@@ -1,0 +1,10 @@
+default_rules:
+- from_id: '1167'
+  to_id: '4359'
+  description: ''
+filename_rules: []
+query_rules:
+- description: ''
+  project: 18种多环芳烃总和（5mm以内）
+  method: '36246'
+  cancel_test: false

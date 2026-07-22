@@ -1,0 +1,31 @@
+default_rules: []
+filename_rules:
+- from_id: '1168'
+  to_id: '4480'
+  filename: Y
+  description: ''
+- from_id: '1168'
+  to_id: '4481'
+  filename: G
+  description: ''
+query_rules:
+- description: ''
+  project: ''
+  method: '22048'
+  cancel_test: false
+processing_rules:
+- method: SVHC
+  type: 直接读取
+- method: 62321-8
+  type: 小数位补充
+- method: '22048'
+  type: 换算处理
+  factor: '3.33333'
+  decimal_places: '4'
+weighing_params:
+  decimal_places: ''
+  min_value: ''
+  max_value: ''
+  conversion_factor: '4'
+  result_decimal_places: '4'
+  weighing_mode: process

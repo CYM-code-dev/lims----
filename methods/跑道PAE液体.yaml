@@ -1,0 +1,33 @@
+default_rules: []
+filename_rules:
+- from_id: '1168'
+  to_id: '4480'
+  description: ''
+  filename: Y
+  project_name: DEHP
+- from_id: '1168'
+  to_id: '4596'
+  description: ''
+  filename: Y
+  project_name: DNOP
+query_rules:
+- description: ''
+  project: DEHP
+  method: '36246'
+  cancel_test: false
+- description: ''
+  project: DNOP
+  method: '36246'
+  cancel_test: false
+processing_rules:
+- method: ''
+  type: 换算加补充
+  factor: 0.5
+  decimal_places: 4
+weighing_params:
+  decimal_places: '4'
+  min_value: '0.2450'
+  max_value: '0.2600'
+  conversion_factor: ''
+  result_decimal_places: ''
+  weighing_mode: process

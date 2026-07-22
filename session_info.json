@@ -1,0 +1,20 @@
+{
+  "username": "myn",
+  "login_time": "2026-07-22 10:58:36",
+  "cookies": {
+    "JSESSIONID": "7123B1A0D71BD6D2D4AD7FA145F8256A",
+    "platform-portal-sid": "82a2f422-f502-4643-a3bb-8ea4b5e7fe58"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Connection": "keep-alive",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "http://192.168.12.234:60015",
+    "Referer": "http://192.168.12.234:60015/web/login.html",
+    "Host": "192.168.12.234:60015"
+  }
+}

@@ -1,0 +1,39 @@
+default_rules: []
+filename_rules:
+- from_id: '1535'
+  to_id: '4593'
+  description: ''
+  filename: ''
+  project_name: MDI
+- from_id: '1535'
+  to_id: '4603'
+  description: ''
+  filename: 固化剂
+  project_name: ''
+- from_id: '1535'
+  to_id: '4595'
+  description: ''
+  filename: G
+  project_name: ''
+- from_id: '1535'
+  to_id: '5271'
+  filename: Y
+  project_name: ''
+  description: ''
+query_rules:
+- description: ''
+  project: ''
+  method: '18446'
+  cancel_test: false
+processing_rules:
+- method: '18446'
+  type: 换算加补充
+  factor: 4.0
+  decimal_places: 4
+weighing_params:
+  decimal_places: ''
+  min_value: ''
+  max_value: ''
+  conversion_factor: ''
+  result_decimal_places: ''
+  weighing_mode: process

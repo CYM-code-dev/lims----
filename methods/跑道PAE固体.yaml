@@ -1,0 +1,54 @@
+default_rules: []
+filename_rules:
+- from_id: '1168'
+  to_id: '4481'
+  description: ''
+  filename: G
+  project_name: DEHP
+- from_id: '1168'
+  to_id: '4482'
+  description: ''
+  filename: G
+  project_name: DNOP
+query_rules:
+  query_rules: []
+  exclusion_rules: []
+  sum_rules:
+  - project: '1'
+    method: '1'
+    id1: '1'
+    id2: '1'
+processing_rules: []
+weighing_params:
+  decimal_places: ''
+  min_value: ''
+  max_value: ''
+  conversion_factor: ''
+  result_decimal_places: ''
+  weighing_mode: random
+spectrum_upload_settings:
+  upload_mode: local_upload
+  spectrum_check_params:
+    blank:
+      enabled: false
+      count: ''
+      keyword: ''
+    standard:
+      enabled: false
+      count: ''
+      keyword: ''
+    linearity:
+      enabled: false
+      count: ''
+      keyword: ''
+    sample:
+      enabled: false
+      count: ''
+      keyword: ''
+  quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
+  undetected_threshold: ''
+other_params_settings:
+  standard_type: fresh
+  preparation_number: ''
+  instrument_setting: default
+  device_number: ''
