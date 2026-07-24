@@ -2,11 +2,14 @@
 import requests
 import json
 import time
+import base64
+import mimetypes
 from datetime import datetime, timedelta
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 import pandas as pd
 import os
+import paths
 from openpyxl import load_workbook
 
 # 禁用SSL警告
@@ -132,7 +135,7 @@ class DetectionAPI:
         """加载子方法切换配置"""
         try:
             # 假设Excel文件在当前目录
-            excel_file = "原始记录登记.xlsx"
+            excel_file = os.path.join(paths.data_dir(), "原始记录登记.xlsx")
             if os.path.exists(excel_file):
                 # 使用openpyxl读取Excel
                 wb = load_workbook(excel_file)
@@ -581,26 +584,142 @@ class DetectionAPI:
                 try:
                     result = response.json()
                     if result.get('success'):
-                        # 删除成功日志
-                        return True
+                        return True, result.get('resultData')
                     else:
                         error_msg = result.get('errorCtx', {}).get('errorMsg', '未知错误')
                         if log_func:
                             log_func(f"提交实验数据失败: {error_msg}, 项目: {project_name}")
-                        return False
+                        return False, None
                 except json.JSONDecodeError:
                     if log_func:
                         log_func(f"提交实验数据失败: 响应不是有效的JSON格式")
-                    return False
+                    return False, None
             else:
                 if log_func:
                     log_func(f"提交实验数据失败: HTTP {response.status_code}, 项目: {project_name}")
-                return False
+                return False, None
 
         except Exception as e:
             if log_func:
                 log_func(f"提交实验数据异常: {str(e)}, 项目: {project_name}")
             return False
+
+    def extract_experiment_code(self, result_data, local_code):
+        """从提交响应里递归找服务端真实实验编号（与 local_code 同前缀、同长度、后段为数字）；
+        找不到回退 local_code。实验编号由服务端生成，本地时间戳拼的会被忽略。"""
+        if not local_code or len(local_code) <= 14:
+            return local_code
+        prefix = local_code[:-14]
+        plen = len(local_code)
+
+        def is_code(v):
+            return (isinstance(v, str) and len(v) == plen
+                    and v.startswith(prefix) and v[len(prefix):].isdigit())
+
+        found = []
+
+        def walk(v):
+            if isinstance(v, dict):
+                for x in v.values():
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+            elif is_code(v):
+                found.append(v)
+
+        walk(result_data)
+        for c in found:
+            if c != local_code:
+                return c
+        return found[0] if found else local_code
+
+    def upload_spectrum_file(self, file_path, result_checkin_ids="", log_func=None):
+        """上传谱图文件到 LIMS，返回 (success, inner_resultData_or_errmsg)
+
+        inner 含 id / orgName / name / url；fileName 用 orgName（原始名）。
+        body 为 JSON，含 files(data_url)+fileName+type+size+name+pid+pname+loginId
+        （抓包 session.txt 确认；缺 fileName 等字段即报"缺少参数"）。URL 无 query；
+        result_checkin_ids 仅写入 Referer（服务端实际从 body 取参，其值不影响结果）。
+        """
+        try:
+            if not file_path or not os.path.isfile(file_path):
+                return False, f"文件不存在: {file_path}"
+
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            with open(file_path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode('ascii')
+            mime, _ = mimetypes.guess_type(file_path)
+            if not mime:
+                mime = 'application/octet-stream'
+            data_url = f"data:{mime};base64,{b64}"
+
+            pid = self.get_user_pid()
+            pname = self.get_user_pname()
+            login_id = self.get_user_login_id()
+            user_info = self.login_system.users.get(self.login_system.current_user, {})
+            real_name = user_info.get('display_name') or pname
+            # 抓包(session.txt)确认：URL 无 query；body 为含 8 字段的 JSON（files+fileName+type+size+name+pid+pname+loginId）。
+            headers = {
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                'Origin': self.login_system.base_url,
+                'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html?ids=&decideProjectOrgIds=23&type=0&recordNumber=null&checkInStatus=CHECK_IN_STATUS_NO&verifyStatus=&auditStatus=&resultCheckInIds={result_checkin_ids}&souce=checkIn&pid={pid}&pname={pname}&loginId={login_id}',
+                'Accept-Encoding': 'gzip, deflate',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                # 抓包无此头；置 None 剥离 session 默认头（login 时注入）以贴合抓包
+                'X-Requested-With': None
+            }
+            if log_func:
+                log_func(f"uploadFile fileName={file_name}, size={file_size}, name={real_name}, resultCheckInIds={result_checkin_ids!r}")
+
+            body = json.dumps({
+                "files": data_url,
+                "fileName": file_name,
+                "type": "base64",
+                "size": file_size,
+                "name": real_name,
+                "pid": int(pid),
+                "pname": pname,
+                "loginId": int(login_id),
+            }, separators=(',', ':')).encode('utf-8')
+
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/samplePhoto/uploadFile",
+                data=body,
+                headers=headers,
+                verify=False,
+                timeout=60
+            )
+
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    if result.get('success'):
+                        inner = result.get('resultData', {}).get('resultData', {})
+                        if inner:
+                            return True, inner
+                        return True, result.get('resultData')
+                    error_msg = result.get('errorCtx', {}).get('errorMsg', '未知错误')
+                    if log_func:
+                        log_func(f"上传谱图失败: {error_msg}, 文件: {os.path.basename(file_path)}")
+                    return False, error_msg
+                except json.JSONDecodeError:
+                    if log_func:
+                        log_func("上传谱图失败: 响应不是有效的JSON格式")
+                    return False, "响应不是有效的JSON格式"
+            else:
+                body = response.text[:300] if response.text else ""
+                if log_func:
+                    log_func(f"上传谱图失败: HTTP {response.status_code}, 文件: {os.path.basename(file_path)}, 响应: {body}")
+                return False, f"HTTP {response.status_code}: {body}"
+
+        except Exception as e:
+            if log_func:
+                log_func(f"上传谱图异常: {str(e)}, 文件: {file_path}")
+            return False, str(e)
 
     def clear_experiment_cache(self, sample_project_ids, log_func=None):
         """清除实验暂存数据 - 完整修复，确保传递所有项目ID"""
@@ -1339,6 +1458,93 @@ class DetectionAPI:
             'raw_data': []
         }
 
+    def get_main_equipment_choices(self, sample_project_id, log_func=None):
+        """查询主检设备可选列表 - 对齐网页端 equipmentBill/ocMultipleChoicePage
+        usedCategory=检测设备,主检设备，按 SampleProjectId 查询"""
+        return self._query_equipment_choice_page(
+            "ocMultipleChoicePage", "检测设备,主检设备",
+            sample_project_id, {"Id": "23"}, log_func,  # ponytail: 机构ID=23，与样品列表 decideProjectOrgId 一致
+        )
+
+    def get_weighing_equipment_choices(self, sample_project_id, log_func=None):
+        """查询称样设备可选列表 - 对齐网页端 equipmentBill/ocChoicePage
+        usedCategory=称样设备，按 SampleProjectId 查询"""
+        return self._query_equipment_choice_page(
+            "ocChoicePage", "称样设备", sample_project_id, {}, log_func,
+        )
+
+    def _query_equipment_choice_page(self, action, used_category, sample_project_id, extra_params, log_func=None):
+        """通用设备选择页查询，返回 [{label, id}, ...]"""
+        try:
+            params = {
+                "_search": "false",
+                "nd": int(time.time() * 1000),
+                "pageSize": "30",
+                "pageNo": "1",
+                "sidx": "",
+                "sord": "asc",
+                "usedCategory": used_category,
+                "keyword": "",
+                "SampleProjectId": str(sample_project_id),
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+            }
+            params.update(extra_params)
+            response = self.login_system.session.get(
+                f"{self.login_system.base_url}/detectionManager/manager/equipmentBill/{action}",
+                params=params,
+                headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                    'Referer': f"{self.login_system.base_url}/web/detectionResultCheckInCalc.html",
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                verify=False,
+                timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    return self._extract_equipment_list(result)
+            return []
+        except Exception as e:
+            if log_func:
+                log_func(f"查询设备列表异常({action}): {str(e)}")
+            return []
+
+    def _extract_equipment_list(self, result):
+        """从设备选择页响应提取设备列表 - 兼容 resultData.voList / rows / list / 平铺列表。
+        返回 [{label, id}, ...]：label 含设备编号（mainEquipmentNames 本身为"编号,名称"格式；
+        缺失时用 code 字段拼前缀），与 process_equipment_list 的默认设备串可匹配"""
+        rd = result.get('resultData')
+        if isinstance(rd, dict):
+            rows = rd.get('voList') or rd.get('rows') or rd.get('list') or []
+        elif isinstance(rd, list):
+            rows = rd
+        else:
+            rows = []
+        items, seen = [], set()
+        for eq in rows:
+            if not isinstance(eq, dict):
+                continue
+            men = (eq.get('mainEquipmentNames') or '').strip()
+            name = (eq.get('name') or eq.get('equipmentName') or '').strip()
+            code = (eq.get('no') or eq.get('code') or eq.get('equipmentCode')
+                    or eq.get('equipmentNo') or eq.get('number') or eq.get('billCode') or '').strip()
+            if men:
+                label = men
+            elif code and name and code not in name:
+                label = f"{code} {name}"
+            else:
+                label = name
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            eq_id = eq.get('equipmentBillId') or eq.get('id') or ''
+            items.append({'label': label, 'id': str(eq_id) if eq_id else ''})
+        return items
+
     def get_current_sample_id(self):
         """获取当前样品ID - 用于构建Referer"""
         return ""
@@ -1557,7 +1763,8 @@ class DetectionAPI:
                         'columeName': display_name,
                         'editType': 'EDIT_TYPE_TEXT',
                         'defaultVal': str(field_value) if field_value else '',
-                        'columeOrder': len(dynamic_columns) + 1
+                        'columeOrder': len(dynamic_columns) + 1,
+                        'isColumnMerge': 0,  # 兜底列默认不合并（主路径 getDynamicColumns 自带该字段）
                     }
                     dynamic_columns.append(column)
 
@@ -1862,10 +2069,15 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                 edit_type = col.get('editType', 'EDIT_TYPE_TEXT')
                 default_val = col.get('defaultVal', '')
 
-                # 从用户输入获取值，正确处理空值
+                # 从用户输入获取值（合并列共享一个值；非合并列按测试次数取对应行）
                 user_value = ""
                 if hasattr(self, 'data_fields') and col_code in self.data_fields:
-                    user_value = self.data_fields[col_code].get().strip()
+                    field = self.data_fields[col_code]
+                    if isinstance(field, list):
+                        if 0 <= record_index < len(field):
+                            user_value = field[record_index].get().strip()
+                    else:
+                        user_value = field.get().strip()
 
                 # 如果用户输入了值，使用用户输入的值；否则使用配置中的默认值
                 if user_value:

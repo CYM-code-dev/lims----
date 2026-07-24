@@ -1,6 +1,7 @@
 # detection_entry_main.py
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import ttkbootstrap as ttkb  # 档1: 现代主题(sandstone-light)，ttk 控件自动套用
 import json
 import time
 from datetime import datetime, timedelta
@@ -15,11 +16,42 @@ from login import MultiUserLoginSystem
 from detection_entry_api import DetectionAPI, build_grouped_experiment_data
 
 
+def _make_large_checkbutton_style(scale=1.5):
+    """放大 ttk.Checkbutton 勾选框：复用 ttkbootstrap 自带位图按 scale 重建 indicator element，
+    风格与 sandstone-light 主题保持一致。ponytail: indicator 是固定尺寸位图，只能重建放大；
+    依赖 ttkbootstrap 内部 API，失败则回退默认勾选框。"""
+    try:
+        from ttkbootstrap.style.layout import image_element, layout, El
+        from ttkbootstrap.style.assets import RecolorRenderer
+        from PIL import ImageTk
+        s = ttkb.Style()
+        c = s.colors
+        size = int(36 * scale)
+        def _img(name, ink):
+            return ImageTk.PhotoImage(RecolorRenderer.render(name, (size, size), '#ffffff', ink, None, None))
+        chk, ind = _img('checkbox_checked', c.primary), _img('checkbox_indeterminate', c.primary)
+        unk = _img('checkbox_unchecked', c.fg)
+        dchk, dind = _img('checkbox_checked', c.border), _img('checkbox_indeterminate', c.border)
+        dunk = _img('checkbox_unchecked', c.border)
+        sn = 'Large.TCheckbutton'
+        image_element(s, sn + '.indicator', default=chk,
+                      states={'disabled selected': dchk, 'disabled alternate': dind, 'disabled': dunk,
+                              'alternate': ind, '!selected': unk}, border=0, padding=0, sticky=tk.W)
+        layout(s, sn, El('Checkbutton.padding', sticky=tk.NSEW, children=[
+            El(sn + '.indicator', side=tk.LEFT, sticky=''),
+            El('Checkbutton.focus', side=tk.LEFT, sticky='', children=[El('Checkbutton.label', sticky=tk.NSEW)])]))
+        s.configure(sn, background=c.bg, foreground=c.fg, focuscolor=c.fg)
+        s._large_cb_imgs = (chk, unk, ind, dchk, dunk, dind)  # 持有 PhotoImage 引用防 GC
+        return sn
+    except Exception:
+        return None
+
+
 class DetectionEntrySystem:
     def __init__(self, root, result_checkin_ids=None, sample_id=None, sample_project_ids=None, url_params=None):
         self.root = root
         self.root.title("检测数据录入系统")
-        self.root.geometry("800x700")
+        self.root.geometry("1500x1200")
         self.solution_type_var = None
         self.solution_status_var = None
         # 使用登录系统和API模块
@@ -62,6 +94,12 @@ class DetectionEntrySystem:
         self.solution_type_var = None
         self.solution_status_var = None
 
+        # 谱图上传相关变量
+        self.spectrum_rows = []  # 每行 {project, file_path_var, status_var, record}
+        self.spectrum_uploaded = []  # 已上传文件记录 {fileId, fileName, url}
+        self.spectrum_list_frame = None
+        self.spectrum_status_var = None
+
         # 创建界面
         self.setup_ui()
 
@@ -71,7 +109,8 @@ class DetectionEntrySystem:
     def check_login_status(self):
         """检查登录状态"""
         if self.login_system.load_session() and self.login_system.verify_session():
-            self.update_status(f"已登录: {self.login_system.current_user}", "green")
+            disp = self.login_system.users.get(self.login_system.current_user, {}).get('display_name', self.login_system.current_user)
+            self.update_status(f"已登录: {disp}", "green")
         else:
             self.update_status("未登录", "red")
 
@@ -88,22 +127,35 @@ class DetectionEntrySystem:
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
+        # 增大标签页标题字体（样品信息/环境与设备/检测数据）及横向间距
+        ttk.Style().configure("TNotebook.Tab", font=("微软雅黑", 12), padding=(28, 8))
+        # 选中的标签页文字变蓝，便于区分当前页
+        ttk.Style().map("TNotebook.Tab", foreground=[("selected", "#1565C0")])
+
+        # 档3: 放大复选框勾选框（ttkbootstrap 默认 indicator 偏小）
+        self.large_cb_style = _make_large_checkbutton_style(1.5)
+
         # 样品信息标签页
         sample_frame = ttk.Frame(notebook, padding="10")
         notebook.add(sample_frame, text="样品信息")
 
         # 环境条件标签页
         env_frame = ttk.Frame(notebook, padding="10")
-        notebook.add(env_frame, text="环境条件")
+        notebook.add(env_frame, text="环境与设备")
 
         # 检测数据标签页
         data_frame = ttk.Frame(notebook, padding="10")
         notebook.add(data_frame, text="检测数据")
 
+        # 谱图上传标签页
+        spectrum_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(spectrum_frame, text="谱图上传")
+
         # 设置各个标签页
         self.setup_sample_tab(sample_frame)
         self.setup_env_tab(env_frame)
         self.setup_data_tab(data_frame)
+        self.setup_spectrum_tab(spectrum_frame)
 
     def setup_status_bar(self, parent):
         """设置状态栏"""
@@ -136,7 +188,7 @@ class DetectionEntrySystem:
         row1_frame.pack(fill=tk.X, pady=5)
 
         ttk.Label(row1_frame, text="样品编号:").pack(side=tk.LEFT)
-        self.sample_code_var = tk.StringVar()
+        self.sample_code_var = tk.StringVar(value="TR26070030")  # 测试期默认值，上线前去掉
         sample_code_entry = ttk.Entry(row1_frame, textvariable=self.sample_code_var, width=20)
         sample_code_entry.pack(side=tk.LEFT, padx=(5, 20))
 
@@ -145,26 +197,23 @@ class DetectionEntrySystem:
         project_name_entry = ttk.Entry(row1_frame, textvariable=self.project_name_var, width=20)
         project_name_entry.pack(side=tk.LEFT, padx=(5, 20))
 
-        # 第二行 - 检测方法和注销复测
-        row2_frame = ttk.Frame(query_frame)
-        row2_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(row2_frame, text="检测方法:").pack(side=tk.LEFT)
+        # 检测方法、注销复测（与样品编号/项目同一行）
+        ttk.Label(row1_frame, text="检测方法:").pack(side=tk.LEFT)
         self.method_name_var = tk.StringVar()
-        method_name_entry = ttk.Entry(row2_frame, textvariable=self.method_name_var, width=20)
+        method_name_entry = ttk.Entry(row1_frame, textvariable=self.method_name_var, width=20)
         method_name_entry.pack(side=tk.LEFT, padx=(5, 20))
 
         # 注销复测改为复选框
         self.retest_var = tk.BooleanVar(value=False)
-        retest_checkbox = ttk.Checkbutton(row2_frame, text="注销复测", variable=self.retest_var)
+        retest_checkbox = ttk.Checkbutton(row1_frame, text="注销复测", variable=self.retest_var, style=self.large_cb_style)
         retest_checkbox.pack(side=tk.LEFT, padx=(5, 0))
 
         # 查询按钮区域
         button_frame = ttk.Frame(query_frame)
         button_frame.pack(fill=tk.X, pady=10)
 
-        ttk.Button(button_frame, text="查询", command=self.query_samples).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(button_frame, text="清空条件", command=self.clear_query_conditions).pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="查询", command=self.query_samples, bootstyle="primary").pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="清空条件", command=self.clear_query_conditions, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
 
         # 查询结果统计
         self.result_count_var = tk.StringVar(value="查询结果: 0 条")
@@ -194,20 +243,35 @@ class DetectionEntrySystem:
         selection_frame = ttk.Frame(parent)
         selection_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Button(selection_frame, text="全选", command=self.select_all_projects).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(selection_frame, text="取消全选", command=self.deselect_all_projects).pack(side=tk.LEFT,
+        ttkb.Button(selection_frame, text="全选", command=self.select_all_projects, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(selection_frame, text="取消全选", command=self.deselect_all_projects, bootstyle="secondary").pack(side=tk.LEFT,
                                                                                               padx=(0, 10))
 
         # 新增：获取动态配置按钮
-        ttk.Button(selection_frame, text="获取动态配置", command=self.get_dynamic_config).pack(side=tk.LEFT,
+        ttkb.Button(selection_frame, text="获取动态配置", command=self.get_dynamic_config, bootstyle="primary").pack(side=tk.LEFT,
                                                                                                padx=(0, 10))
 
         # 已选择项目统计
         self.selected_count_var = tk.StringVar(value="已选择: 0 个项目")
         ttk.Label(selection_frame, textvariable=self.selected_count_var).pack(side=tk.LEFT, padx=(20, 0))
 
+        # 配置获取结果信息栏（替代弹窗）
+        self.config_status_var = tk.StringVar(value="")
+        ttk.Label(selection_frame, textvariable=self.config_status_var, foreground="blue").pack(side=tk.LEFT, padx=(20, 0))
+
     def setup_data_tab(self, parent):
         """设置检测数据标签页 - 添加标准溶液提交功能"""
+        # 第一行 - 当前方法ID + 切换方法ID
+        method_row = ttk.Frame(parent)
+        method_row.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(method_row, text="当前方法ID:").pack(side=tk.LEFT)
+        self.current_method_id_var = tk.StringVar(value="未获取")
+        ttk.Label(method_row, textvariable=self.current_method_id_var, foreground="blue").pack(side=tk.LEFT, padx=(5, 20))
+        ttk.Label(method_row, text="切换方法ID:").pack(side=tk.LEFT)
+        self.switch_method_id_var = tk.StringVar()
+        ttk.Entry(method_row, textvariable=self.switch_method_id_var, width=15).pack(side=tk.LEFT, padx=(5, 5))
+        ttkb.Button(method_row, text="切换方法", command=self.switch_method_id, bootstyle="secondary").pack(side=tk.LEFT)
+
         # 检测数据区域
         data_frame = ttk.LabelFrame(parent, text="检测数据", padding="10")
         data_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -248,8 +312,8 @@ class DetectionEntrySystem:
         button_frame = ttk.Frame(parent)
         button_frame.pack(fill=tk.X, pady=10)
 
-        ttk.Button(button_frame, text="提交数据", command=self.submit_data).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(button_frame, text="清空数据", command=self.clear_data).pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="提交数据", command=self.submit_data, bootstyle="primary").pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="清空数据", command=self.clear_data, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
 
         # 添加分组信息显示
         self.group_info_var = tk.StringVar(value="")
@@ -303,6 +367,257 @@ class DetectionEntrySystem:
         else:
             self.experiment_code_var.set("实验编号: 未生成")
 
+    def setup_spectrum_tab(self, parent):
+        """设置谱图上传标签页"""
+        # 信息栏（第一行，顶部）
+        info_frame = ttk.Frame(parent)
+        info_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        self.spectrum_status_var = tk.StringVar(value="未刷新")
+        ttk.Label(info_frame, textvariable=self.spectrum_status_var, foreground="blue").pack(side=tk.LEFT)
+
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
+
+        ttkb.Button(toolbar, text="刷新选中项目", command=self.refresh_spectrum_list, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 5))
+        ttkb.Button(toolbar, text="选择谱图(按样品编号匹配)", command=self.pick_spectrum_match, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 5))
+        ttkb.Button(toolbar, text="同一谱图应用到全部", command=self.pick_spectrum_apply_all, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 5))
+        ttkb.Button(toolbar, text="开始上传", command=self.upload_all_spectra, bootstyle="primary").pack(side=tk.LEFT, padx=(0, 5))
+
+        # 滚动列表
+        list_outer = ttk.Frame(parent)
+        list_outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(list_outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
+        self.spectrum_list_frame = ttk.Frame(canvas)
+
+        self.spectrum_list_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.spectrum_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self._render_spectrum_rows()
+
+    def _render_spectrum_rows(self):
+        """根据 self.spectrum_rows 重建行控件"""
+        for widget in self.spectrum_list_frame.winfo_children():
+            widget.destroy()
+
+        if not self.spectrum_rows:
+            ttk.Label(self.spectrum_list_frame,
+                      text="请先在「样品信息」页选中项目，再点「刷新选中项目」",
+                      foreground="gray").pack(pady=20)
+            return
+
+        # 表头
+        header = ttk.Frame(self.spectrum_list_frame)
+        header.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(header, text="样品编号", width=16).pack(side=tk.LEFT)
+        ttk.Label(header, text="项目", width=16).pack(side=tk.LEFT)
+        ttk.Label(header, text="样品名称", width=14).pack(side=tk.LEFT)
+        ttk.Label(header, text="谱图文件", width=26).pack(side=tk.LEFT)
+        ttk.Label(header, text="状态", width=12).pack(side=tk.LEFT)
+        ttk.Separator(self.spectrum_list_frame, orient='horizontal').pack(fill=tk.X, pady=3)
+
+        for row in self.spectrum_rows:
+            proj = row["project"]
+            line = ttk.Frame(self.spectrum_list_frame)
+            line.pack(fill=tk.X, pady=1)
+            ttk.Label(line, text=proj.get('sampleCode', ''), width=16).pack(side=tk.LEFT)
+            ttk.Label(line, text=proj.get('projectName', ''), width=16).pack(side=tk.LEFT)
+            ttk.Label(line, text=proj.get('sampleName', ''), width=14).pack(side=tk.LEFT)
+            ttk.Label(line, textvariable=row["file_disp"], width=26, foreground="blue").pack(side=tk.LEFT)
+            ttk.Label(line, textvariable=row["status_var"], width=12).pack(side=tk.LEFT)
+            ttkb.Button(line, text="重选", width=4, bootstyle="secondary",
+                       command=lambda r=row: self._repick_row(r)).pack(side=tk.LEFT, padx=(4, 0))
+
+    def refresh_spectrum_list(self):
+        """按样品信息页勾选的项目重建谱图行列表"""
+        if not self.login_system.current_user:
+            messagebox.showerror("错误", "请先登录系统")
+            return
+
+        selected_indices = [i for i, var in enumerate(self.project_vars) if var.get()]
+        if not selected_indices:
+            messagebox.showerror("错误", "请先在「样品信息」页至少选择一个项目")
+            return
+
+        # 按 projectId 保留已选文件/已上传记录
+        old_by_pid = {r["project"].get("projectId"): r for r in self.spectrum_rows}
+        self.spectrum_rows = []
+        for index in selected_indices:
+            if index < len(self.filtered_projects):
+                project = self.filtered_projects[index]
+                prev = old_by_pid.get(project.get("projectId"))
+                if prev:
+                    row = {
+                        "project": project,
+                        "file_path": prev["file_path"],
+                        "file_disp": prev["file_disp"],
+                        "status_var": prev["status_var"],
+                        "record": prev["record"],
+                    }
+                else:
+                    row = {
+                        "project": project,
+                        "file_path": None,
+                        "file_disp": tk.StringVar(value="未选择"),
+                        "status_var": tk.StringVar(value="待上传"),
+                        "record": None,
+                    }
+                self.spectrum_rows.append(row)
+
+        self._render_spectrum_rows()
+        self._sync_uploaded()
+        self._update_spectrum_status()
+
+    def pick_spectrum_match(self):
+        """选择多个文件，按样品编号匹配到对应行"""
+        if not self._ensure_spectrum_rows():
+            return
+        paths = filedialog.askopenfilenames(
+            title="选择谱图文件（按样品编号匹配）",
+            filetypes=[("PDF文件", "*.pdf"), ("图片", "*.jpg *.jpeg *.png"), ("所有文件", "*.*")]
+        )
+        if not paths:
+            return
+
+        matched_any = False
+        unmatched = []
+        for path in paths:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            hits = [r for r in self.spectrum_rows
+                    if stem and stem in r["project"].get('sampleCode', '')]
+            if hits:
+                for r in hits:
+                    r["file_path"] = path
+                    r["file_disp"].set(os.path.basename(path))
+                    if r["record"] is None:
+                        r["status_var"].set("待上传")
+                matched_any = True
+            else:
+                unmatched.append(os.path.basename(path))
+
+        self._render_spectrum_rows()
+        self._update_spectrum_status()
+        parts = []
+        if matched_any:
+            parts.append("已匹配")
+        if unmatched:
+            parts.append("未匹配: " + ", ".join(unmatched))
+        self.spectrum_status_var.set("；".join(parts) if parts else "无匹配")
+
+    def pick_spectrum_apply_all(self):
+        """选一个文件，赋给所有行"""
+        if not self._ensure_spectrum_rows():
+            return
+        path = filedialog.askopenfilename(
+            title="选择一个谱图文件（应用到全部）",
+            filetypes=[("PDF文件", "*.pdf"), ("图片", "*.jpg *.jpeg *.png"), ("所有文件", "*.*")]
+        )
+        if not path:
+            return
+        for r in self.spectrum_rows:
+            r["file_path"] = path
+            r["file_disp"].set(os.path.basename(path))
+            if r["record"] is None:
+                r["status_var"].set("待上传")
+        self._render_spectrum_rows()
+        self._update_spectrum_status()
+
+    def _repick_row(self, row):
+        path = filedialog.askopenfilename(
+            title="为该行选择谱图文件",
+            filetypes=[("PDF文件", "*.pdf"), ("图片", "*.jpg *.jpeg *.png"), ("所有文件", "*.*")]
+        )
+        if path:
+            row["file_path"] = path
+            row["file_disp"].set(os.path.basename(path))
+            row["record"] = None
+            row["status_var"].set("待上传")
+            self._sync_uploaded()
+            self._update_spectrum_status()
+
+    def upload_all_spectra(self):
+        """上传所有已选文件且未上传的行"""
+        if not self.login_system.current_user:
+            messagebox.showerror("错误", "请先登录系统")
+            return
+        if not self.spectrum_rows:
+            messagebox.showerror("错误", "请先点「刷新选中项目」")
+            return
+
+        todo = [r for r in self.spectrum_rows if r["file_path"] and r["record"] is None]
+        if not todo:
+            messagebox.showinfo("提示", "没有待上传的谱图（已选文件均已上传，或未选择文件）")
+            return
+
+        # 按文件路径去重：同一文件只上传一次，结果共享给所有引用该路径的行（否则 N 个项目=N 份重复上传）
+        unique_paths = list(dict.fromkeys(r["file_path"] for r in todo))
+
+        self.update_status(f"正在上传 {len(unique_paths)} 个谱图文件...")
+        self.root.update_idletasks()
+
+        success_count = 0
+        fail_count = 0
+        for path in unique_paths:
+            rows = [r for r in todo if r["file_path"] == path]
+            for r in rows:
+                r["status_var"].set("上传中...")
+            self.root.update_idletasks()
+            project_id = rows[0]["project"].get("projectId")
+            sample_id = rows[0]["project"].get("sampleId")
+            self.log(f"上传 {os.path.basename(path)}: sampleId={sample_id!r}, projectId(resultCheckInId)={project_id}（共享 {len(rows)} 行）")
+            success, result = self.api.upload_spectrum_file(path, str(project_id) if project_id else "", self.log)
+            if success:
+                record = {
+                    "fileId": result.get("id"),
+                    "fileName": result.get("orgName") or result.get("name"),
+                    "url": result.get("url"),
+                }
+                for r in rows:
+                    r["record"] = record
+                    r["status_var"].set(f"成功 {record['fileName']}")
+                success_count += 1
+            else:
+                for r in rows:
+                    r["status_var"].set(f"失败: {result}")
+                fail_count += 1
+
+        self._sync_uploaded()
+        self._update_spectrum_status()
+        self.update_status(f"谱图上传完成: 成功 {success_count}, 失败 {fail_count}",
+                           "green" if fail_count == 0 else "orange")
+        if fail_count:
+            messagebox.showwarning("部分失败", f"成功 {success_count} 个，失败 {fail_count} 个，请查看状态列")
+
+    def _ensure_spectrum_rows(self):
+        if not self.spectrum_rows:
+            messagebox.showerror("错误", "请先点「刷新选中项目」加载项目列表")
+            return False
+        return True
+
+    def _sync_uploaded(self):
+        """spectrum_uploaded 与当前行的已上传记录保持一致（按 fileId 去重：多项目共享同一文件只算一份）"""
+        seen = set()
+        out = []
+        for r in self.spectrum_rows:
+            rec = r.get("record")
+            if rec and rec.get("fileId") not in seen:
+                seen.add(rec.get("fileId"))
+                out.append(rec)
+        self.spectrum_uploaded = out
+
+    def _update_spectrum_status(self):
+        total = len(self.spectrum_rows)
+        assigned = sum(1 for r in self.spectrum_rows if r["file_path"])
+        uploaded = sum(1 for r in self.spectrum_rows if r["record"])
+        self.spectrum_status_var.set(f"共 {total} 项 | 已选文件 {assigned} | 已上传 {uploaded}")
+
     def submit_data(self):
         """提交数据 - 对选中的复选框进行操作，并自动提交标准溶液"""
         if not self.login_system.current_user:
@@ -333,10 +648,14 @@ class DetectionEntrySystem:
             # 动态获取质量字段
             mass_field = self.find_mass_field()
             if mass_field:
-                mass_value = float(self.data_fields[mass_field].get() or "0")
-                if mass_value <= 0:
-                    messagebox.showerror("错误", "质量必须大于0")
-                    return
+                # 非合并列可能有多次测试的质量值，逐一校验
+                field = self.data_fields[mass_field]
+                vals = field if isinstance(field, list) else [field]
+                for v in vals:
+                    mass_value = float(v.get() or "0")
+                    if mass_value <= 0:
+                        messagebox.showerror("错误", "质量必须大于0")
+                        return
         except ValueError:
             messagebox.showerror("错误", "质量必须为数字")
             return
@@ -487,11 +806,20 @@ class DetectionEntrySystem:
         failed_groups = []
 
         for method_name, projects in method_groups.items():
-            success = self.get_single_method_group_config(method_name, projects)
+            try:
+                success = self.get_single_method_group_config(method_name, projects)
+            except Exception as e:
+                import traceback
+                messagebox.showerror("获取配置异常", f"方法组 {method_name}:\n{e}\n\n{traceback.format_exc()}")
+                success = False
             if success:
                 success_groups.append(method_name)
             else:
                 failed_groups.append(method_name)
+
+        # 配置获取成功后，自动刷新「谱图上传」标签页的选中项目
+        if success_groups:
+            self.refresh_spectrum_list()
 
         # 显示结果
         result_message = f"配置获取完成！\n\n"
@@ -509,10 +837,19 @@ class DetectionEntrySystem:
                 project_count = len(method_groups[group])
                 result_message += f"  ✗ {group} ({project_count}个项目)\n"
 
+        # 信息栏显示配置结果（替代成功弹窗）
+        if success_groups:
+            parts = [f"{g}（{len(method_groups[g])}项）" for g in success_groups]
+            status_text = "配置完成：" + "、".join(parts)
+            if failed_groups:
+                status_text += f"；失败 {len(failed_groups)} 组"
+            self.config_status_var.set(status_text)
+        else:
+            self.config_status_var.set(f"配置失败：{len(failed_groups)} 组")
+
+        # 仅在存在失败组时弹窗提示
         if failed_groups:
             messagebox.showwarning("部分成功", result_message)
-        else:
-            messagebox.showinfo("成功", result_message)
 
     def get_single_method_group_config(self, method_name, projects):
         """获取单个检测方法组的配置 - 简化版本"""
@@ -528,14 +865,28 @@ class DetectionEntrySystem:
             first_project = projects[0]
             sample_id = first_project.get('sampleId')
 
-            # 使用统一的方法获取配置
+            # 先取实验配置，解析方法ID并立即显示——确保即使后续 get_all_configs 的子步骤
+            # （动态列/设备等）抛异常，"当前方法ID" 也能显示出来
+            experiment_config = self.api.get_experiment_config(
+                sample_project_ids_str, method_name, "", sample_id, self.log, None
+            )
+            method_id = (experiment_config or {}).get('ocMethodSettings', {}).get('methodId')
+            actual_method_id = method_id
+            description = None
+            if method_id and str(method_id) in self.api.sub_method_map:
+                sub_method_info = self.api.sub_method_map[str(method_id)]
+                actual_method_id = sub_method_info['sub_method_id']
+                description = sub_method_info.get('description')
+            self.current_method_id_var.set(str(actual_method_id) if actual_method_id is not None else "未获取")
+
+            # 使用统一的方法获取配置（传入已解析的 method_id，对齐 submit_data 流程）
             all_configs = self.api.get_all_configs(
                 sample_project_ids_str,
                 method_name,
                 "",  # result_checkin_ids
                 sample_id,
                 self.log,
-                None,  # 方法ID将在API内部获取
+                method_id,  # 已解析的方法ID
                 project_names  # 项目名称列表
             )
 
@@ -546,27 +897,22 @@ class DetectionEntrySystem:
             # 提取各个配置
             self.experiment_config = all_configs.get('experiment', {})
             self.equipment_config = all_configs.get('equipment', {})
+            self._refresh_equipment_display()
             self.units_config = all_configs.get('units', [])
             self.round_methods_config = all_configs.get('round_methods', {})
             self.calc_methods_config = all_configs.get('calc_methods', {})
             self.dynamic_columns = all_configs.get('dynamic_columns', [])
 
-            # 从配置中获取实际使用的方法信息
+            # 测试次数 N：单项目在 ocAnalysisRecordList 中的记录数（默认 1，平行样为 2）
+            self.test_run_count = self._compute_test_run_count(self.experiment_config)
+
+            # 实际方法名称（可能经过子方法切换）
             actual_method_name = all_configs.get('actual_method_name', method_name)
-            actual_method_id = all_configs.get('actual_method_id')
+            display_method_name = f"{actual_method_name} {description}" if description else actual_method_name
 
             # 保存实际的方法名称和方法ID用于实验数据
             self.actual_method_name = actual_method_name
             self.actual_method_id = actual_method_id
-
-            # 构建显示名称
-            method_id = self.experiment_config.get('ocMethodSettings', {}).get('methodId')
-            if method_id and str(method_id) in self.api.sub_method_map:
-                sub_method_info = self.api.sub_method_map[str(method_id)]
-                description = sub_method_info['description']
-                display_method_name = f"{actual_method_name} {description}"
-            else:
-                display_method_name = actual_method_name
 
             # 更新UI动态字段
             self.setup_dynamic_data_fields(self.dynamic_columns)
@@ -646,10 +992,10 @@ class DetectionEntrySystem:
             return []
 
     def setup_env_tab(self, parent):
-        """设置环境条件标签页"""
+        """设置环境与设备标签页（环境条件 + 当前方法ID下的设备信息）"""
         # 环境条件区域
         env_frame = ttk.LabelFrame(parent, text="环境条件", padding="10")
-        env_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        env_frame.pack(fill=tk.X, pady=(0, 10))
 
         # 温湿度和时间
         env_row1 = ttk.Frame(env_frame)
@@ -679,7 +1025,105 @@ class DetectionEntrySystem:
         env_row3 = ttk.Frame(env_frame)
         env_row3.pack(fill=tk.X, pady=10)
 
-        ttk.Button(env_row3, text="设置当前日期", command=self.set_current_date).pack(side=tk.LEFT)
+        ttkb.Button(env_row3, text="设置当前日期", command=self.set_current_date, bootstyle="secondary").pack(side=tk.LEFT)
+
+        # 设备信息区域：复选框多选（主检支持多台），点"查询设备"按当前样品项目拉取可选列表
+        eq_frame = ttk.LabelFrame(parent, text="设备信息", padding="10")
+        eq_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        eq_top = ttk.Frame(eq_frame)
+        eq_top.pack(fill=tk.X, pady=(0, 5))
+        ttkb.Button(eq_top, text="查询设备", command=self.query_equipment_choices, bootstyle="secondary").pack(side=tk.LEFT)
+        self.eq_query_status_var = tk.StringVar(value="未查询")
+        ttk.Label(eq_top, textvariable=self.eq_query_status_var, foreground="blue").pack(side=tk.LEFT, padx=(10, 0))
+
+        eq_cols = ttk.Frame(eq_frame)
+        eq_cols.pack(fill=tk.BOTH, expand=True)
+
+        main_col = ttk.LabelFrame(eq_cols, text="主检设备", padding="5")
+        main_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.main_eq_inner = self._build_checklist(main_col)
+        self.main_eq_vars = []  # [(BooleanVar, item), ...]
+
+        weighing_col = ttk.LabelFrame(eq_cols, text="称样设备", padding="5")
+        weighing_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.weighing_eq_inner = self._build_checklist(weighing_col)
+        self.weighing_eq_vars = []
+
+    def _build_checklist(self, parent):
+        """在 parent 内构建可滚动复选框容器，返回内部 Frame（用于放置 Checkbutton）"""
+        canvas = tk.Canvas(parent, height=140, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        return inner
+
+    def _populate_checklist(self, inner, var_list, items, defaults):
+        """用 items 重建复选框；label 命中 defaults 任一字符串的默认勾选"""
+        for w in inner.winfo_children():
+            w.destroy()
+        var_list.clear()
+        for it in items:
+            label = it.get('label', '')
+            if not label:
+                continue
+            checked = any(d and d in label for d in defaults)
+            var = tk.BooleanVar(value=checked)
+            ttk.Checkbutton(inner, text=label, variable=var, style=self.large_cb_style).pack(anchor=tk.W, fill=tk.X)
+            var_list.append((var, it))
+
+    @staticmethod
+    def _split_names(joined):
+        """分号连接的设备串拆成集合，用于默认勾选匹配"""
+        return {p.strip() for p in (joined or '').split(';') if p.strip()}
+
+    def _refresh_equipment_display(self):
+        """配置加载后用方法默认设备初始化复选框（点"查询设备"后会替换为完整可选列表，默认项仍勾选）"""
+        if not hasattr(self, 'main_eq_inner'):
+            return
+        eq = getattr(self, 'equipment_config', None) or {}
+        main_defaults = self._split_names(eq.get('mainEquipment', ''))
+        weighing_defaults = self._split_names(eq.get('weighingEquipment', ''))
+        self._populate_checklist(self.main_eq_inner, self.main_eq_vars,
+                                 [{'label': n, 'id': ''} for n in main_defaults], main_defaults)
+        self._populate_checklist(self.weighing_eq_inner, self.weighing_eq_vars,
+                                 [{'label': n, 'id': ''} for n in weighing_defaults], weighing_defaults)
+        self.eq_query_status_var.set("已显示默认设备，点查询设备可拉取全部")
+
+    def _first_selected_project_id(self):
+        """返回第一个选中检测项目的 projectId，无则 None"""
+        project_vars = getattr(self, 'project_vars', [])
+        filtered = getattr(self, 'filtered_projects', [])
+        for i, var in enumerate(project_vars):
+            if var.get() and i < len(filtered):
+                pid = filtered[i].get('projectId')
+                if pid:
+                    return pid
+        return None
+
+    def query_equipment_choices(self):
+        """查询当前选中项目的主检/称样设备可选列表，重建复选框（对齐网页端 ocMultipleChoicePage / ocChoicePage）"""
+        if not self.login_system.current_user:
+            messagebox.showerror("错误", "请先登录系统")
+            return
+        sample_project_id = self._first_selected_project_id()
+        if not sample_project_id:
+            messagebox.showerror("错误", "请先选择检测项目")
+            return
+        self.log(f"查询设备可选列表: SampleProjectId={sample_project_id}")
+        main_list = self.api.get_main_equipment_choices(sample_project_id, self.log)
+        weighing_list = self.api.get_weighing_equipment_choices(sample_project_id, self.log)
+        eq = getattr(self, 'equipment_config', None) or {}
+        self._populate_checklist(self.main_eq_inner, self.main_eq_vars,
+                                 main_list, self._split_names(eq.get('mainEquipment', '')))
+        self._populate_checklist(self.weighing_eq_inner, self.weighing_eq_vars,
+                                 weighing_list, self._split_names(eq.get('weighingEquipment', '')))
+        self.eq_query_status_var.set(f"主检 {len(main_list)} 项, 称样 {len(weighing_list)} 项")
+        self.log(f"设备可选列表已更新: 主检 {len(main_list)} 项, 称样 {len(weighing_list)} 项")
 
     def setup_default_data_fields(self):
         """设置默认的数据字段（在获取动态配置前使用）- 包括固定备注字段"""
@@ -697,18 +1141,26 @@ class DetectionEntrySystem:
         self.setup_fixed_remark_field()
 
     def setup_dynamic_data_fields(self, dynamic_columns):
-        """根据动态列配置设置数据字段 - 修复数据绑定问题"""
+        """根据动态列配置设置数据字段 - 表格形式，支持平行样多次测试与列合并
+
+        平行样测试次数 > 1 时渲染多行；isColumnMerge=1 的列跨行合并（共享一个值）。
+        data_fields[col_code]：合并列 -> StringVar；非合并列 -> list[StringVar]（每行一个）。
+        """
         # 保存当前用户输入的值，避免重新创建字段时丢失
         current_values = {}
         if hasattr(self, 'data_fields'):
             for col_code, var in self.data_fields.items():
-                current_values[col_code] = var.get()
+                if isinstance(var, list):
+                    current_values[col_code] = [v.get() for v in var]
+                else:
+                    current_values[col_code] = var.get()
 
         # 清空现有字段
         for widget in self.dynamic_fields_frame.winfo_children():
             widget.destroy()
 
         self.data_fields = {}
+        self.merge_columns = set()
 
         if not dynamic_columns:
             # 显示无配置信息
@@ -721,50 +1173,92 @@ class DetectionEntrySystem:
             return
 
         sorted_columns = sorted(dynamic_columns, key=lambda x: x.get('columeOrder', 0))
+        n = max(1, getattr(self, 'test_run_count', 1))
 
-        # 只处理动态列
+        # 记录合并列
         for col in sorted_columns:
+            if self._is_merge_column(col):
+                self.merge_columns.add(col.get('columeCode', f'dynamic{col.get("id")}'))
+
+        # ---- 表格 ----
+        table = ttk.Frame(self.dynamic_fields_frame)
+        table.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        table.columnconfigure(0, weight=0)
+        for c_idx in range(1, len(sorted_columns) + 1):
+            table.columnconfigure(c_idx, weight=1)
+
+        # 表头：次数 + 各动态列
+        ttk.Label(table, text="次数", width=6).grid(row=0, column=0, padx=3, pady=(0, 4), sticky='w')
+        for c_idx, col in enumerate(sorted_columns, start=1):
+            ttk.Label(table, text=col.get('columeName', ''), width=10).grid(
+                row=0, column=c_idx, padx=3, pady=(0, 4), sticky='w')
+
+        # 次数列（只读）
+        for run_idx in range(n):
+            ttk.Label(table, text=f"第{run_idx + 1}次", width=6).grid(
+                row=run_idx + 1, column=0, padx=3, pady=2, sticky='w')
+
+        # 各动态列控件
+        for c_idx, col in enumerate(sorted_columns, start=1):
             col_id = col.get('id')
-            col_name = col.get('columeName', '')
             col_code = col.get('columeCode', f'dynamic{col_id}')
             edit_type = col.get('editType', 'EDIT_TYPE_TEXT')
             default_val = col.get('defaultVal', '')
+            select_values = self.get_select_values(col_id, col_code) if edit_type == 'EDIT_TYPE_SELECT' else []
 
-            frame = ttk.Frame(self.dynamic_fields_frame)
-            frame.pack(fill=tk.X, pady=5)
-
-            ttk.Label(frame, text=col_name, width=20).pack(side=tk.LEFT)
-
-            # 优先使用用户当前输入的值，如果没有则使用默认值
-            current_value = current_values.get(col_code, default_val)
-
-            if edit_type == 'EDIT_TYPE_SELECT':
-                # 选择框类型
-                var = tk.StringVar(value=current_value)
-
-                # 获取可选值
-                select_values = self.get_select_values(col_id, col_code)
-                if select_values:
-                    # 有可选值，创建下拉框
-                    combobox = ttk.Combobox(frame, textvariable=var, values=select_values, width=20)
-                    combobox.pack(side=tk.LEFT, padx=5)
-                    if current_value:
-                        combobox.set(current_value)
-                else:
-                    # 没有可选值，使用文本框
-                    entry = ttk.Entry(frame, textvariable=var, width=20)
-                    entry.pack(side=tk.LEFT, padx=5)
-
+            if col_code in self.merge_columns:
+                # 合并列：跨 N 行共享一个值
+                cur = current_values.get(col_code)
+                var = tk.StringVar(value=cur if isinstance(cur, str) else default_val)
+                cell = ttk.Frame(table)
+                cell.grid(row=1, column=c_idx, rowspan=n, padx=3, pady=2, sticky='ew')
+                self._create_cell_widget(cell, var, select_values)
                 self.data_fields[col_code] = var
             else:
-                # 文本类型
-                var = tk.StringVar(value=current_value)
-                entry = ttk.Entry(frame, textvariable=var, width=20)
-                entry.pack(side=tk.LEFT, padx=5)
-                self.data_fields[col_code] = var
+                # 非合并列：每次测试一个值
+                cur_list = current_values.get(col_code) if isinstance(current_values.get(col_code), list) else None
+                vars_list = []
+                for run_idx in range(n):
+                    val = cur_list[run_idx] if cur_list and run_idx < len(cur_list) else default_val
+                    v = tk.StringVar(value=val)
+                    cell = ttk.Frame(table)
+                    cell.grid(row=run_idx + 1, column=c_idx, padx=3, pady=2, sticky='ew')
+                    self._create_cell_widget(cell, v, select_values)
+                    vars_list.append(v)
+                self.data_fields[col_code] = vars_list
 
         # 添加固定备注字段（在动态列之后）
         self.setup_fixed_remark_field()
+
+    def _is_merge_column(self, col):
+        """该动态列是否跨测试次数合并（来自方法设置 isColumnMerge）"""
+        try:
+            return int(col.get('isColumnMerge') or 0) == 1
+        except (TypeError, ValueError):
+            return False
+
+    def _compute_test_run_count(self, experiment_config):
+        """测试次数 N = 单个项目在 ocAnalysisRecordList 中的记录数（默认 1）"""
+        records = (experiment_config or {}).get('ocAnalysisRecordList') or []
+        per_project = {}
+        for r in records:
+            pid = r.get('projectId')
+            if pid is None:
+                continue
+            per_project[pid] = per_project.get(pid, 0) + 1
+        return max(per_project.values()) if per_project else 1
+
+    def _create_cell_widget(self, parent, var, select_values):
+        """在表格单元格里创建输入控件：有下拉选项用 Combobox，否则 Entry"""
+        if select_values:
+            cb = ttk.Combobox(parent, textvariable=var, values=select_values, width=10)
+            cb.pack(fill=tk.X)
+            if var.get():
+                cb.set(var.get())
+            return cb
+        entry = ttk.Entry(parent, textvariable=var, width=10)
+        entry.pack(fill=tk.X)
+        return entry
 
     def update_status(self, message, color="black"):
         """更新状态栏"""
@@ -936,7 +1430,7 @@ class DetectionEntrySystem:
             self.project_vars.append(var)
             self.project_id_to_var[project.get('projectId')] = var
 
-            checkbox = ttk.Checkbutton(project_frame, variable=var, width=8)
+            checkbox = ttk.Checkbutton(project_frame, variable=var, width=8, style=self.large_cb_style)
             checkbox.pack(side=tk.LEFT)
             checkbox.bind('<Button-1>', lambda e, v=var: self.on_project_selected())
 
@@ -979,11 +1473,14 @@ class DetectionEntrySystem:
     def find_mass_field(self):
         """查找质量字段"""
         for field_code, var in self.data_fields.items():
-            field_value = var.get()
-            # 简单的启发式方法：如果字段值看起来像质量值
-            if field_value and field_value.replace('.', '').isdigit():
-                if float(field_value) > 0:
-                    return field_code
+            # 合并列=单个 StringVar；非合并列=list（每次测试一个）
+            vals = var if isinstance(var, list) else [var]
+            for v in vals:
+                field_value = v.get()
+                # 简单的启发式方法：如果字段值看起来像质量值
+                if field_value and field_value.replace('.', '').isdigit():
+                    if float(field_value) > 0:
+                        return field_code
         return None
 
     def submit_single_method_group(self, method_name, projects, configure_order=None):
@@ -1090,6 +1587,7 @@ class DetectionEntrySystem:
             # 提取各个配置
             self.experiment_config = all_configs.get('experiment')
             self.equipment_config = all_configs.get('equipment')
+            self._refresh_equipment_display()
             self.units_config = all_configs.get('units')
             self.round_methods_config = all_configs.get('round_methods')
             self.calc_methods_config = all_configs.get('calc_methods')
@@ -1118,16 +1616,36 @@ class DetectionEntrySystem:
             # 构建实验数据 - 使用修复后的方法
             experiment_data = self.build_grouped_experiment_data(projects, experiment_code, actual_method_name)
 
+            # 注入已上传的谱图关联（谱图上传标签页产出的记录）
+            if getattr(self, "spectrum_uploaded", None):
+                experiment_data["fileIds"] = ",".join(str(f["fileId"]) for f in self.spectrum_uploaded)
+                group_pids = ",".join(str(p.get("projectId")) for p in projects if p.get("projectId"))
+                experiment_data["spectrumJsonList"] = json.dumps([
+                    {"fileId": f["fileId"], "fileName": f["fileName"], "projectId": group_pids}
+                    for f in self.spectrum_uploaded
+                ])
+
             # 提交数据
-            success = self.api.submit_experiment_data(experiment_data, actual_method_name, self.log)
+            success, _ = self.api.submit_experiment_data(experiment_data, actual_method_name, self.log)
 
             if success:
+                # 实验编号由服务端生成；saveOcExperiment 响应只回项目id，故另查 getOcExperiment 取真实编号
+                real_code = experiment_code
+                first_pid = str(project_ids[0]) if project_ids else ""
+                if first_pid:
+                    try:
+                        cfg = self.api.get_experiment_config(first_pid, "", "", "", self.log)
+                        if isinstance(cfg, dict):
+                            real_code = self.api.extract_experiment_code(cfg, experiment_code)
+                    except Exception as e:
+                        if self.log:
+                            self.log(f"读取真实实验编号失败: {e}")
                 # 保存实验编号
                 if not hasattr(self, 'experiment_codes'):
                     self.experiment_codes = {}
 
                 for project_id in project_ids:
-                    self.experiment_codes[project_id] = experiment_code
+                    self.experiment_codes[project_id] = real_code
 
                 # 更新实验编号显示
                 self.update_experiment_code_display()
@@ -1188,11 +1706,52 @@ class DetectionEntrySystem:
                 col_code = col.get('columeCode', '')
                 default_val = col.get('defaultVal', '')
                 if col_code in self.data_fields:
-                    self.data_fields[col_code].set(default_val)
+                    field = self.data_fields[col_code]
+                    if isinstance(field, list):
+                        for v in field:
+                            v.set(default_val)
+                    else:
+                        field.set(default_val)
 
         # 清空固定备注字段
         if hasattr(self, 'remark_text'):
             self.remark_text.delete('1.0', tk.END)
+
+    def switch_method_id(self):
+        """手动切换选中项目的方法ID - 对选中项目调用 update_method 切到输入的目标方法ID"""
+        if not self.login_system.current_user:
+            messagebox.showerror("错误", "请先登录系统")
+            return
+
+        target_id = self.switch_method_id_var.get().strip()
+        if not target_id:
+            messagebox.showerror("错误", "请输入要切换到的目标方法ID")
+            return
+
+        # 取选中的项目（与提交流程一致的选中逻辑）
+        selected_indices = [i for i, var in enumerate(self.project_vars) if var.get()]
+        if not selected_indices:
+            messagebox.showerror("错误", "请至少选择一个检测项目")
+            return
+
+        selected_projects = [self.filtered_projects[i] for i in selected_indices if i < len(self.filtered_projects)]
+        project_ids = [str(p.get('projectId')) for p in selected_projects if p.get('projectId')]
+        if not project_ids:
+            messagebox.showerror("错误", "选中的项目没有有效的项目ID")
+            return
+
+        sample_project_ids_str = ",".join(project_ids)
+        project_names = [p.get('projectName', '') for p in selected_projects]
+
+        self.log(f"开始切换方法ID: 项目[{sample_project_ids_str}] -> 方法ID {target_id}")
+        success = self.api.update_method(sample_project_ids_str, target_id, project_names, self.log)
+
+        if success:
+            self.log(f"已切换到方法ID: {target_id}，自动刷新动态配置...")
+            self.get_dynamic_config()  # 切换后自动刷新动态输入字段（随新方法ID变化）
+        else:
+            self.log(f"方法ID切换失败: 目标ID={target_id}")
+            messagebox.showerror("失败", "方法ID切换失败，请检查目标方法ID是否正确或网络连接")
 
 def main():
     parser = argparse.ArgumentParser(description='检测数据录入系统')
@@ -1202,7 +1761,7 @@ def main():
 
     args = parser.parse_args()
 
-    root = tk.Tk()
+    root = ttkb.Window(themename="sandstone-light")
     app = DetectionEntrySystem(
         root,
         result_checkin_ids=args.result_checkin_ids,
