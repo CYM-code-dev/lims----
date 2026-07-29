@@ -1,8 +1,11 @@
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 from tkinter import messagebox, filedialog
+import ttkbootstrap as ttkb  # 档1: 现代主题(sandstone-light)，ttk 控件自动套用
 import yaml
 import os
+import paths
 import random
 
 
@@ -14,6 +17,40 @@ class QueryTab:
         self.exclusion_rules = []  # 新增：排除项目规则
         self.sum_rules = []  # 新增：总和规则
         self.create_tab()
+
+    def _setup_cell_tooltip(self, tree, columns):
+        """为 tree 指定列悬停显示单元格全部内容(项目/检测方法等长文本列)。"""
+        tip = tk.Toplevel(tree)
+        tip.withdraw()
+        tip.overrideredirect(True)
+        label = ttk.Label(tip, background="#ffffe0", relief="solid", borderwidth=1,
+                          padding=(6, 3), wraplength=420)
+        label.pack()
+        last = [None]  # (item, col) 避免同一格反复重绘
+
+        def on_motion(event):
+            item = tree.identify_row(event.y)
+            col = tree.identify_column(event.x)
+            if not item or not col:
+                tip.withdraw(); last[0] = None; return
+            try:
+                idx = int(col.replace("#", "")) - 1
+                name = str(tree["columns"][idx])
+            except (ValueError, IndexError):
+                tip.withdraw(); last[0] = None; return
+            if name not in columns:
+                tip.withdraw(); last[0] = None; return
+            values = tree.item(item, "values")
+            text = str(values[idx]).strip() if idx < len(values) else ""
+            if not text:
+                tip.withdraw(); last[0] = None; return
+            if last[0] != (item, name):
+                label.configure(text=text); last[0] = (item, name)
+            tip.geometry(f"+{tree.winfo_rootx() + event.x + 14}+{tree.winfo_rooty() + event.y + 14}")
+            tip.deiconify(); tip.lift()
+
+        tree.bind("<Motion>", on_motion)
+        tree.bind("<Leave>", lambda e: (tip.withdraw(), last.__setitem__(0, None)))
 
     def create_tab(self):
         # 创建查询条件标签页
@@ -29,72 +66,72 @@ class QueryTab:
         rules_frame = ttk.LabelFrame(parent, text="查询条件规则管理", padding=5)
         rules_frame.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # 创建规则输入区域
+        # 创建规则输入区域 - 分两行：第一行文本输入(描述/项目/检测方法)，第二行选项与按钮(Retest/最大选中数量/Mode/添加)
         input_frame = ttk.Frame(rules_frame)
         input_frame.pack(fill='x', pady=2)
 
-        # 配置列权重
-        input_frame.columnconfigure(0, weight=0)  # 描述标签
-        input_frame.columnconfigure(1, weight=0)  # 描述输入框
-        input_frame.columnconfigure(2, weight=0)  # 项目标签
-        input_frame.columnconfigure(3, weight=0)  # 项目输入框
-        input_frame.columnconfigure(4, weight=0)  # 方法标签
-        input_frame.columnconfigure(5, weight=1)  # 方法输入框（增大权重）
-        input_frame.columnconfigure(6, weight=0)  # 注销复测标签
-        input_frame.columnconfigure(7, weight=0)  # 注销复测复选框
-        input_frame.columnconfigure(8, weight=1)  # 空白区域
-        input_frame.columnconfigure(9, weight=0)  # 添加按钮
+        # 第一行：项目 / 检测方法
+        row0 = ttk.Frame(input_frame)
+        row0.pack(fill='x', pady=1)
+        row0.columnconfigure(3, weight=1)  # 检测方法输入框列撑开填满
 
-        # 描述输入 - 可以为空
-        ttk.Label(input_frame, text="描述:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
-        self.query_description_entry = ttk.Entry(input_frame, width=10)
-        self.query_description_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
+        ttk.Label(row0, text="项目:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
+        self.query_project_entry = ttk.Entry(row0, width=25)
+        self.query_project_entry.grid(row=0, column=1, padx=(0, 10), pady=1, sticky='w')
 
-        # 项目输入
-        ttk.Label(input_frame, text="项目:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
-        self.query_project_entry = ttk.Entry(input_frame, width=10)
-        self.query_project_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='w')
+        ttk.Label(row0, text="检测方法:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
+        self.query_method_entry = ttk.Entry(row0, width=20)
+        self.query_method_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='ew')
 
-        # 检测方法输入 - 增大宽度
-        ttk.Label(input_frame, text="检测方法:").grid(row=0, column=4, padx=(0, 5), pady=1, sticky='w')
-        self.query_method_entry = ttk.Entry(input_frame, width=20)
-        self.query_method_entry.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='ew')
+        # 第二行：Retest / 最大选中数量 / Mode / 添加
+        row1 = ttk.Frame(input_frame)
+        row1.pack(fill='x', pady=1)
+        row1.columnconfigure(6, weight=1)  # 末尾空白撑开，把添加按钮推到右侧
 
-        # 注销复测选择
-        ttk.Label(input_frame, text="Retest:").grid(row=0, column=6, padx=(0, 5), pady=1, sticky='w')
+        ttk.Label(row1, text="Retest:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
         self.query_cancel_test_var = tk.BooleanVar()
-        self.query_cancel_test_check = ttk.Checkbutton(
-            input_frame, variable=self.query_cancel_test_var
-        )
-        self.query_cancel_test_check.grid(row=0, column=7, padx=(0, 5), pady=1, sticky='w')
+        self.query_cancel_test_check = ttkb.Checkbutton(
+            row1, variable=self.query_cancel_test_var, bootstyle="primary")
+        self.query_cancel_test_check.grid(row=0, column=1, padx=(0, 10), pady=1, sticky='w')
 
-        # 添加按钮
-        self.add_query_rule_btn = ttk.Button(input_frame, text="添加", command=self.add_query_rule)
-        self.add_query_rule_btn.grid(row=0, column=9, padx=(5, 0), pady=1, sticky='e')
+        ttk.Label(row1, text="最大选中数量:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
+        self.query_max_select_entry = ttk.Entry(row1, width=8)
+        self.query_max_select_entry.grid(row=0, column=3, padx=(0, 10), pady=1, sticky='w')
+
+        ttk.Label(row1, text="Mode:").grid(row=0, column=4, padx=(0, 5), pady=1, sticky='w')
+        self.query_mode_var = tk.StringVar(value="方法")
+        self.query_mode_combo = ttk.Combobox(row1, textvariable=self.query_mode_var,
+                                             values=["方法", "样品"], state="readonly", width=8)
+        self.query_mode_combo.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='w')
+
+        self.add_query_rule_btn = ttkb.Button(row1, text="添加", command=self.add_query_rule, bootstyle="secondary")
+        self.add_query_rule_btn.grid(row=0, column=7, padx=(5, 0), pady=1, sticky='e')
 
         # 创建规则显示区域
         display_frame = ttk.Frame(rules_frame)
         display_frame.pack(fill='both', expand=True, pady=5)
 
-        # 创建规则表格 - 新增序号列和录入方式列，调整列顺序
-        columns = ("No", "项目", "检测方法", "Retest", "Mode", "描述")
+        # 创建规则表格 - 列顺序与输入框一致：项目/检测方法/Retest/最大选中数量；Mode 为非输入项置末
+        columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode")
         self.query_rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=8)
 
         # 设置列标题和宽度
+        # 短列(No/Retest/Max/Mode)固定窄列宽不随窗口拉伸；文本列(项目/检测方法)随窗口伸缩
         column_configs = {
-            "No": {"width": 30, "anchor": "center"},  # 序号列居中对齐
-            "项目": {"width": 150, "anchor": "w"},  # 项目列左对齐
-            "检测方法": {"width": 150, "anchor": "w"},  # 检测方法列左对齐
-            "Retest": {"width": 30, "anchor": "center"},  # 注销复测列居中对齐
-            "Mode": {"width": 100, "anchor": "center"},  # 录入方式列居中对齐
-            "描述": {"width": 100, "anchor": "w"}  # 描述列左对齐
+            "No": {"width": 50, "anchor": "center", "stretch": False},  # 序号列居中对齐
+            "项目": {"width": 200, "anchor": "center"},  # 项目列居中对齐
+            "检测方法": {"width": 200, "anchor": "center"},  # 检测方法列居中对齐
+            "Retest": {"width": 90, "anchor": "center", "stretch": False},  # 注销复测列居中对齐
+            "Max": {"width": 80, "anchor": "center", "stretch": False},  # 最大选中数量列居中对齐
+            "Mode": {"width": 90, "anchor": "center", "stretch": False}  # 录入方式列居中对齐
         }
 
         for col in columns:
-            self.query_rules_tree.heading(col, text=col)
+            self.query_rules_tree.heading(col, text=col, anchor="center")
             config = column_configs.get(col, {})
             self.query_rules_tree.column(col, width=config.get("width", 100),
-                                         anchor=config.get("anchor", "w"))
+                                         anchor=config.get("anchor", "center"),
+                                         stretch=config.get("stretch", True))
 
         # 添加滚动条
         scrollbar = ttk.Scrollbar(display_frame, orient="vertical", command=self.query_rules_tree.yview)
@@ -106,24 +143,27 @@ class QueryTab:
         # 绑定双击事件，用于编辑规则
         self.query_rules_tree.bind("<Double-1>", self.on_query_rule_double_click)
 
+        # 项目/检测方法 列悬停显示全部内容
+        self._setup_cell_tooltip(self.query_rules_tree, ("项目", "检测方法"))
+
         # 创建规则操作按钮 - 新增上移、下移按钮，以及排除和总和按钮
         button_frame = ttk.Frame(rules_frame)
         button_frame.pack(fill='x', pady=3)
 
         # 左侧按钮
-        ttk.Button(button_frame, text="上移", command=self.move_query_rule_up).pack(side='left', padx=2)
-        ttk.Button(button_frame, text="下移", command=self.move_query_rule_down).pack(side='left', padx=2)
-        ttk.Button(button_frame, text="删除", command=self.delete_query_rule).pack(side='left', padx=2)
+        ttkb.Button(button_frame, text="上移", command=self.move_query_rule_up, bootstyle="secondary").pack(side='left', padx=2)
+        ttkb.Button(button_frame, text="下移", command=self.move_query_rule_down, bootstyle="secondary").pack(side='left', padx=2)
+        ttkb.Button(button_frame, text="删除", command=self.delete_query_rule, bootstyle="danger").pack(side='left', padx=2)
 
         # 右侧按钮 - 新增排除和总和按钮
-        ttk.Button(button_frame, text="排除", command=self.show_exclusion_dialog).pack(side='right', padx=2)
-        ttk.Button(button_frame, text="总和", command=self.show_sum_dialog).pack(side='right', padx=2)
+        ttkb.Button(button_frame, text="排除", command=self.show_exclusion_dialog, bootstyle="secondary").pack(side='right', padx=2)
+        ttkb.Button(button_frame, text="总和", command=self.show_sum_dialog, bootstyle="secondary").pack(side='right', padx=2)
 
     def show_exclusion_dialog(self):
         """显示排除项目设置对话框"""
-        dialog = tk.Toplevel(self.parent)
+        dialog = ttkb.Toplevel(self.parent)
         dialog.title("排除项目设置")
-        dialog.geometry("550x400")  # 增加宽度以容纳更多内容
+        dialog.geometry("880x760")  # 增加宽度以容纳更多内容
         dialog.transient(self.parent)
         dialog.grab_set()
 
@@ -131,7 +171,7 @@ class QueryTab:
         dialog.resizable(True, True)
 
         # 计算居中位置
-        self.center_dialog(dialog, 550, 400)
+        self.center_dialog(dialog, 880, 760)
 
         # 主容器
         main_frame = ttk.Frame(dialog, padding=10)
@@ -193,22 +233,23 @@ class QueryTab:
             # 标记已修改
             self.app.mark_modified()
 
-        ttk.Button(input_frame, text="添加", command=add_exclusion_rule).grid(row=0, column=4, padx=5, pady=3,
+        ttkb.Button(input_frame, text="添加", command=add_exclusion_rule, bootstyle="secondary").grid(row=0, column=4, padx=5, pady=3,
                                                                               sticky='e')
 
         # 排除项目列表
         list_frame = ttk.LabelFrame(main_frame, text="已添加的排除项目", padding=5)
         list_frame.pack(fill='both', expand=True, pady=(0, 5))
         list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
 
         # 创建列表
         columns = ("项目", "检测方法")
         exclusion_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
 
         # 设置列宽 - 增加项目列宽度
-        exclusion_tree.heading("项目", text="项目")
+        exclusion_tree.heading("项目", text="项目", anchor="w")
         exclusion_tree.column("项目", width=250, anchor="w")
-        exclusion_tree.heading("检测方法", text="检测方法")
+        exclusion_tree.heading("检测方法", text="检测方法", anchor="w")
         exclusion_tree.column("检测方法", width=200, anchor="w")
 
         # 添加滚动条
@@ -257,10 +298,10 @@ class QueryTab:
                 refresh_exclusion_list()
                 self.app.mark_modified()
 
-        ttk.Button(button_frame, text="删除选中", command=delete_selected_exclusion).pack(side='left', padx=5)
+        ttkb.Button(button_frame, text="删除选中", command=delete_selected_exclusion, bootstyle="danger").pack(side='left', padx=5)
 
         # 关闭按钮
-        ttk.Button(button_frame, text="关闭", command=dialog.destroy).pack(side='right', padx=5)
+        ttkb.Button(button_frame, text="关闭", command=dialog.destroy, bootstyle="secondary").pack(side='right', padx=5)
 
     def on_exclusion_rule_double_click(self, event, tree):
         """双击排除规则进行编辑"""
@@ -281,7 +322,7 @@ class QueryTab:
 
         # 创建编辑框
         entry = ttk.Entry(tree)
-        entry.place(x=x, y=y, width=width, height=height)
+        entry.place(x=x, y=y-4, width=width, height=height+8)
         entry.insert(0, current_value)
         entry.focus_set()
 
@@ -319,9 +360,9 @@ class QueryTab:
 
     def show_sum_dialog(self):
         """显示总和设置对话框"""
-        dialog = tk.Toplevel(self.parent)
+        dialog = ttkb.Toplevel(self.parent)
         dialog.title("总和设置")
-        dialog.geometry("700x400")  # 增加宽度以容纳更多内容
+        dialog.geometry("1020x760")  # 增加宽度以容纳更多内容
         dialog.transient(self.parent)
         dialog.grab_set()
 
@@ -329,7 +370,7 @@ class QueryTab:
         dialog.resizable(True, True)
 
         # 计算居中位置
-        self.center_dialog(dialog, 700, 400)
+        self.center_dialog(dialog, 1020, 760)
 
         # 主容器
         main_frame = ttk.Frame(dialog, padding=10)
@@ -416,27 +457,28 @@ class QueryTab:
             # 标记已修改
             self.app.mark_modified()
 
-        ttk.Button(input_frame, text="添加", command=add_sum_rule).grid(row=0, column=8, padx=5, pady=3, sticky='e')
+        ttkb.Button(input_frame, text="添加", command=add_sum_rule, bootstyle="secondary").grid(row=0, column=8, padx=5, pady=3, sticky='e')
 
-        ttk.Button(input_frame, text="添加", command=add_sum_rule).grid(row=0, column=8, padx=5, pady=3, sticky='e')
+        ttkb.Button(input_frame, text="添加", command=add_sum_rule, bootstyle="secondary").grid(row=0, column=8, padx=5, pady=3, sticky='e')
 
         # 总和条款列表
         list_frame = ttk.LabelFrame(main_frame, text="已添加的总和条款", padding=5)
         list_frame.pack(fill='both', expand=True, pady=(0, 5))
         list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
 
         # 创建列表
         columns = ("项目", "检测方法", "ID1", "ID2")
         sum_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
 
         # 设置列宽 - 增加项目和方法列宽，减少ID1和ID2列宽
-        sum_tree.heading("项目", text="项目")
+        sum_tree.heading("项目", text="项目", anchor="w")
         sum_tree.column("项目", width=190, anchor="w")
-        sum_tree.heading("检测方法", text="检测方法")
+        sum_tree.heading("检测方法", text="检测方法", anchor="w")
         sum_tree.column("检测方法", width=190, anchor="w")
-        sum_tree.heading("ID1", text="ID1")
+        sum_tree.heading("ID1", text="ID1", anchor="w")
         sum_tree.column("ID1", width=40, anchor="w")  # 减少ID1列宽
-        sum_tree.heading("ID2", text="ID2")
+        sum_tree.heading("ID2", text="ID2", anchor="w")
         sum_tree.column("ID2", width=40, anchor="w")  # 减少ID2列宽
 
         # 添加滚动条
@@ -487,10 +529,10 @@ class QueryTab:
                 refresh_sum_list()
                 self.app.mark_modified()
 
-        ttk.Button(button_frame, text="删除选中", command=delete_selected_sum).pack(side='left', padx=5)
+        ttkb.Button(button_frame, text="删除选中", command=delete_selected_sum, bootstyle="danger").pack(side='left', padx=5)
 
         # 关闭按钮
-        ttk.Button(button_frame, text="关闭", command=dialog.destroy).pack(side='right', padx=5)
+        ttkb.Button(button_frame, text="关闭", command=dialog.destroy, bootstyle="secondary").pack(side='right', padx=5)
 
     def center_dialog(self, dialog, width, height):
         """将对话框居中显示在主窗口中间"""
@@ -529,7 +571,7 @@ class QueryTab:
 
         # 创建编辑框
         entry = ttk.Entry(tree)
-        entry.place(x=x, y=y, width=width, height=height)
+        entry.place(x=x, y=y-4, width=width, height=height+8)
         entry.insert(0, current_value)
         entry.focus_set()
 
@@ -596,11 +638,13 @@ class QueryTab:
         if column_name == "Mode":
             # 创建下拉框
             combo = ttk.Combobox(self.query_rules_tree, values=["方法", "样品"], state="readonly")
-            combo.place(x=x, y=y, width=width, height=height)
+            combo.place(x=x, y=y-4, width=width, height=height+8)
             combo.set(current_value)
             combo.focus_set()
 
             def save_combo_edit(event=None):
+                if not combo.winfo_exists():
+                    return
                 new_value = combo.get()
                 new_values = list(current_values)
                 new_values[column_index] = new_value
@@ -616,22 +660,41 @@ class QueryTab:
                 combo.destroy()
 
             def cancel_combo_edit(event=None):
-                combo.destroy()
+                if combo.winfo_exists():
+                    combo.destroy()
+
+            def on_focus_out(event=None):
+                # 下拉框展开会先触发 FocusOut；延迟检查焦点是否落在 popdown 上，
+                # 若是则不关闭（避免一展开下拉就被销毁，导致 方法/样品 切换不顺）
+                def _check():
+                    if not combo.winfo_exists():
+                        return
+                    if "popdown" in str(self.query_rules_tree.tk.call('focus')):
+                        return
+                    combo.destroy()
+                combo.after(10, _check)
 
             combo.bind("<Return>", save_combo_edit)
-            combo.bind("<FocusOut>", save_combo_edit)
+            combo.bind("<FocusOut>", on_focus_out)
             combo.bind("<Escape>", cancel_combo_edit)
             combo.bind("<<ComboboxSelected>>", save_combo_edit)
         else:
             # 其他列使用文本框编辑
             entry = ttk.Entry(self.query_rules_tree)
-            entry.place(x=x, y=y, width=width, height=height)
+            entry.place(x=x, y=y-4, width=width, height=height+8)
             entry.insert(0, current_value)
             entry.focus_set()
 
             def save_edit(event=None):
                 # 获取新值
                 new_value = entry.get()
+
+                # 最大选中数量校验：留空表示不限制，否则必须是非负整数
+                if column_name == "Max":
+                    new_value = new_value.strip()
+                    if new_value and not new_value.isdigit():
+                        messagebox.showwarning("输入错误", "最大选中数量必须为空或非负整数")
+                        return
 
                 # 更新显示
                 new_values = list(current_values)
@@ -642,7 +705,6 @@ class QueryTab:
                 index = self.query_rules_tree.index(item)
                 if 0 <= index < len(self.query_rules):
                     rule = self.query_rules[index]
-                    column_name = self.query_rules_tree.heading(column_index)['text']
 
                     if column_name == "项目":
                         rule["project"] = new_value
@@ -650,8 +712,8 @@ class QueryTab:
                         rule["method"] = new_value
                     elif column_name == "Retest":
                         rule["cancel_test"] = (new_value == "是")
-                    elif column_name == "描述":
-                        rule["description"] = new_value
+                    elif column_name == "Max":
+                        rule["max_select"] = new_value
 
                 # 标记已修改
                 self.app.mark_modified()
@@ -732,26 +794,31 @@ class QueryTab:
     def add_query_rule(self):
         """添加查询条件规则"""
         # 获取输入值
-        description = self.query_description_entry.get().strip()
         project = self.query_project_entry.get().strip()
         method = self.query_method_entry.get().strip()
         cancel_test = self.query_cancel_test_var.get()
+        max_select = self.query_max_select_entry.get().strip()
 
-        # 使用默认录入方式
-        input_method = "方法"
+        # 录入方式（来自下拉框，默认"方法"）
+        input_method = self.query_mode_var.get() or "方法"
 
         # 验证输入 - 至少需要项目或检测方法中的一个
         if not project and not method:
             messagebox.showwarning("输入错误", "请至少填写项目或检测方法")
             return
 
+        # 验证最大选中数量 - 留空表示不限制，否则必须是非负整数
+        if max_select and not max_select.isdigit():
+            messagebox.showwarning("输入错误", "最大选中数量必须为空或非负整数")
+            return
+
         # 添加规则
         rule = {
-            "description": description,
             "project": project,
             "method": method,
             "cancel_test": cancel_test,
-            "input_method": input_method
+            "input_method": input_method,
+            "max_select": max_select
         }
         self.query_rules.append(rule)
 
@@ -759,10 +826,11 @@ class QueryTab:
         self.app.mark_modified()
 
         # 清空输入框
-        self.query_description_entry.delete(0, tk.END)
         self.query_project_entry.delete(0, tk.END)
         self.query_method_entry.delete(0, tk.END)
+        self.query_max_select_entry.delete(0, tk.END)
         self.query_cancel_test_var.set(False)
+        self.query_mode_var.set("方法")
 
         # 更新显示
         self.refresh_query_rules_tree()
@@ -807,8 +875,8 @@ class QueryTab:
                 rule.get("project", ""),
                 rule.get("method", ""),
                 "是" if rule.get("cancel_test", False) else "否",
-                rule.get("input_method", "方法"),  # 默认值为"检测方法"
-                rule.get("description", "")
+                rule.get("max_select", ""),  # 最大选中数量
+                rule.get("input_method", "方法")  # 默认值为"方法"
             ))
 
     def get_rules(self):
@@ -826,6 +894,8 @@ class QueryTab:
         for rule in query_rules:
             if "input_method" not in rule:
                 rule["input_method"] = "方法"
+            if "max_select" not in rule:
+                rule["max_select"] = ""
         self.query_rules = query_rules
 
         # 设置排除规则和总和规则
@@ -869,18 +939,17 @@ class MethodTab:
         self.switch_mode = tk.StringVar(value="default")
 
         # 默认切换类型
-        ttk.Radiobutton(mode_frame, text="默认切换",
-                        variable=self.switch_mode, value="default").pack(side='left', padx=(0, 15))
+        ttkb.Radiobutton(mode_frame, text="默认切换",
+                        variable=self.switch_mode, value="default", bootstyle="primary").pack(side='left', padx=(0, 15))
 
-        # 名称切换
-        ttk.Radiobutton(mode_frame, text="名称切换",
-                        variable=self.switch_mode, value="filename").pack(side='left', padx=(0, 15))
+        # 名称切换：文件名关键字 + 试样描述关键字(均非空时需同时命中)切换方法
+        ttkb.Radiobutton(mode_frame, text="名称切换",
+                        variable=self.switch_mode, value="filename", bootstyle="primary").pack(side='left', padx=(0, 15))
 
         # 全部复选框
         self.show_all_var = tk.BooleanVar()
-        self.show_all_check = ttk.Checkbutton(
-            mode_frame, text="全部", variable=self.show_all_var, command=self.on_show_all_change
-        )
+        self.show_all_check = ttkb.Checkbutton(
+            mode_frame, text="全部", variable=self.show_all_var, command=self.on_show_all_change, bootstyle="primary")
         self.show_all_check.pack(side='left')
 
         # 绑定切换模式变化事件
@@ -904,16 +973,11 @@ class MethodTab:
         input_frame.columnconfigure(10, weight=1)  # 空白区域扩展
         input_frame.columnconfigure(11, weight=0)  # 添加按钮
 
-        # 描述输入 - 可以为空
-        ttk.Label(input_frame, text="描述:").grid(row=0, column=0, padx=(0, 0), pady=1, sticky='w')
-        self.description_entry = ttk.Entry(input_frame, width=15)
-        self.description_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
-
         # 文件名输入
         self.filename_label = ttk.Label(input_frame, text="文件名:")
         self.filename_entry = ttk.Entry(input_frame, width=12)
 
-        # 项目名输入
+        # 项目名输入(名称切换模式下复用为"试样描述"关键字输入)
         self.project_name_label = ttk.Label(input_frame, text="项目名:")
         self.project_name_entry = ttk.Entry(input_frame, width=12)
 
@@ -926,7 +990,7 @@ class MethodTab:
         self.to_id_entry = ttk.Entry(input_frame, width=15)
 
         # 添加规则按钮
-        self.add_rule_btn = ttk.Button(input_frame, text="添加", command=self.add_rule)
+        self.add_rule_btn = ttkb.Button(input_frame, text="添加", command=self.add_rule, bootstyle="secondary")
         self.add_rule_btn.grid(row=0, column=11, padx=(5, 0), pady=1, sticky='e')
 
         # 创建规则显示区域
@@ -934,29 +998,34 @@ class MethodTab:
         display_frame.pack(fill='both', expand=True, pady=5)
 
         # 创建规则表格
-        columns = ("模式", "描述", "文件名", "项目名", "原ID", "目标ID")
+        columns = ("模式", "文件名", "试样描述", "项目名", "原ID", "目标ID")
         self.rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=6)
 
-        # 设置列标题和宽度
-        column_widths = {
-            "模式": 60,
-            "描述": 120,
-            "文件名": 100,
-            "项目名": 100,
-            "原ID": 70,
-            "目标ID": 100
+        # 设置列标题和宽度（stretch=True 列宽随窗口缩放；表头与内容 anchor 一致避免错位）
+        column_configs = {
+            "模式":   {"width": 60,  "anchor": "center"},
+            "文件名": {"width": 120, "anchor": "w"},
+            "试样描述": {"width": 140, "anchor": "w"},
+            "项目名": {"width": 120, "anchor": "w"},
+            "原ID":   {"width": 70,  "anchor": "center"},
+            "目标ID": {"width": 90,  "anchor": "center"},
         }
 
         for col in columns:
-            self.rules_tree.heading(col, text=col)
-            self.rules_tree.column(col, width=column_widths.get(col, 80))
+            cfg = column_configs[col]
+            self.rules_tree.heading(col, text=col, anchor=cfg["anchor"])
+            self.rules_tree.column(col, width=cfg["width"], anchor=cfg["anchor"], stretch=True)
 
-        # 添加滚动条
-        scrollbar = ttk.Scrollbar(display_frame, orient="vertical", command=self.rules_tree.yview)
-        self.rules_tree.configure(yscrollcommand=scrollbar.set)
+        # 添加滚动条（竖向 + 横向），用 grid 统一布局
+        vsb = ttk.Scrollbar(display_frame, orient="vertical", command=self.rules_tree.yview)
+        hsb = ttk.Scrollbar(display_frame, orient="horizontal", command=self.rules_tree.xview)
+        self.rules_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self.rules_tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        display_frame.columnconfigure(0, weight=1)
+        display_frame.rowconfigure(0, weight=1)
+        self.rules_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
 
         # 绑定双击事件，用于编辑规则
         self.rules_tree.bind("<Double-1>", self.on_rule_double_click)
@@ -965,13 +1034,13 @@ class MethodTab:
         button_frame = ttk.Frame(rules_frame)
         button_frame.pack(fill='x', pady=3)
 
-        self.move_up_btn = ttk.Button(button_frame, text="上移", command=self.move_rule_up)
+        self.move_up_btn = ttkb.Button(button_frame, text="上移", command=self.move_rule_up, bootstyle="secondary")
         self.move_up_btn.pack(side='left', padx=2)
 
-        self.move_down_btn = ttk.Button(button_frame, text="下移", command=self.move_rule_down)
+        self.move_down_btn = ttkb.Button(button_frame, text="下移", command=self.move_rule_down, bootstyle="secondary")
         self.move_down_btn.pack(side='left', padx=2)
 
-        ttk.Button(button_frame, text="删除", command=self.delete_rule).pack(side='left', padx=2)
+        ttkb.Button(button_frame, text="删除", command=self.delete_rule, bootstyle="danger").pack(side='left', padx=2)
 
     def on_rule_double_click(self, event):
         """双击方法切换规则进行编辑"""
@@ -996,7 +1065,7 @@ class MethodTab:
 
         # 创建编辑框
         entry = ttk.Entry(self.rules_tree)
-        entry.place(x=x, y=y, width=width, height=height)
+        entry.place(x=x, y=y-4, width=width, height=height+8)
         entry.insert(0, current_value)
         entry.focus_set()
 
@@ -1023,46 +1092,26 @@ class MethodTab:
             # 在规则列表中查找匹配的规则
             for i, rule in enumerate(rules_list):
                 if mode == "默认":
-                    if (rule.get("description", "") == current_values[1] and
+                    if (rule.get("project_name", "") == current_values[3] and
                             rule["from_id"] == current_values[4] and
                             rule["to_id"] == current_values[5]):
-                        if column_name == "描述":
-                            rule["description"] = new_value
+                        if column_name == "项目名":
+                            rule["project_name"] = new_value
                         elif column_name == "原ID":
                             rule["from_id"] = new_value
                         elif column_name == "目标ID":
                             rule["to_id"] = new_value
                         break
                 else:  # 名称
-                    # 使用get方法安全访问字段
-                    rule_description = rule.get("description", "")
-                    rule_filename = rule.get("filename", "")
-                    rule_project_name = rule.get("project_name", "")
-                    rule_from_id = rule.get("from_id", "")
-                    rule_to_id = rule.get("to_id", "")
-
-                    # 构建比较值
-                    compare_values = [
-                        rule_description,
-                        rule_filename,
-                        rule_project_name,
-                        rule_from_id,
-                        rule_to_id
-                    ]
-
-                    current_display_values = [
-                        current_values[1],  # 描述
-                        current_values[2],  # 文件名
-                        current_values[3],  # 项目名
-                        current_values[4],  # 原ID
-                        current_values[5]  # 目标ID
-                    ]
-
-                    if compare_values == current_display_values:
-                        if column_name == "描述":
-                            rule["description"] = new_value
-                        elif column_name == "文件名":
+                    # 文件名/试样描述/项目名/原ID/目标ID
+                    if ([rule.get("filename", ""), rule.get("desc", ""), rule.get("project_name", ""),
+                            rule.get("from_id", ""), rule.get("to_id", "")] ==
+                            [current_values[1], current_values[2], current_values[3],
+                             current_values[4], current_values[5]]):
+                        if column_name == "文件名":
                             rule["filename"] = new_value
+                        elif column_name == "试样描述":
+                            rule["desc"] = new_value
                         elif column_name == "项目名":
                             rule["project_name"] = new_value
                         elif column_name == "原ID":
@@ -1198,7 +1247,6 @@ class MethodTab:
 
         if show_all:
             # 在全部模式下，隐藏所有输入控件
-            self.description_entry.grid_remove()
             self.filename_label.grid_remove()
             self.filename_entry.grid_remove()
             self.project_name_label.grid_remove()
@@ -1208,24 +1256,28 @@ class MethodTab:
             self.to_id_label.grid_remove()
             self.to_id_entry.grid_remove()
         else:
-            # 显示描述和ID输入控件
-            self.description_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
-            self.from_id_label.grid(row=0, column=6, padx=(0, 0), pady=1, sticky='w')
-            self.from_id_entry.grid(row=0, column=7, padx=(0, 5), pady=1, sticky='w')
-            self.to_id_label.grid(row=0, column=8, padx=(0, 0), pady=1, sticky='w')
-            self.to_id_entry.grid(row=0, column=9, padx=(0, 5), pady=1, sticky='w')
+            # 显示ID输入控件
+            self.from_id_label.grid(row=0, column=4, padx=(0, 0), pady=1, sticky='w')
+            self.from_id_entry.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='w')
+            self.to_id_label.grid(row=0, column=6, padx=(0, 0), pady=1, sticky='w')
+            self.to_id_entry.grid(row=0, column=7, padx=(0, 5), pady=1, sticky='w')
 
-            # 根据模式调整文件名和项目名输入框的显示
+            # 根据模式调整输入框显示
             if mode == "filename":
-                self.filename_label.grid(row=0, column=2, padx=(0, 0), pady=1, sticky='w')
-                self.filename_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='w')
-                self.project_name_label.grid(row=0, column=4, padx=(0, 0), pady=1, sticky='w')
-                self.project_name_entry.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='w')
+                # 名称切换：文件名关键字 + 试样描述关键字(均非空时需同时命中)；项目名输入框位复用为试样描述
+                self.filename_label.configure(text="文件名:")
+                self.filename_label.grid(row=0, column=0, padx=(0, 0), pady=1, sticky='w')
+                self.filename_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
+                self.project_name_label.configure(text="试样描述:")
+                self.project_name_label.grid(row=0, column=2, padx=(0, 0), pady=1, sticky='w')
+                self.project_name_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='w')
             else:
+                # 默认切换：按项目名匹配(default_rules.project_name)
                 self.filename_label.grid_remove()
                 self.filename_entry.grid_remove()
-                self.project_name_label.grid_remove()
-                self.project_name_entry.grid_remove()
+                self.project_name_label.configure(text="项目名:")
+                self.project_name_label.grid(row=0, column=0, padx=(0, 0), pady=1, sticky='w')
+                self.project_name_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
 
         # 更新规则显示
         self.refresh_rules_tree()
@@ -1249,18 +1301,18 @@ class MethodTab:
             for rule in self.default_rules:
                 all_rules.append({
                     "mode": "默认",
-                    "description": rule.get("description", ""),
                     "filename": "",
-                    "project_name": "",
+                    "desc": "",
+                    "project_name": rule.get("project_name", ""),
                     "from_id": rule["from_id"],
                     "to_id": rule["to_id"]
                 })
-            # 添加名称切换规则
+            # 添加名称切换规则(文件名 + 试样描述关键字)
             for rule in self.filename_rules:
                 all_rules.append({
                     "mode": "名称",
-                    "description": rule.get("description", ""),
                     "filename": rule.get("filename", ""),
+                    "desc": rule.get("desc", ""),
                     "project_name": rule.get("project_name", ""),
                     "from_id": rule["from_id"],
                     "to_id": rule["to_id"]
@@ -1270,8 +1322,8 @@ class MethodTab:
             for rule in all_rules:
                 self.rules_tree.insert("", "end", values=(
                     rule["mode"],
-                    rule["description"],
                     rule["filename"],
+                    rule["desc"],
                     rule["project_name"],
                     rule["from_id"],
                     rule["to_id"]
@@ -1279,27 +1331,24 @@ class MethodTab:
         else:
             # 显示当前模式的规则
             mode = self.switch_mode.get()
-            if mode == "default":
-                rules = self.default_rules
-            else:
-                rules = self.filename_rules
+            rules = self.default_rules if mode == "default" else self.filename_rules
 
             # 添加规则到表格
             for rule in rules:
                 if mode == "default":
                     self.rules_tree.insert("", "end", values=(
                         "默认",
-                        rule.get("description", ""),
                         "",
                         "",
+                        rule.get("project_name", ""),
                         rule["from_id"],
                         rule["to_id"]
                     ))
                 else:
                     self.rules_tree.insert("", "end", values=(
                         "名称",
-                        rule.get("description", ""),
                         rule.get("filename", ""),
+                        rule.get("desc", ""),
                         rule.get("project_name", ""),
                         rule["from_id"],
                         rule["to_id"]
@@ -1309,7 +1358,6 @@ class MethodTab:
         # 获取输入值
         from_id = self.from_id_entry.get().strip()
         to_id = self.to_id_entry.get().strip()
-        description = self.description_entry.get().strip()
 
         if not from_id or not to_id:
             messagebox.showwarning("输入错误", "请填写原方法ID和目标方法ID")
@@ -1318,23 +1366,23 @@ class MethodTab:
         # 根据当前模式添加规则
         mode = self.switch_mode.get()
         if mode == "default":
-            rule = {"from_id": from_id, "to_id": to_id, "description": description}
+            project_name = self.project_name_entry.get().strip()
+            rule = {"from_id": from_id, "to_id": to_id, "project_name": project_name}
             self.default_rules.append(rule)
         else:
             filename = self.filename_entry.get().strip()
-            project_name = self.project_name_entry.get().strip()
-
-            # 验证输入 - 至少需要文件名或项目名中的一个
-            if not filename and not project_name:
-                messagebox.showwarning("输入错误", "请至少填写文件名或项目名")
+            # 名称切换：项目名输入框位复用为"试样描述"关键字(可多个逗号分隔)
+            desc = self.project_name_entry.get().strip()
+            # 验证输入 - 至少需要文件名或试样描述关键字中的一个
+            if not filename and not desc:
+                messagebox.showwarning("输入错误", "请至少填写文件名或试样描述关键字")
                 return
 
             rule = {
                 "from_id": from_id,
                 "to_id": to_id,
                 "filename": filename,
-                "project_name": project_name,
-                "description": description
+                "desc": desc
             }
 
             self.filename_rules.append(rule)
@@ -1345,7 +1393,6 @@ class MethodTab:
         # 清空输入框
         self.from_id_entry.delete(0, tk.END)
         self.to_id_entry.delete(0, tk.END)
-        self.description_entry.delete(0, tk.END)
         if mode == "filename":
             self.filename_entry.delete(0, tk.END)
             self.project_name_entry.delete(0, tk.END)
@@ -1379,35 +1426,28 @@ class MethodTab:
                 # 重新计算实际索引，因为显示的是合并后的列表
                 if mode == "默认":
                     # 在默认规则列表中查找匹配的规则
-                    target_description = values[1]
-                    target_from_id = values[4]  # 注意索引变化
+                    target_project_name = values[3]
+                    target_from_id = values[4]
                     target_to_id = values[5]
                     for i, rule in enumerate(self.default_rules):
-                        if (rule.get("description", "") == target_description and
+                        if (rule.get("project_name", "") == target_project_name and
                                 rule["from_id"] == target_from_id and
                                 rule["to_id"] == target_to_id):
                             del self.default_rules[i]
                             break
                 else:  # 名称
-                    # 在名称规则列表中查找匹配的规则
-                    target_description = values[1]
-                    target_filename = values[2]
+                    # 在名称规则列表中查找匹配的规则(文件名/试样描述/项目名/原ID/目标ID)
+                    target_filename = values[1]
+                    target_desc = values[2]
                     target_project_name = values[3]
                     target_from_id = values[4]
                     target_to_id = values[5]
                     for i, rule in enumerate(self.filename_rules):
-                        # 使用get方法安全访问字段
-                        rule_description = rule.get("description", "")
-                        rule_filename = rule.get("filename", "")
-                        rule_project_name = rule.get("project_name", "")
-                        rule_from_id = rule.get("from_id", "")
-                        rule_to_id = rule.get("to_id", "")
-
-                        if (rule_description == target_description and
-                                rule_filename == target_filename and
-                                rule_project_name == target_project_name and
-                                rule_from_id == target_from_id and
-                                rule_to_id == target_to_id):
+                        if (rule.get("filename", "") == target_filename and
+                                rule.get("desc", "") == target_desc and
+                                rule.get("project_name", "") == target_project_name and
+                                rule["from_id"] == target_from_id and
+                                rule["to_id"] == target_to_id):
                             del self.filename_rules[i]
                             break
         else:
@@ -1418,33 +1458,27 @@ class MethodTab:
             for item in selected_items:
                 # 由于没有序号列，我们需要根据规则内容来删除
                 values = self.rules_tree.item(item, "values")
-                target_description = values[1]
-                target_from_id = values[4]  # 注意索引变化
+                target_from_id = values[4]
                 target_to_id = values[5]
 
                 if mode == "default":
+                    target_project_name = values[3]
                     for i, rule in enumerate(self.default_rules):
-                        if (rule.get("description", "") == target_description and
+                        if (rule.get("project_name", "") == target_project_name and
                                 rule["from_id"] == target_from_id and
                                 rule["to_id"] == target_to_id):
                             del self.default_rules[i]
                             break
                 else:
-                    target_filename = values[2]
+                    target_filename = values[1]
+                    target_desc = values[2]
                     target_project_name = values[3]
                     for i, rule in enumerate(self.filename_rules):
-                        # 使用get方法安全访问字段
-                        rule_description = rule.get("description", "")
-                        rule_filename = rule.get("filename", "")
-                        rule_project_name = rule.get("project_name", "")
-                        rule_from_id = rule.get("from_id", "")
-                        rule_to_id = rule.get("to_id", "")
-
-                        if (rule_description == target_description and
-                                rule_filename == target_filename and
-                                rule_project_name == target_project_name and
-                                rule_from_id == target_from_id and
-                                rule_to_id == target_to_id):
+                        if (rule.get("filename", "") == target_filename and
+                                rule.get("desc", "") == target_desc and
+                                rule.get("project_name", "") == target_project_name and
+                                rule["from_id"] == target_from_id and
+                                rule["to_id"] == target_to_id):
                             del self.filename_rules[i]
                             break
 
@@ -1494,15 +1528,18 @@ class WeighingTab:
 
         self.weighing_mode = tk.StringVar(value="random")
 
-        ttk.Radiobutton(mode_frame, text="称量记录",
+        ttkb.Radiobutton(mode_frame, text="称量记录",
                         variable=self.weighing_mode, value="record",
-                        command=self.on_weighing_mode_change).pack(side='left', padx=10)
-        ttk.Radiobutton(mode_frame, text="随机数生成",
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
+        ttkb.Radiobutton(mode_frame, text="随机数生成",
                         variable=self.weighing_mode, value="random",
-                        command=self.on_weighing_mode_change).pack(side='left', padx=10)
-        ttk.Radiobutton(mode_frame, text="称量记录处理",
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
+        ttkb.Radiobutton(mode_frame, text="称量记录处理",
                         variable=self.weighing_mode, value="process",
-                        command=self.on_weighing_mode_change).pack(side='left', padx=10)
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
+        ttkb.Radiobutton(mode_frame, text="无需称样量",
+                        variable=self.weighing_mode, value="none",
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
 
         # 创建内容区域 - 所有模式的内容都显示
         self.weighing_content_frame = ttk.Frame(weighing_frame)
@@ -1595,7 +1632,7 @@ class WeighingTab:
         self.result_decimal_entry = ttk.Entry(config_frame, textvariable=self.result_decimal_places, width=5)
 
         # 添加按钮 - 右对齐
-        self.add_processing_rule_btn = ttk.Button(config_frame, text="添加", command=self.add_processing_rule)
+        self.add_processing_rule_btn = ttkb.Button(config_frame, text="添加", command=self.add_processing_rule, bootstyle="secondary")
         self.add_processing_rule_btn.grid(row=0, column=9, padx=(10, 0), pady=2, sticky='e')
 
         # 初始显示参数配置
@@ -1616,10 +1653,11 @@ class WeighingTab:
         }
 
         for col in columns:
-            self.processing_rules_tree.heading(col, text=col)
             config = column_configs.get(col, {})
+            anchor = config.get("anchor", "w")
+            self.processing_rules_tree.heading(col, text=col, anchor=anchor)
             self.processing_rules_tree.column(col, width=config.get("width", 100),
-                                              anchor=config.get("anchor", "w"))
+                                              anchor=anchor)
 
         rules_scrollbar = ttk.Scrollbar(rules_list_frame, orient="vertical", command=self.processing_rules_tree.yview)
         self.processing_rules_tree.configure(yscrollcommand=rules_scrollbar.set)
@@ -1634,8 +1672,8 @@ class WeighingTab:
         rules_button_frame = ttk.Frame(self.process_frame)
         rules_button_frame.pack(fill='x', pady=2)
 
-        self.delete_processing_rule_btn = ttk.Button(rules_button_frame, text="删除选中",
-                                                     command=self.delete_processing_rule)
+        self.delete_processing_rule_btn = ttkb.Button(rules_button_frame, text="删除选中",
+                                                     command=self.delete_processing_rule, bootstyle="danger")
         self.delete_processing_rule_btn.pack(side='left', padx=5)
 
     def show_processing_params(self):
@@ -1677,7 +1715,7 @@ class WeighingTab:
 
         # 创建编辑框
         entry = ttk.Entry(self.processing_rules_tree)
-        entry.place(x=x, y=y, width=width, height=height)
+        entry.place(x=x, y=y-4, width=width, height=height+8)
         entry.insert(0, current_value)
         entry.focus_set()
 
@@ -1741,6 +1779,10 @@ class WeighingTab:
             # 处理模式 - 随机数区域禁用，处理区域启用
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "normal")
+        elif mode == "none":
+            # 无需称样量 - 两个区域都禁用
+            self.set_frame_state(self.random_frame, "disabled")
+            self.set_frame_state(self.process_frame, "disabled")
 
     def set_frame_state(self, frame, state):
         """设置框架及其子组件的状态"""
@@ -1947,6 +1989,7 @@ class SpectrumUploadTab:
         self.quantitative_report_path = r"\\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip"
         self.undetected_threshold = ""
         self.marker = ""  # 新增：标记物参数
+        self.clear_spectrum = False  # 新增：录入前是否清空谱图
         self.create_tab()
 
     def create_tab(self):
@@ -1973,34 +2016,49 @@ class SpectrumUploadTab:
         self.mode_var = tk.StringVar(value="local_upload")
 
         # 本地上传单选按钮
-        self.local_upload_radio = ttk.Radiobutton(
+        self.local_upload_radio = ttkb.Radiobutton(
             mode_selection_frame,
             text="本地上传",
             variable=self.mode_var,
             value="local_upload",
-            command=self.on_mode_change
-        )
+            command=self.on_mode_change, bootstyle="primary")
         self.local_upload_radio.pack(side='left', padx=(0, 20))
 
         # 数据采集单选按钮（与"本地上传"互斥）
-        self.data_acquisition_radio = ttk.Radiobutton(
+        self.data_acquisition_radio = ttkb.Radiobutton(
             mode_selection_frame,
             text="数据采集",
             variable=self.mode_var,
             value="data_acquisition",
-            command=self.on_mode_change
-        )
+            command=self.on_mode_change, bootstyle="primary")
         self.data_acquisition_radio.pack(side='left', padx=(0, 20))
 
         # 新增：本地+采集单选按钮
-        self.local_acquisition_radio = ttk.Radiobutton(
+        self.local_acquisition_radio = ttkb.Radiobutton(
             mode_selection_frame,
             text="本地+采集",
             variable=self.mode_var,
             value="local_acquisition",
-            command=self.on_mode_change
-        )
+            command=self.on_mode_change, bootstyle="primary")
         self.local_acquisition_radio.pack(side='left')
+
+        # 无需谱图（与上述模式互斥）
+        self.no_spectrum_radio = ttkb.Radiobutton(
+            mode_selection_frame,
+            text="无需谱图",
+            variable=self.mode_var,
+            value="no_spectrum",
+            command=self.on_mode_change, bootstyle="primary")
+        self.no_spectrum_radio.pack(side='left', padx=(20, 0))
+
+        # 是否清空谱图：选中后序列运行录入数据前调 deleteSpectrumByProjectIds 删除谱图再录入
+        self.clear_spectrum_var = tk.BooleanVar(value=self.clear_spectrum)
+        self.clear_spectrum_check = ttkb.Checkbutton(
+            mode_selection_frame,
+            text="录入前清空谱图",
+            variable=self.clear_spectrum_var,
+            command=self.on_clear_spectrum_change, bootstyle="primary")
+        self.clear_spectrum_check.pack(side='left', padx=(30, 0))
 
     def create_content_area(self, parent):
         """创建内容区域"""
@@ -2106,12 +2164,11 @@ class SpectrumUploadTab:
         """创建紧凑的谱图检查行"""
         # 复选框
         check_var = tk.BooleanVar(value=self.spectrum_check_params[param_type]["enabled"])
-        check_button = ttk.Checkbutton(
+        check_button = ttkb.Checkbutton(
             parent,
             text=display_name,
             variable=check_var,
-            command=lambda: self.on_spectrum_check_change(param_type, check_var)
-        )
+            command=lambda: self.on_spectrum_check_change(param_type, check_var), bootstyle="primary")
 
         # 如果是最后一行且有指定的底部边距，使用不同的pady值
         if bottom_margin is not None and row_num == 4:
@@ -2125,11 +2182,13 @@ class SpectrumUploadTab:
         count_var = tk.StringVar(value=self.spectrum_check_params[param_type]["count"])
         count_entry = ttk.Entry(parent, textvariable=count_var, width=8)
         count_entry.grid(row=row_num, column=1, padx=(0, 5), pady=pady_value, sticky='w')
+        count_entry.bind('<KeyRelease>', lambda e: self.on_spectrum_param_change(param_type, 'count', count_var.get()))
 
         # 关键字输入框
         keyword_var = tk.StringVar(value=self.spectrum_check_params[param_type]["keyword"])
         keyword_entry = ttk.Entry(parent, textvariable=keyword_var)
         keyword_entry.grid(row=row_num, column=2, padx=(0, 10), pady=pady_value, sticky='ew')
+        keyword_entry.bind('<KeyRelease>', lambda e: self.on_spectrum_param_change(param_type, 'keyword', keyword_var.get()))
 
         # 保存引用
         setattr(self, f"{param_type}_check_var", check_var)
@@ -2161,12 +2220,18 @@ class SpectrumUploadTab:
         self.marker = self.marker_var.get()
         self.app.mark_modified()
 
+    def on_clear_spectrum_change(self):
+        """录入前清空谱图复选框状态改变"""
+        self.clear_spectrum = self.clear_spectrum_var.get()
+        self.app.mark_modified()
+
     def validate_spectrum_check_params(self):
         """验证谱图检查参数"""
         errors = []
 
+        # 样品类型按样品编号前缀匹配，关键字可空(blank/standard/linearity 仍需关键字)
         for param_type, display_name in [("blank", "空白"), ("standard", "标液"),
-                                         ("linearity", "线性"), ("sample", "样品")]:
+                                         ("linearity", "线性")]:
             if self.spectrum_check_params[param_type]["enabled"]:
                 count = self.spectrum_check_params[param_type]["count"].strip()
                 keyword = self.spectrum_check_params[param_type]["keyword"].strip()
@@ -2181,7 +2246,14 @@ class SpectrumUploadTab:
         mode = self.mode_var.get()
 
         # 根据当前选择的模式启用或禁用本地上传模式区域
-        if mode == "local_upload" or mode == "local_acquisition":
+        if mode == "no_spectrum":
+            # 无需谱图：禁用全部参数
+            self.set_local_upload_frame_state("disabled")
+            self.report_path_entry.config(state="disabled")
+            self.threshold_entry.config(state="disabled")
+            self.marker_entry.config(state="disabled")
+            self.local_upload_frame.configure(text="本地参数设置(禁用)")
+        elif mode == "local_upload" or mode == "local_acquisition":
             # 本地上传和本地+采集模式都启用本地上传模式区域
             self.set_local_upload_frame_state("normal")
 
@@ -2231,7 +2303,8 @@ class SpectrumUploadTab:
             "spectrum_check_params": self.spectrum_check_params,
             "quantitative_report_path": self.quantitative_report_path,
             "undetected_threshold": self.undetected_threshold,
-            "marker": self.marker  # 新增标记物参数
+            "marker": self.marker,  # 新增标记物参数
+            "clear_spectrum": self.clear_spectrum  # 新增：录入前是否清空谱图
         }
 
     def set_settings(self, settings):
@@ -2252,17 +2325,23 @@ class SpectrumUploadTab:
                     # 设置复选框状态
                     check_var = getattr(self, f"{param_type}_check_var", None)
                     if check_var:
-                        check_var.set(params.get("enabled", False))
+                        en = params.get("enabled", False)
+                        check_var.set(en)
+                        self.spectrum_check_params[param_type]["enabled"] = en
 
                     # 设置数量
                     count_var = getattr(self, f"{param_type}_count_var", None)
                     if count_var:
-                        count_var.set(params.get("count", ""))
+                        cv = params.get("count", "")
+                        count_var.set(cv)
+                        self.spectrum_check_params[param_type]["count"] = cv
 
                     # 设置关键字
                     keyword_var = getattr(self, f"{param_type}_keyword_var", None)
                     if keyword_var:
-                        keyword_var.set(params.get("keyword", ""))
+                        kw = params.get("keyword", "")
+                        keyword_var.set(kw)
+                        self.spectrum_check_params[param_type]["keyword"] = kw
 
         # 设置新增参数
         if "quantitative_report_path" in settings:
@@ -2278,6 +2357,11 @@ class SpectrumUploadTab:
             self.marker = settings["marker"]
             self.marker_var.set(self.marker)
 
+        # 新增：设置录入前清空谱图
+        if "clear_spectrum" in settings:
+            self.clear_spectrum = bool(settings["clear_spectrum"])
+            self.clear_spectrum_var.set(self.clear_spectrum)
+
         # 更新显示
         self.on_mode_change()
 
@@ -2286,7 +2370,33 @@ class QueryAppFixed:
     def __init__(self, root):
         self.root = root
         self.root.title("录入方法编辑器_未加载配置文件")
-        self.root.geometry("700x500")  # 增加窗口大小以适应新标签页
+        self.root.geometry("1400x980")  # 增大窗口以完整显示各标签页内容
+
+        # 统一控件风格（与 SequenceMaster 保持一致）
+        style = ttk.Style()
+        # 字号统一为菜单栏（文件/操作）字体大小
+        _mf = tkfont.nametofont("TkMenuFont").actual()
+        _font = (_mf["family"], _mf["size"])
+        for _s in ("TLabel", "TButton", "TEntry", "TCombobox", "TCheckbutton",
+                   "TRadiobutton", "Treeview.Heading", "TLabelframe.Label"):
+            style.configure(_s, font=_font)
+        style.configure("Treeview", font=_font, rowheight=36)  # 行高足够、字号统一
+        # 选中行蓝底白字：默认主题下 selected 配色不明显，看不出选了哪行
+        style.map("Treeview",
+                  background=[("selected", "#2563eb")],
+                  foreground=[("selected", "#ffffff")])
+        # 标签页配色：未选中灰字、选中蓝字白底，更醒目
+        style.configure("TNotebook.Tab", padding=(24, 10),
+                        font=(_font[0], _font[1], "bold"), foreground="#6b7280")
+        style.map("TNotebook.Tab",
+                  foreground=[("selected", "#2563eb")],
+                  background=[("selected", "#ffffff")])
+        style.configure("TButton", padding=(8, 2))          # 收紧按钮，避免偏高偏大
+        # 禁用态更明显：灰底 + 浅灰字（默认仅变字色、底色仍白，不易区分）
+        for _e in ("TEntry", "TCombobox"):
+            style.map(_e,
+                      fieldbackground=[("disabled", "#e8e8e6")],
+                      foreground=[("disabled", "#9aa0a6")])
 
         # 当前配置文件路径和名称
         self.current_config_file = None
@@ -2296,7 +2406,7 @@ class QueryAppFixed:
         self.modified = False
 
         # 记录上次打开的文件路径
-        self.last_config_file = "last_config.txt"
+        self.last_config_file = os.path.join(paths.data_dir(), "last_config.txt")
 
         # 标记初始化是否完成
         self.initialization_complete = False
@@ -2312,8 +2422,8 @@ class QueryAppFixed:
         self.spectrum_tab = SpectrumUploadTab(self.notebook, self)
         self.other_params_tab = OtherParamsTab(self.notebook, self)  # 新增其他参数标签页
 
-        # 创建底部按钮
-        self.create_bottom_buttons()
+        # 创建菜单栏（置于标签页上方）
+        self.create_menubar()
 
         # 绑定事件处理
         self.bind_events()
@@ -2394,7 +2504,8 @@ class QueryAppFixed:
             new_rule = {
                 "from_id": rule["from_id"],
                 "to_id": rule["to_id"],
-                "description": rule.get("description", "")
+                "description": rule.get("description", ""),
+                "desc": rule.get("desc", "")
             }
 
             # 处理名称字段 - 优先使用新格式，如果没有则使用旧格式
@@ -2530,25 +2641,30 @@ class QueryAppFixed:
         self.modified = False
         return True
 
-    def create_bottom_buttons(self):
-        # 创建底部按钮框架
-        button_frame = ttk.Frame(self.root)
-        button_frame.pack(fill='x', padx=5, pady=5)
+    def create_menubar(self):
+        """创建菜单栏（加载/保存/另存为/重置/查询），置于标签页上方，配色贴合主题"""
+        c = ttkb.Style().colors  # sandstone-light 主题色
+        menu_opts = dict(
+            bg=c.bg, fg=c.fg,
+            activebackground=c.light, activeforeground=c.fg,
+            borderwidth=0, relief="flat",
+        )
+        menubar = tk.Menu(self.root, **menu_opts)
 
-        # 查询按钮
-        ttk.Button(button_frame, text="查询", command=self.execute_query).pack(side='right', padx=3)
+        # 文件菜单：加载、保存、另存为
+        file_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        file_menu.add_command(label="加载", command=self.load_rules)
+        file_menu.add_command(label="保存", command=self.save_all_rules)
+        file_menu.add_command(label="另存为", command=self.save_as_rules)
+        menubar.add_cascade(label="文件", menu=file_menu)
 
-        # 重置按钮
-        ttk.Button(button_frame, text="重置", command=self.reset_form).pack(side='right', padx=3)
+        # 操作菜单：重置、查询
+        action_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        action_menu.add_command(label="重置", command=self.reset_form)
+        action_menu.add_command(label="查询", command=self.execute_query)
+        menubar.add_cascade(label="操作", menu=action_menu)
 
-        # 保存配置按钮 - 点击此按钮保存所有规则
-        ttk.Button(button_frame, text="保存", command=self.save_all_rules).pack(side='left', padx=3)
-
-        # 加载配置按钮
-        ttk.Button(button_frame, text="加载", command=self.load_rules).pack(side='left', padx=3)
-
-        # 另存为按钮
-        ttk.Button(button_frame, text="另存为", command=self.save_as_rules).pack(side='left', padx=3)
+        self.root.config(menu=menubar)
 
     def execute_query(self):
         # 获取查询条件
@@ -2578,11 +2694,11 @@ class QueryAppFixed:
         self.method_tab.to_id_entry.delete(0, tk.END)
         self.method_tab.filename_entry.delete(0, tk.END)
         self.method_tab.project_name_entry.delete(0, tk.END)
-        self.method_tab.description_entry.delete(0, tk.END)
-        self.query_tab.query_description_entry.delete(0, tk.END)
         self.query_tab.query_project_entry.delete(0, tk.END)
         self.query_tab.query_method_entry.delete(0, tk.END)
         self.query_tab.query_cancel_test_var.set(False)
+        self.query_tab.query_max_select_entry.delete(0, tk.END)
+        self.query_tab.query_mode_var.set("方法")
         self.method_tab.update_rules_display()
 
     def save_all_rules(self):
@@ -2708,6 +2824,7 @@ class OtherParamsTab:
         self.preparation_number = ""  # 配制序号
         self.instrument_setting = "default"  # 默认仪器设置：使用立方默认设备
         self.device_number = ""  # 设备编号
+        self.fixed_params = []  # 固定参数规则：[{trigger, param_name, param_value}]
         self.create_tab()
 
     def create_tab(self):
@@ -2721,6 +2838,9 @@ class OtherParamsTab:
         # 创建仪器设置区域
         self.create_instrument_setting_section(other_frame)
 
+        # 创建固定参数设置区域
+        self.create_fixed_params_section(other_frame)
+
     def create_standard_type_section(self, parent):
         """创建标液类型设置区域"""
         standard_frame = ttk.LabelFrame(parent, text="标液类型设置", padding=10)
@@ -2733,31 +2853,28 @@ class OtherParamsTab:
         self.standard_type_var = tk.StringVar(value="fresh")
 
         # 现配现用单选按钮
-        ttk.Radiobutton(
+        ttkb.Radiobutton(
             type_frame,
             text="现配现用",
             variable=self.standard_type_var,
             value="fresh",
-            command=self.on_standard_type_change
-        ).pack(side='left', padx=(0, 20))
+            command=self.on_standard_type_change, bootstyle="primary").pack(side='left', padx=(0, 20))
 
         # 固定标液单选按钮
-        ttk.Radiobutton(
+        ttkb.Radiobutton(
             type_frame,
             text="固定标液",
             variable=self.standard_type_var,
             value="fixed",
-            command=self.on_standard_type_change
-        ).pack(side='left', padx=(0, 20))
+            command=self.on_standard_type_change, bootstyle="primary").pack(side='left', padx=(0, 20))
 
         # 新增：无需标液单选按钮
-        ttk.Radiobutton(
+        ttkb.Radiobutton(
             type_frame,
             text="无需标液",
             variable=self.standard_type_var,
             value="none",
-            command=self.on_standard_type_change
-        ).pack(side='left')
+            command=self.on_standard_type_change, bootstyle="primary").pack(side='left')
 
         # 配制序号输入区域（始终显示，但状态根据选择变化）
         self.preparation_frame = ttk.Frame(standard_frame)
@@ -2790,22 +2907,20 @@ class OtherParamsTab:
         self.instrument_setting_var = tk.StringVar(value="default")
 
         # 使用立方默认设备单选按钮
-        ttk.Radiobutton(
+        ttkb.Radiobutton(
             setting_frame,
             text="默认设备",
             variable=self.instrument_setting_var,
             value="default",
-            command=self.on_instrument_setting_change
-        ).pack(side='left', padx=(0, 20))
+            command=self.on_instrument_setting_change, bootstyle="primary").pack(side='left', padx=(0, 20))
 
         # 使用指定设备单选按钮
-        ttk.Radiobutton(
+        ttkb.Radiobutton(
             setting_frame,
             text="指定设备",
             variable=self.instrument_setting_var,
             value="specified",
-            command=self.on_instrument_setting_change
-        ).pack(side='left')
+            command=self.on_instrument_setting_change, bootstyle="primary").pack(side='left')
 
         # 设备编号输入区域（始终显示，但状态根据选择变化）
         self.device_frame = ttk.Frame(instrument_frame)
@@ -2825,6 +2940,194 @@ class OtherParamsTab:
 
         # 初始状态设置
         self.on_instrument_setting_change()
+
+    def create_fixed_params_section(self, parent):
+        """创建固定参数设置区域：一个触发条件显示为一行，可含多个「参数=值」"""
+        frame = ttk.LabelFrame(parent, text="固定参数设置", padding=10)
+        frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # 输入区：触发条件(字段=值) + 参数名 + 值
+        input_frame = ttk.Frame(frame)
+        input_frame.pack(fill='x', pady=5)
+
+        ttk.Label(input_frame, text="触发条件:").pack(side='left', padx=(0, 5))
+        self.fp_trigger_field_var = tk.StringVar(value="检测项目")
+        ttk.Combobox(input_frame, textvariable=self.fp_trigger_field_var,
+                     values=["检测项目", "检测方法"], state="readonly", width=10).pack(side='left', padx=(0, 2))
+        ttk.Label(input_frame, text="=").pack(side='left', padx=(0, 2))
+        self.fp_trigger_value_entry = ttk.Entry(input_frame, width=14)
+        self.fp_trigger_value_entry.pack(side='left', padx=(0, 12))
+
+        ttk.Label(input_frame, text="参数名:").pack(side='left', padx=(0, 5))
+        self.fp_param_name_entry = ttk.Entry(input_frame, width=18)
+        self.fp_param_name_entry.pack(side='left', padx=(0, 8))
+
+        ttk.Label(input_frame, text="值:").pack(side='left', padx=(0, 5))
+        self.fp_param_value_entry = ttk.Entry(input_frame, width=12)
+        self.fp_param_value_entry.pack(side='left', padx=(0, 10))
+
+        ttkb.Button(input_frame, text="添加", command=self.add_fixed_param, bootstyle="secondary").pack(side='left')
+
+        # 列表区：一个触发条件一行，多个参数合并显示
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill='both', expand=True, pady=5)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        columns = ("触发条件", "参数设置")
+        self.fp_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
+        self.fp_tree.heading("触发条件", text="触发条件", anchor="w")
+        self.fp_tree.column("触发条件", width=160, anchor="w")
+        self.fp_tree.heading("参数设置", text="参数设置", anchor="w")
+        self.fp_tree.column("参数设置", width=520, anchor="w")
+
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.fp_tree.yview)
+        hsb = ttk.Scrollbar(list_frame, orient="horizontal", command=self.fp_tree.xview)
+        self.fp_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.fp_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+
+        self.fp_tree.bind("<Double-1>", self.on_fixed_param_double_click)
+
+        # 操作按钮
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', pady=3)
+        ttkb.Button(btn_frame, text="删除选中", command=self.delete_fixed_param, bootstyle="danger").pack(side='left', padx=2)
+
+    def add_fixed_param(self):
+        """添加一个参数到触发条件对应的规则（同一触发条件只占一行）"""
+        trigger_field = self.fp_trigger_field_var.get().strip()
+        trigger_value = self.fp_trigger_value_entry.get().strip()
+        param_name = self.fp_param_name_entry.get().strip()
+        param_value = self.fp_param_value_entry.get().strip()
+
+        if not trigger_value:
+            messagebox.showwarning("输入错误", "请填写触发条件值")
+            return
+        if not param_name:
+            messagebox.showwarning("输入错误", "请填写参数名")
+            return
+
+        trigger = f"{trigger_field}={trigger_value}"
+        # 同一触发条件并入同一行
+        rule = next((r for r in self.fixed_params if r["trigger"] == trigger), None)
+        if rule is None:
+            rule = {"trigger": trigger, "params": []}
+            self.fixed_params.append(rule)
+        rule["params"].append({"name": param_name, "value": param_value})
+
+        self.refresh_fixed_params_tree()
+
+        # 清空参数输入（保留触发条件，便于连续为同一条件添加多个参数）
+        self.fp_param_name_entry.delete(0, tk.END)
+        self.fp_param_value_entry.delete(0, tk.END)
+
+        self.app.mark_modified()
+
+    def delete_fixed_param(self):
+        """删除选中的触发条件规则（整行）"""
+        selected_items = self.fp_tree.selection()
+        if not selected_items:
+            messagebox.showwarning("选择错误", "请先选择要删除的行")
+            return
+
+        if not messagebox.askyesno("确认删除", "确定要删除选中的触发条件及其全部参数吗？"):
+            return
+
+        for item in reversed(selected_items):
+            index = self.fp_tree.index(item)
+            if 0 <= index < len(self.fixed_params):
+                del self.fixed_params[index]
+
+        self.refresh_fixed_params_tree()
+        self.app.mark_modified()
+
+    def refresh_fixed_params_tree(self):
+        """刷新固定参数列表（一个触发条件一行）"""
+        for item in self.fp_tree.get_children():
+            self.fp_tree.delete(item)
+
+        for rule in self.fixed_params:
+            params_str = "; ".join(f'{p["name"]}={p["value"]}' for p in rule.get("params", []))
+            self.fp_tree.insert("", "end", values=(rule.get("trigger", ""), params_str))
+
+    def on_fixed_param_double_click(self, event):
+        """双击编辑：触发条件列直接改；参数设置列按「名=值; 名=值」解析"""
+        item = self.fp_tree.selection()
+        if not item:
+            return
+
+        item = item[0]
+        column = self.fp_tree.identify_column(event.x)
+        column_index = int(column.replace('#', '')) - 1
+        column_name = self.fp_tree.heading(column_index)['text']
+
+        current_values = self.fp_tree.item(item, 'values')
+        current_value = current_values[column_index]
+
+        x, y, width, height = self.fp_tree.bbox(item, column)
+        entry = ttk.Entry(self.fp_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.fp_tree.item(item, values=new_values)
+
+            index = self.fp_tree.index(item)
+            if 0 <= index < len(self.fixed_params):
+                rule = self.fixed_params[index]
+                if column_name == "触发条件":
+                    rule["trigger"] = new_value
+                elif column_name == "参数设置":
+                    # 解析「名=值; 名=值」回 params 列表
+                    params = []
+                    for part in new_value.split(";"):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        name, _, value = part.partition("=")
+                        params.append({"name": name.strip(), "value": value.strip()})
+                    rule["params"] = params
+
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
+
+    @staticmethod
+    def _normalize_fixed_params(raw):
+        """将加载的固定参数统一为 [{trigger, params:[{name,value}]}]；兼容旧扁平格式"""
+        result = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if "params" in item:
+                result.append({"trigger": item.get("trigger", ""),
+                               "params": list(item.get("params", []))})
+            elif "param_name" in item:
+                # 旧扁平格式：按 trigger 合并成一行
+                trig = item.get("trigger", "")
+                rule = next((r for r in result if r["trigger"] == trig), None)
+                if rule is None:
+                    rule = {"trigger": trig, "params": []}
+                    result.append(rule)
+                rule["params"].append({"name": item.get("param_name", ""),
+                                       "value": item.get("param_value", "")})
+        return result
 
     def on_standard_type_change(self):
         """标液类型改变时的处理"""
@@ -2868,7 +3171,8 @@ class OtherParamsTab:
             "standard_type": self.standard_type_var.get(),
             "preparation_number": self.preparation_number_var.get().strip(),
             "instrument_setting": self.instrument_setting_var.get(),
-            "device_number": self.device_number_var.get().strip()
+            "device_number": self.device_number_var.get().strip(),
+            "fixed_params": self.fixed_params
         }
 
     def set_settings(self, settings):
@@ -2892,12 +3196,16 @@ class OtherParamsTab:
         if "device_number" in settings:
             self.device_number_var.set(settings["device_number"])
 
+        # 设置固定参数（兼容旧扁平格式：按 trigger 合并为一行）
+        self.fixed_params = self._normalize_fixed_params(settings.get("fixed_params", []))
+        self.refresh_fixed_params_tree()
+
         # 更新显示
         self.on_standard_type_change()
         self.on_instrument_setting_change()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = ttkb.Window(themename="sandstone-light")
     app = QueryAppFixed(root)
     root.mainloop()

@@ -3,15 +3,29 @@ filename_rules:
 - from_id: '1168'
   to_id: '4481'
   description: ''
-  filename: G
+  filename: K
   project_name: DEHP
+  desc: 草,颗粒
 - from_id: '1168'
   to_id: '4482'
   description: ''
-  filename: G
+  filename: K
   project_name: DNOP
+  desc: 草,颗粒
 query_rules:
-  query_rules: []
+  query_rules:
+  - description: ''
+    project: 3种邻苯二甲酸酯类化合物（DBP、BBP、DEHP）总和
+    method: GB 36246-2018 附录A
+    cancel_test: false
+    input_method: 方法
+    max_select: '30'
+  - description: ''
+    project: 3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和
+    method: GB 36246-2018 附录A
+    cancel_test: false
+    input_method: 方法
+    max_select: '30'
   exclusion_rules: []
   sum_rules:
   - project: '1'
@@ -20,35 +34,38 @@ query_rules:
     id2: '1'
 processing_rules: []
 weighing_params:
-  decimal_places: ''
-  min_value: ''
-  max_value: ''
+  decimal_places: '4'
+  min_value: '0.46'
+  max_value: '0.51'
   conversion_factor: ''
   result_decimal_places: ''
-  weighing_mode: random
+  weighing_mode: record
 spectrum_upload_settings:
   upload_mode: local_upload
   spectrum_check_params:
     blank:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: BLK
     standard:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: C3
     linearity:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: 校准曲线
     sample:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: K
   quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
   undetected_threshold: ''
+  marker: ''
+  clear_spectrum: true
 other_params_settings:
-  standard_type: fresh
-  preparation_number: ''
+  standard_type: fixed
+  preparation_number: D-9156
   instrument_setting: default
   device_number: ''
+  fixed_params: []

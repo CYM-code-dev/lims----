@@ -1,28 +1,24 @@
-default_rules: []
-filename_rules:
-- from_id: '1168'
-  to_id: '4480'
-  description: ''
-  desc: 胶水
-  filename: ''
-  project_name: DBP
-- from_id: '1168'
-  to_id: '4596'
-  description: ''
-  desc: 胶水
-  filename: ''
-  project_name: DNOP
+default_rules:
+- from_id: '1949'
+  to_id: '4678'
+  description: 苯
+  project_name: 苯
+- from_id: '1949'
+  to_id: '4679'
+  description: 总和
+  project_name: 甲苯、二甲苯及乙苯总和
+filename_rules: []
 query_rules:
   query_rules:
   - description: ''
-    project: 3种邻苯二甲酸酯类化合物（DBP、BBP、DEHP）总和
-    method: GB 36246-2018 附录A
+    project: 苯
+    method: GB 36246-2018 6.15.2
     cancel_test: false
     input_method: 方法
     max_select: '30'
   - description: ''
-    project: 3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和
-    method: GB 36246-2018 附录A
+    project: 甲苯、二甲苯及乙苯总和
+    method: GB 36246-2018 6.15.2
     cancel_test: false
     input_method: 方法
     max_select: '30'
@@ -35,8 +31,8 @@ query_rules:
 processing_rules: []
 weighing_params:
   decimal_places: '4'
-  min_value: '0.25'
-  max_value: '0.30'
+  min_value: '1.9'
+  max_value: '2.1'
   conversion_factor: ''
   result_decimal_places: ''
   weighing_mode: random
@@ -50,22 +46,22 @@ spectrum_upload_settings:
     standard:
       enabled: true
       count: '1'
-      keyword: C3
+      keyword: C1
     linearity:
       enabled: true
       count: '1'
-      keyword: 校准曲线
+      keyword: BQ
     sample:
       enabled: true
       count: '1'
-      keyword: ''
+      keyword: A,B
   quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
   undetected_threshold: ''
   marker: ''
   clear_spectrum: true
 other_params_settings:
   standard_type: fixed
-  preparation_number: D-9156
+  preparation_number: D-9335
   instrument_setting: default
   device_number: ''
   fixed_params: []

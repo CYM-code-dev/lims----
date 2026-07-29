@@ -7,6 +7,8 @@ build/
 dist/
 
 # ===== 凭证 / 运行时状态（敏感，勿提交）=====
+# 用户运行时数据目录（凭证/会话/本地配置），由 paths.data_dir() 写入
+data/
 users_config.json      # 用户名+姓名+工号+密码hash
 session_info.json      # 含实时登录 cookie（JSESSIONID 等）
 last_config.txt        # 上次打开的方法路径

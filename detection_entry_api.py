@@ -33,16 +33,17 @@ class DetectionAPI:
 
         self.load_sub_method_config()
 
-    def generate_experiment_code(self, method_name="", log_func=None):
-        """生成实验编号 - 统一实现，避免重复"""
+    def generate_experiment_code(self, method_name="", log_func=None, force_new=False):
+        """生成实验编号 - 统一实现，避免重复。
+        force_new=True 时跳过缓存、强制生成新编号(一行分多批提交时，每批需独立编号，否则同号冲突)。"""
         try:
             user_name = self.get_user_pname()
 
             # 构建缓存键
             cache_key = f"{user_name}_{method_name}" if method_name else user_name
 
-            # 如果已经为该用户和方法生成过编号，直接返回
-            if cache_key in self.experiment_code_cache:
+            # 如果已经为该用户和方法生成过编号，直接返回(force_new 时跳过缓存)
+            if not force_new and cache_key in self.experiment_code_cache:
                 return self.experiment_code_cache[cache_key]
 
             # 生成新的实验编号
@@ -785,6 +786,60 @@ class DetectionAPI:
                 log_func(f"清除实验暂存数据异常: {str(e)}, 项目ID: {sample_project_ids}")
             return False
 
+    def delete_spectrum_by_project_ids(self, project_ids, log_func=None):
+        """按项目ID删除已绑定谱图(deleteSpectrumByProjectIds)。
+        project_ids 为逗号分隔串或列表；ids=项目ID,pid/pname/loginId=当前登录用户。
+        录入前清空旧谱图，避免与新谱图重复。"""
+        try:
+            if isinstance(project_ids, list):
+                ids_str = ",".join(str(p) for p in project_ids if p)
+            else:
+                ids_str = str(project_ids or "").strip(",")
+            if not ids_str:
+                return False
+
+            request_data = {
+                "ids": ids_str,
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id()
+            }
+
+            headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html?ids=&decideProjectOrgIds=23&type=0&recordNumber=null&checkInStatus=CHECK_IN_STATUS_NO&verifyStatus=&auditStatus=&resultCheckInIds={ids_str}&souce=checkIn&pid={self.get_user_pid()}&pname={self.get_user_pname()}&loginId={self.get_user_login_id()}',
+                'X-Requested-With': 'XMLHttpRequest',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36'
+            }
+
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/ocSpectrum/deleteSpectrumByProjectIds",
+                data=request_data,
+                headers=headers,
+                verify=False,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    if log_func:
+                        log_func(f"已清空旧谱图(ids={ids_str})")
+                    return True
+                error_msg = result.get('errorCtx', {}).get('errorMsg', '未知错误')
+                if log_func:
+                    log_func(f"清空旧谱图失败: {error_msg}, 项目ID: {ids_str}")
+                return False
+            if log_func:
+                log_func(f"清空旧谱图失败: HTTP {response.status_code}, 项目ID: {ids_str}")
+            return False
+
+        except Exception as e:
+            if log_func:
+                log_func(f"清空旧谱图异常: {str(e)}, 项目ID: {project_ids}")
+            return False
+
     def get_units_config(self, log_func=None):
         """获取单位配置 - 使用正确的API地址"""
         try:
@@ -1022,6 +1077,80 @@ class DetectionAPI:
         except Exception as e:
             return None
 
+    def calc_report_values(self, calc_rows, meta, log_func=None):
+        """调用 ocMethodTitleSettings/calcTheValue 计算报告值，返回 {row_id: {calculatedValue, reportValue, other}}。
+        calc_rows: [{columnValues, id, projectId, sampleCode, calcUnit, reportUnit, serialNum}, ...]（id 与分析记录 id 一致）
+        meta: {roundMethod, roundMethodLevelJson, resultRoundMethod, resultRoundMethodLevelJson,
+               calcMethod, accuracy, methodSettingId, accuracyRadixPoint, curve}
+        响应 resultData 是 JSON 字符串需二次解析；失败/异常返回 {}，调用方回退原 None 行为不阻断提交。
+        注：单位换算(unitConversion/conversionBatch)按需，数值报告值单位不符时再补。"""
+        try:
+            pid = self.get_user_pid()
+            try:
+                pid = int(pid)
+            except (ValueError, TypeError):
+                pid = 377
+            curve = meta.get('curve')
+            if not curve:
+                curve = [{"id": "", "equation": "", "correlationCoefficient": "", "slope": "", "intercept": ""}]
+            elif isinstance(curve, dict):
+                curve = [curve]
+            body = {
+                "roundMethod": meta.get('roundMethod'),
+                "roundMethodLevelJson": meta.get('roundMethodLevelJson'),
+                "resultRoundMethod": meta.get('resultRoundMethod'),
+                "resultRoundMethodLevelJson": meta.get('resultRoundMethodLevelJson'),
+                "calcMethod": meta.get('calcMethod'),
+                "accuracy": meta.get('accuracy'),
+                "methodSettingId": meta.get('methodSettingId'),
+                "accuracyRadixPoint": meta.get('accuracyRadixPoint'),
+                "curve": curve,
+                "rows": calc_rows,
+                "pid": pid,
+                "pname": self.get_user_pname(),
+                "loginId": pid,
+            }
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/ocMethodTitleSettings/calcTheValue",
+                json=body,
+                headers={
+                    'Content-Type': 'application/json;charset=UTF-8',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Origin': self.login_system.base_url,
+                    'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                },
+                verify=False, timeout=30,
+            )
+            if response.status_code != 200:
+                if log_func:
+                    log_func(f"calcTheValue 失败: HTTP {response.status_code}; 响应={response.text[:200]}")
+                return {}
+            result = response.json()
+            if not result.get('success'):
+                err = result.get('errorCtx') or {}
+                if log_func:
+                    log_func(f"calcTheValue 失败(success=false): {err.get('errorMsg', '未知错误')}; 响应={response.text[:200]}")
+                return {}
+            rd = result.get('resultData')
+            if isinstance(rd, str):
+                rd = json.loads(rd)  # resultData 是 JSON 字符串，需二次解析
+            out = {}
+            for row in (rd or {}).get('rows', []):
+                cv = row.get('columnValues', {})
+                out[row.get('id')] = {
+                    'calculatedValue': cv.get('calculatedValue'),
+                    'reportValue': cv.get('reportValue'),
+                    'other': cv.get('other'),
+                }
+            if log_func and not out:
+                log_func(f"calcTheValue: 响应 0 行 (rd 类型={type(rd).__name__})")
+            return out
+        except Exception as e:
+            if log_func:
+                log_func(f"calcTheValue 异常: {str(e)}")
+            return {}
+
     def get_experiment_config(self, sample_project_ids, method_standard_no, result_checkin_ids=None, sample_id=None,
                               log_func=None, method_id=None):
         """获取实验配置 - 确保使用子方法配置"""
@@ -1039,6 +1168,9 @@ class DetectionAPI:
             request_data = {
                 "sampleProjectIds": sample_project_ids,
                 "calcType": "0",
+                # 方法标准号：让服务端定位检测方法，从而展开平行样记录并回填 methodId；
+                # 与 getDynamicColumns 保持一致（之前漏传导致 methodId 未解析、平行样不展开）
+                "detectionMethod.standardNo": method_standard_no,
                 "pid": self.get_user_pid(),
                 "pname": self.get_user_pname(),
                 "loginId": self.get_user_login_id(),
@@ -1085,8 +1217,12 @@ class DetectionAPI:
                     config_data = result.get('resultData', {})
                     return config_data
                 else:
+                    if log_func:
+                        log_func(f"getOcExperiment success=false: {result}")
                     return {}
             else:
+                if log_func:
+                    log_func(f"getOcExperiment HTTP {response.status_code}: {response.text[:200]}")
                 return {}
 
         except Exception as e:
@@ -1473,6 +1609,68 @@ class DetectionAPI:
             "ocChoicePage", "称样设备", sample_project_id, {}, log_func,
         )
 
+    def save_main_equipment(self, experiment_id, items, log_func=None):
+        """提交主检设备到 ocExperiment/saveMainEqubment（测试）。
+        items: [{label, id, raw}, ...] —— label 形如 "CK-SB107-CG,电热恒温振荡水浴锅,2026-10-10"。
+        返回 (success, result_json)。"""
+        try:
+            entries, ids, name_parts = [], [], []
+            for it in items:
+                raw = it.get('raw') or {}
+                label = it.get('label', '')
+                eq_id = it.get('id', '')
+                # 编号/名称：优先 raw 字段，回退 label("编号 名称")
+                code = (raw.get('no') or raw.get('code') or raw.get('equipmentCode')
+                        or raw.get('equipmentNo') or raw.get('number') or raw.get('billCode') or '').strip()
+                name = (raw.get('name') or raw.get('equipmentName') or '').strip()
+                if not (code and name):
+                    sp = label.split(' ', 1)
+                    code = code or (sp[0] if sp else '')
+                    name = name or (sp[1] if len(sp) > 1 else (sp[0] if sp else ''))
+                # 有效日期：取 raw.checkOutDate（前端字段），兼容 "YYYY-MM-DD HH:MM:SS"
+                cod = raw.get('checkOutDate')
+                check_out = cod[:10] if isinstance(cod, str) else (str(cod)[:10] if cod else '')
+                entries.append({
+                    'id': int(eq_id) if str(eq_id).isdigit() else eq_id,
+                    'name': name,
+                    'checkOutDate': check_out,
+                    'condition': raw.get('condition'),
+                })
+                name_parts.append(','.join((code, name, check_out)))
+                ids.append(str(eq_id))
+            request_data = {
+                'id': int(experiment_id) if str(experiment_id).isdigit() else 0,
+                'mainEquipmentNames': ";".join(name_parts),
+                'mainEquipmentIds': ",".join(ids),
+                'mainEquipment': json.dumps(entries, ensure_ascii=False),
+                'equipmentUseIds': ",".join(['0'] * len(entries)),
+                'pid': self.get_user_pid(),
+                'pname': self.get_user_pname(),
+                'loginId': self.get_user_login_id(),
+            }
+            if log_func:
+                log_func(f"[测试] mainEquipmentNames={request_data['mainEquipmentNames']}")
+                log_func(f"[测试] mainEquipmentIds={request_data['mainEquipmentIds']}")
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/saveMainEqubment",
+                json=request_data,
+                headers={
+                    'Content-Type': 'application/json;charset=UTF-8',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                verify=False, timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('success', False), result
+            return False, {'error': f'HTTP {response.status_code}'}
+        except Exception as e:
+            if log_func:
+                log_func(f"提交主检设备异常: {str(e)}")
+            return False, {'error': str(e)}
+
     def _query_equipment_choice_page(self, action, used_category, sample_project_id, extra_params, log_func=None):
         """通用设备选择页查询，返回 [{label, id}, ...]"""
         try:
@@ -1542,7 +1740,7 @@ class DetectionAPI:
                 continue
             seen.add(label)
             eq_id = eq.get('equipmentBillId') or eq.get('id') or ''
-            items.append({'label': label, 'id': str(eq_id) if eq_id else ''})
+            items.append({'label': label, 'id': str(eq_id) if eq_id else '', 'raw': eq})
         return items
 
     def get_current_sample_id(self):
@@ -1624,6 +1822,39 @@ class DetectionAPI:
             return new_method_id
 
         return method_id
+
+    def get_switchable_methods(self, decide_project_name, method_id, log_func=None):
+        """查询当前检测项目+方法下可切换的方法ID列表（getObjByIdAndDetProjectName）
+        返回 [{decideProjectMethodId, decideProjectMethodName, standardNo, parentId, ...}]"""
+        try:
+            params = {
+                "decideProjectName": decide_project_name,
+                "decideProjectMethodId": method_id,
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+                "_": str(int(time.time() * 1000))
+            }
+            response = self.login_system.session.get(
+                f"{self.login_system.base_url}/detectionManager/manager/detectionMethod/getObjByIdAndDetProjectName",
+                params=params,
+                headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                verify=False,
+                timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    return result.get('resultData', [])
+            return []
+        except Exception as e:
+            if log_func:
+                log_func(f"查询可切换方法ID异常: {str(e)}")
+            return []
 
     def update_method(self, sample_project_ids, method_id, project_names=None, log_func=None):
         """更新检测方法 - 修复参数格式"""
@@ -1877,6 +2108,29 @@ class _Box:
         self._v = v
 
 
+def _match_fixed_params(fixed_params, project):
+    """按触发条件筛选适用于该项目的固定参数，返回 {规范化参数名(去空白): 值}。
+    触发格式「检测项目=值」/「检测方法=值」；值与项目对应字段做包含匹配。
+    参数名去全部空白后作为键，便于与 columeName 容错匹配。"""
+    overrides = {}
+    for rule in fixed_params or []:
+        trig = (rule.get("trigger") or "").strip()
+        if not trig:
+            continue
+        field, _, value = trig.partition("=")
+        field, value = field.strip(), value.strip()
+        if not value:
+            continue
+        target = (project.get("standardNo") or "").strip() if field == "检测方法" \
+            else (project.get("projectName") or "").strip()
+        if value in target:
+            for p in rule.get("params") or []:
+                name = "".join((p.get("name") or "").split())
+                if name:
+                    overrides[name] = p.get("value", "")
+    return overrides
+
+
 def build_grouped_experiment_data(host, projects, experiment_code, method_name):
     """构建分组实验数据 - 包含完整标准物质信息（共享实现，阶段0从 detection_entry_main 抽出）。
 
@@ -1931,6 +2185,10 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
         if project_id not in project_analysis_records:
             project_analysis_records[project_id] = []
         project_analysis_records[project_id].append(record)
+
+    # data_fields 按 ocAnalysisRecordList 位置索引；多组分时第二个组分的记录位置不是 0，
+    # 故建 记录对象→全局行号 映射，避免读到第一个组分的输入（串行）
+    _record_pos = {id(r): i for i, r in enumerate(analysis_records_config)}
 
     # 从设备配置中获取设备信息
     main_equipment = self.equipment_config.get('mainEquipment', '')
@@ -2015,6 +2273,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
 
     # 构建分析记录列表
     oc_analysis_record_save_list = []
+    calc_rows = []  # calcTheValue 请求行，与分析记录共用 id
     record_id_counter = 1
 
     # 获取固定备注字段的内容
@@ -2028,6 +2287,9 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
         detection_no = project.get('detectionNo')
         sample_small_no = project.get('sampleSmallNo')
         sample_name = project.get('sampleName', '未知样品')
+
+        # 固定参数覆盖（序列模式：方法 other_params_settings.fixed_params，按触发条件匹配当前项目）
+        fixed_overrides = _match_fixed_params(getattr(self, "fixed_params", None), project)
 
         # 检查必要字段
         if not sample_id:
@@ -2074,8 +2336,9 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                 if hasattr(self, 'data_fields') and col_code in self.data_fields:
                     field = self.data_fields[col_code]
                     if isinstance(field, list):
-                        if 0 <= record_index < len(field):
-                            user_value = field[record_index].get().strip()
+                        _gi = _record_pos.get(id(record_config), record_index)
+                        if 0 <= _gi < len(field):
+                            user_value = field[_gi].get().strip()
                     else:
                         user_value = field.get().strip()
 
@@ -2089,6 +2352,11 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                         dynamic_fields[col_code] = str(config_value) if config_value is not None else default_val
                     else:
                         dynamic_fields[col_code] = default_val
+
+                # 固定参数覆盖：优先级最高，覆盖用户输入与默认值（参数名去空白后与 columeName 匹配）
+                _cn = "".join(col_name.split())
+                if _cn and _cn in fixed_overrides:
+                    dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
                 # 构建selectmap数据 - 与前端保持一致
                 if edit_type == 'EDIT_TYPE_SELECT' and dynamic_fields[col_code]:
@@ -2169,7 +2437,47 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                 "_X_ID": f"row_{8 + record_id_counter}"
             }
             oc_analysis_record_save_list.append(analysis_record)
+            # 收集 calcTheValue 请求行（columnValues=动态字段+检出限，calculatedValue 留空由服务端算）
+            calc_rows.append({
+                "columnValues": {
+                    "detectionLimit": detection_limit,
+                    "detectionLimitType": detection_limit_type,
+                    # 空值发 null 对齐网页端；发 "" 服务端按数字解析失败会返回空 calculatedValue
+                    **{k: (v if v != "" else None) for k, v in dynamic_fields.items()},
+                    "calculatedValue": "",
+                },
+                "id": record_id_counter,
+                "projectId": project_id,
+                "sampleCode": detection_no + sample_small_no,
+                "calcUnit": calculated_unit,
+                "reportUnit": report_unit_name,
+                "serialNum": record_config.get('serialNumber', record_index + 1),
+            })
             record_id_counter += 1
+
+    # 计算报告值并回填（calcTheValue）；失败回退原 None 行为，不阻断提交
+    calc_meta = {
+        'roundMethod': round_method,
+        'roundMethodLevelJson': round_method_level_json,
+        'resultRoundMethod': self.experiment_config.get('resultRoundMethod'),
+        'resultRoundMethodLevelJson': self.experiment_config.get('resultRoundMethodLevelJson'),
+        'calcMethod': calc_method_str,
+        'accuracy': (analysis_records_config[0].get('accuracy') if analysis_records_config else None) or 'STANDARD_DEVIATION',
+        'methodSettingId': (self.experiment_config or {}).get('ocMethodSettings', {}).get('methodId') or oc_method_settings.get('id'),
+        'accuracyRadixPoint': oc_method_settings.get('accuracyRadixPoint'),
+        'curve': self.experiment_config.get('ocCurve'),
+    }
+    calc_result = self.api.calc_report_values(calc_rows, calc_meta, self.log)
+    if calc_result:
+        for rec in oc_analysis_record_save_list:
+            cv = calc_result.get(rec.get('id'))
+            if cv:
+                rec['calculatedValue'] = cv.get('calculatedValue')
+                rec['reportValue'] = cv.get('reportValue')
+                if cv.get('other'):
+                    rec['other'] = cv['other']
+        if self.log:
+            self.log(f"已计算报告值: {len(calc_result)} 条")
 
     # 构建检测方法对象 - 与前端保持一致
     detection_method = {
@@ -2196,8 +2504,8 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
         "standardStrain": None,
         "reagent": None,
         "cultureMedium": None,
-        "temperature": self.temperature_var.get() or "22",
-        "humidity": self.humidity_var.get() or "55",
+        "temperature": self.temperature_var.get(),
+        "humidity": self.humidity_var.get(),
         "detectionMethod": detection_method,
         "computingFormula": computing_formula,
         "experimentProcess": experiment_process,

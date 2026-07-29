@@ -1,10 +1,13 @@
-default_rules:
-- from_id: '1167'
-  to_id: '4359'
-  description: ''
+default_rules: []
 filename_rules: []
 query_rules:
-  query_rules: []
+  query_rules:
+  - description: ''
+    project: ''
+    method: GB/T 23991-2009
+    cancel_test: false
+    input_method: 方法
+    max_select: ''
   exclusion_rules: []
   sum_rules:
   - project: '1'
@@ -13,9 +16,9 @@ query_rules:
     id2: '1'
 processing_rules: []
 weighing_params:
-  decimal_places: ''
-  min_value: ''
-  max_value: ''
+  decimal_places: '4'
+  min_value: '0.26'
+  max_value: '0.35'
   conversion_factor: ''
   result_decimal_places: ''
   weighing_mode: random
@@ -41,8 +44,18 @@ spectrum_upload_settings:
   quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
   undetected_threshold: ''
   marker: ''
+  clear_spectrum: true
 other_params_settings:
-  standard_type: fresh
-  preparation_number: D-9211
+  standard_type: fixed
+  preparation_number: D-9210
   instrument_setting: default
   device_number: ''
+  fixed_params:
+  - trigger: 检测项目=可溶性汞
+    params:
+    - name: 分析校正系数e(%)
+      value: '50'
+    - name: 样品浓度C(mg/L)
+      value: <0.004
+    - name: 试剂空白C₀(mg/L)
+      value: <0.004
