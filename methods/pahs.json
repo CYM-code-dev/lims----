@@ -1,0 +1,33 @@
+{
+  "sequence_data": [
+    {
+      "id": 1,
+      "weighing_path": "//files.cirs-ck.com/轻工公盘/有机/20260730-PDPAHS/称量记录0730.xlsx",
+      "method_file": "D:/Agent/lims数据登记/methods/跑道PAHS.yaml",
+      "reference_material": "",
+      "equipment": "",
+      "spectrum_path": "//files.cirs-ck.com/轻工公盘/有机/20260730-PDPAHS",
+      "sample_code": "",
+      "configure_order": "D-9139",
+      "standard_type": "fixed",
+      "instrument_setting": "default",
+      "weighing_mode": "record",
+      "temperature": "25",
+      "humidity": "55",
+      "status": "待运行",
+      "error_msg": "",
+      "experiment_code": ""
+    }
+  ],
+  "column_widths": [
+    50,
+    260,
+    220,
+    140,
+    140,
+    260,
+    70,
+    70,
+    140
+  ]
+}

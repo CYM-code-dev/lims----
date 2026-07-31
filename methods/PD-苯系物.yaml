@@ -54,14 +54,16 @@ spectrum_upload_settings:
     sample:
       enabled: true
       count: '1'
-      keyword: A,B
+      keyword: '*A,*B'
   quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
   undetected_threshold: ''
   marker: ''
   clear_spectrum: true
+  spectrum_filter_rules: []
 other_params_settings:
   standard_type: fixed
   preparation_number: D-9335
   instrument_setting: default
   device_number: ''
+  equipment_rules: []
   fixed_params: []

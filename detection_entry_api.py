@@ -46,9 +46,6 @@ class DetectionAPI:
             if not force_new and cache_key in self.experiment_code_cache:
                 return self.experiment_code_cache[cache_key]
 
-            # 生成新的实验编号
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
             # 缓存用户前缀
             if user_name not in self.user_prefix_cache:
                 user_prefix = user_name[:3].lower() if user_name else "unk"
@@ -56,7 +53,12 @@ class DetectionAPI:
             else:
                 user_prefix = self.user_prefix_cache[user_name]
 
-            experiment_code = f"{user_prefix}{timestamp}"
+            # 时间戳为秒级，同秒多批(如 XRF 多方法各一批)会撞号→服务端按号归并/回读回退撞号。
+            # 保证全局唯一：与已生成编号同秒则逐秒后移，直到不重复(格式不变：前缀+14位数字)
+            ts = datetime.now()
+            while f"{user_prefix}{ts.strftime('%Y%m%d%H%M%S')}" in self.experiment_code_cache.values():
+                ts += timedelta(seconds=1)
+            experiment_code = f"{user_prefix}{ts.strftime('%Y%m%d%H%M%S')}"
 
             # 缓存生成的编号
             self.experiment_code_cache[cache_key] = experiment_code
@@ -557,7 +559,7 @@ class DetectionAPI:
         """提交实验数据 - 修复版本，确保与前端请求一致"""
         try:
             if not experiment_data:
-                return False
+                return False, None
 
             # 构建正确的请求头 - 与前端完全一致
             sample_project_ids = experiment_data.get("sampleProjectIds", "")
@@ -603,7 +605,7 @@ class DetectionAPI:
         except Exception as e:
             if log_func:
                 log_func(f"提交实验数据异常: {str(e)}, 项目: {project_name}")
-            return False
+            return False, None
 
     def extract_experiment_code(self, result_data, local_code):
         """从提交响应里递归找服务端真实实验编号（与 local_code 同前缀、同长度、后段为数字）；
@@ -2110,12 +2112,24 @@ class _Box:
 
 def _match_fixed_params(fixed_params, project):
     """按触发条件筛选适用于该项目的固定参数，返回 {规范化参数名(去空白): 值}。
-    触发格式「检测项目=值」/「检测方法=值」；值与项目对应字段做包含匹配。
-    参数名去全部空白后作为键，便于与 columeName 容错匹配。"""
+    触发格式「检测项目=值」/「检测方法=值」/「默认」(无条件，优先级最低，可被具体条件覆盖)；
+    条件值与项目对应字段做包含匹配。参数名去全部空白后作为键，便于与 columeName 容错匹配。"""
     overrides = {}
+
+    def _apply(rule):
+        for p in rule.get("params") or []:
+            name = "".join((p.get("name") or "").split())
+            if name:
+                overrides[name] = p.get("value", "")
+
+    # 先应用默认规则（优先级最低）
+    for rule in fixed_params or []:
+        if (rule.get("trigger") or "").strip() in ("默认", "默认触发"):
+            _apply(rule)
+    # 再按 检测项目/检测方法 条件匹配（覆盖默认）
     for rule in fixed_params or []:
         trig = (rule.get("trigger") or "").strip()
-        if not trig:
+        if not trig or trig in ("默认", "默认触发"):
             continue
         field, _, value = trig.partition("=")
         field, value = field.strip(), value.strip()
@@ -2124,10 +2138,7 @@ def _match_fixed_params(fixed_params, project):
         target = (project.get("standardNo") or "").strip() if field == "检测方法" \
             else (project.get("projectName") or "").strip()
         if value in target:
-            for p in rule.get("params") or []:
-                name = "".join((p.get("name") or "").split())
-                if name:
-                    overrides[name] = p.get("value", "")
+            _apply(rule)
     return overrides
 
 
@@ -2238,21 +2249,31 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                 }
                 main_equipment_array.append(equipment_info)
 
-    # 检查关键配置是否存在
-    if not computing_formula:
-        raise Exception("实验配置中缺少计算公式")
-    if not round_method:
-        raise Exception("实验配置中缺少修约方法")
-    if not calc_method:
-        raise Exception("实验配置中缺少计算方法")
+    # 默认触发的固定参数同时写死「计算值+报告值」时，结果全固定，无需计算公式/修约/计算方法，跳过后端 calcTheValue
+    _default_fp = next((r for r in (getattr(self, "fixed_params", None) or [])
+                        if (r.get("trigger") or "").strip() in ("默认", "默认触发")), None)
+    _default_names = {"".join((p.get("name") or "").split())
+                      for p in ((_default_fp or {}).get("params") or [])}
+    skip_calc = _default_names >= {"计算值", "报告值"}
+
+    # 检查关键配置是否存在（固定结果值的方法可缺计算公式/修约/计算方法）
+    if not skip_calc:
+        if not computing_formula:
+            raise Exception("实验配置中缺少计算公式")
+        if not round_method:
+            raise Exception("实验配置中缺少修约方法")
+        if not calc_method:
+            raise Exception("实验配置中缺少计算方法")
     if not experiment_process:
         raise Exception("实验配置中缺少实验过程")
 
     # 修复：将 calcMethod 从对象转换为字符串
     if isinstance(calc_method, dict):
         calc_method_str = calc_method.get('key', 'CALC_METHOD_ENUM_AVG')
-    else:
+    elif calc_method:
         calc_method_str = str(calc_method)
+    else:
+        calc_method_str = None  # 固定结果值方法无 calcMethod，提交 null 而非 "None" 字符串
 
     # 修复：确保 ocMethodSettings 中的枚举字段是字符串而不是对象
     if oc_method_settings and isinstance(oc_method_settings, dict):
@@ -2290,6 +2311,10 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
 
         # 固定参数覆盖（序列模式：方法 other_params_settings.fixed_params，按触发条件匹配当前项目）
         fixed_overrides = _match_fixed_params(getattr(self, "fixed_params", None), project)
+
+        # 保留名「计算值/报告值」：直接固定结果值，跳过后端 calcTheValue（按方法触发，该项目下所有记录统一）
+        fixed_calc_value = fixed_overrides.pop("计算值", None)
+        fixed_report_value = fixed_overrides.pop("报告值", None)
 
         # 检查必要字段
         if not sample_id:
@@ -2353,10 +2378,11 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                     else:
                         dynamic_fields[col_code] = default_val
 
-                # 固定参数覆盖：优先级最高，覆盖用户输入与默认值（参数名去空白后与 columeName 匹配）
+                # 固定参数作为默认填充：称样表格已有值时优先使用表格值；仅当用户未填写时用固定参数补全
                 _cn = "".join(col_name.split())
                 if _cn and _cn in fixed_overrides:
-                    dynamic_fields[col_code] = str(fixed_overrides[_cn])
+                    if not user_value:
+                        dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
                 # 构建selectmap数据 - 与前端保持一致
                 if edit_type == 'EDIT_TYPE_SELECT' and dynamic_fields[col_code]:
@@ -2436,6 +2462,11 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                 "cid": None,
                 "_X_ID": f"row_{8 + record_id_counter}"
             }
+            # 固定结果值写回（来自固定参数保留名「计算值/报告值」）
+            if fixed_calc_value is not None:
+                analysis_record["calculatedValue"] = fixed_calc_value
+            if fixed_report_value is not None:
+                analysis_record["reportValue"] = fixed_report_value
             oc_analysis_record_save_list.append(analysis_record)
             # 收集 calcTheValue 请求行（columnValues=动态字段+检出限，calculatedValue 留空由服务端算）
             calc_rows.append({
@@ -2455,29 +2486,36 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
             })
             record_id_counter += 1
 
-    # 计算报告值并回填（calcTheValue）；失败回退原 None 行为，不阻断提交
-    calc_meta = {
-        'roundMethod': round_method,
-        'roundMethodLevelJson': round_method_level_json,
-        'resultRoundMethod': self.experiment_config.get('resultRoundMethod'),
-        'resultRoundMethodLevelJson': self.experiment_config.get('resultRoundMethodLevelJson'),
-        'calcMethod': calc_method_str,
-        'accuracy': (analysis_records_config[0].get('accuracy') if analysis_records_config else None) or 'STANDARD_DEVIATION',
-        'methodSettingId': (self.experiment_config or {}).get('ocMethodSettings', {}).get('methodId') or oc_method_settings.get('id'),
-        'accuracyRadixPoint': oc_method_settings.get('accuracyRadixPoint'),
-        'curve': self.experiment_config.get('ocCurve'),
-    }
-    calc_result = self.api.calc_report_values(calc_rows, calc_meta, self.log)
-    if calc_result:
-        for rec in oc_analysis_record_save_list:
-            cv = calc_result.get(rec.get('id'))
-            if cv:
-                rec['calculatedValue'] = cv.get('calculatedValue')
-                rec['reportValue'] = cv.get('reportValue')
-                if cv.get('other'):
-                    rec['other'] = cv['other']
-        if self.log:
-            self.log(f"已计算报告值: {len(calc_result)} 条")
+    # 计算报告值并回填（calcTheValue）；固定结果值时跳过；失败回退原 None 行为，不阻断提交
+    calc_result = None
+    if not skip_calc:
+        calc_meta = {
+            'roundMethod': round_method,
+            'roundMethodLevelJson': round_method_level_json,
+            'resultRoundMethod': self.experiment_config.get('resultRoundMethod'),
+            'resultRoundMethodLevelJson': self.experiment_config.get('resultRoundMethodLevelJson'),
+            'calcMethod': calc_method_str,
+            'accuracy': (analysis_records_config[0].get('accuracy') if analysis_records_config else None) or 'STANDARD_DEVIATION',
+            'methodSettingId': (self.experiment_config or {}).get('ocMethodSettings', {}).get('methodId') or oc_method_settings.get('id'),
+            'accuracyRadixPoint': oc_method_settings.get('accuracyRadixPoint'),
+            'curve': self.experiment_config.get('ocCurve'),
+        }
+        calc_result = self.api.calc_report_values(calc_rows, calc_meta, self.log)
+        if calc_result:
+            for rec in oc_analysis_record_save_list:
+                cv = calc_result.get(rec.get('id'))
+                if cv:
+                    # 已被固定参数写死的值不覆盖
+                    if rec.get('calculatedValue') is None:
+                        rec['calculatedValue'] = cv.get('calculatedValue')
+                    if rec.get('reportValue') is None:
+                        rec['reportValue'] = cv.get('reportValue')
+                    if cv.get('other'):
+                        rec['other'] = cv['other']
+            if self.log:
+                self.log(f"已计算报告值: {len(calc_result)} 条")
+    elif self.log:
+        self.log("结果值由固定参数写死，跳过 calcTheValue")
 
     # 构建检测方法对象 - 与前端保持一致
     detection_method = {
@@ -2579,3 +2617,16 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
     }
 
     return experiment_data
+
+
+if __name__ == "__main__":
+    # generate_experiment_code 唯一性自检：同秒连发多批不应撞号(XRF 多方法各一批曾因此合并)
+    _api = object.__new__(DetectionAPI)
+    _api.experiment_code_cache = {}
+    _api.user_prefix_cache = {}
+    _api.get_user_pname = lambda: "lqy"
+    _codes = [_api.generate_experiment_code(method_name=f"m{i}", force_new=False) for i in range(4)]
+    assert len(set(_codes)) == 4, _codes                       # 同秒4批各不相同
+    assert all(c.startswith("lqy") and len(c) == 17 for c in _codes), _codes  # 格式不变
+    assert _api.generate_experiment_code(method_name="m0") == _codes[0]       # 同方法非force_new 复用缓存
+    print("detection_entry_api selfcheck OK")

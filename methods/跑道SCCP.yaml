@@ -2,12 +2,11 @@ default_rules: []
 filename_rules: []
 query_rules:
   query_rules:
-  - description: ''
-    project: ''
-    method: GB/T 23991-2009
+  - project: 短链氯化石蜡（C10-C13）
+    method: GB 36246-2018 附录G
     cancel_test: false
     input_method: 方法
-    max_select: ''
+    max_select: '30'
   exclusion_rules: []
   sum_rules:
   - project: '1'
@@ -17,8 +16,8 @@ query_rules:
 processing_rules: []
 weighing_params:
   decimal_places: '4'
-  min_value: '0.26'
-  max_value: '0.35'
+  min_value: '0.46'
+  max_value: '0.55'
   conversion_factor: ''
   result_decimal_places: ''
   weighing_mode: random
@@ -26,36 +25,38 @@ spectrum_upload_settings:
   upload_mode: local_upload
   spectrum_check_params:
     blank:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: BLK
     standard:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '2'
+      keyword: SCCP 100
     linearity:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: XX
     sample:
-      enabled: false
-      count: ''
-      keyword: ''
+      enabled: true
+      count: '1'
+      keyword: '*，*T,*TS'
   quantitative_report_path: \\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip
   undetected_threshold: ''
   marker: ''
   clear_spectrum: true
+  spectrum_filter_rules: []
 other_params_settings:
   standard_type: fixed
-  preparation_number: D-9210
-  instrument_setting: default
+  preparation_number: D-9044
+  instrument_setting: conditional
   device_number: ''
-  fixed_params:
-  - trigger: 检测项目=可溶性汞
-    params:
-    - name: 分析校正系数e(%)
-      value: '50'
-    - name: 样品浓度C(mg/L)
-      value: <0.004
-    - name: 试剂空白C₀(mg/L)
-      value: <0.004
+  equipment_rules:
+  - filename: ''
+    project_name: ''
+    desc: 胶水；液体
+    device_number: CK-SB294-CG;CK-SB086-CG
+  - filename: ''
+    project_name: ''
+    desc: 颗粒；草
+    device_number: CK-SB086-CG；CK-SB063-CG；CK-SB294-CG
+  fixed_params: []

@@ -1,0 +1,51 @@
+{
+  "sequence_data": [
+    {
+      "id": 1,
+      "weighing_path": "D:/Agent/lims数据登记/methods/称量记录2.xlsx",
+      "method_file": "D:/Agent/lims数据登记/methods/跑道PAE固体.yaml",
+      "reference_material": "",
+      "equipment": "",
+      "spectrum_path": "//files.cirs-ck.com/轻工公盘/有机/20260730-pd-017",
+      "sample_code": "",
+      "configure_order": "D-9156",
+      "standard_type": "fixed",
+      "instrument_setting": "default",
+      "weighing_mode": "record",
+      "temperature": "25",
+      "humidity": "55",
+      "status": "成功",
+      "error_msg": "",
+      "experiment_code": "wjy20260730145133 / wjy20260730145134"
+    },
+    {
+      "id": 2,
+      "weighing_path": "D:/Agent/lims数据登记/methods/称量记录2.xlsx",
+      "method_file": "D:/Agent/lims数据登记/methods/跑道PAE液体.yaml",
+      "reference_material": "",
+      "equipment": "",
+      "spectrum_path": "//files.cirs-ck.com/轻工公盘/有机/20260730-pd-017",
+      "sample_code": "",
+      "configure_order": "D-9156",
+      "standard_type": "fixed",
+      "instrument_setting": "default",
+      "weighing_mode": "random",
+      "temperature": "25",
+      "humidity": "55",
+      "status": "成功",
+      "error_msg": "",
+      "experiment_code": "wjy20260730145157 / wjy20260730145159"
+    }
+  ],
+  "column_widths": [
+    50,
+    260,
+    220,
+    140,
+    140,
+    260,
+    70,
+    70,
+    140
+  ]
+}

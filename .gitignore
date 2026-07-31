@@ -21,3 +21,8 @@ logs/
 # ===== 工具本地产物 =====
 .codegraph/
 .claude/settings.local.json
+
+# ===== 调试 / 临时文件 =====
+*.bak
+file.txt
+session.txt
