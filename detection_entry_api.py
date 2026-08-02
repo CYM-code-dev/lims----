@@ -9,6 +9,7 @@ import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 import pandas as pd
 import os
+import unicodedata
 import paths
 from openpyxl import load_workbook
 
@@ -25,6 +26,7 @@ class DetectionAPI:
         self.current_sample_id = None
         self.sub_method_map = {}
         self.method_id_to_standard_no = {}
+        self._std_no_name_to_id = {}  # standardNoName -> methodId（如 'AfPS GS 2019:01 PAK 单组份' -> 4489）
         self.cached_solution_types = None
 
         # 实验编号缓存
@@ -258,12 +260,19 @@ class DetectionAPI:
             else:
                 sample_project_ids_str = str(sample_project_ids)
 
-            # 动态查询配置ID并严格检查审核状态
-            configure_id, error_msg = self.get_solution_configure_id(configure_order, log_func)
-
-            # 严格的审核状态检查 - 只有明确返回配置ID才允许提交
-            if not configure_id:
-                return False, f"标准溶液 {configure_order} {error_msg}，请先审核后再提交"
+            # 动态查询配置ID并严格检查审核状态（支持逗号分隔多个标液，每个生成一条 configureJsonList）
+            orders = [o.strip() for o in str(configure_order or "").replace("，", ",").split(",") if o.strip()]
+            configure_entries = []
+            for order in orders:
+                configure_id, error_msg = self.get_solution_configure_id(order, log_func)
+                # 严格的审核状态检查 - 只有明确返回配置ID才允许提交
+                if not configure_id:
+                    return False, f"标准溶液 {order} {error_msg}，请先审核后再提交"
+                configure_entries.append({
+                    "configureIds": str(configure_id),
+                    "configureType": "SOLUTION_TYPE_D",
+                    "status": 0
+                })
 
             # 获取当前用户信息
             pid = self.get_user_pid()
@@ -299,13 +308,7 @@ class DetectionAPI:
             # 构建请求数据
             request_data = {
                 "id": int(experiment_id) if experiment_id and str(experiment_id).isdigit() else 0,
-                "configureJsonList": json.dumps([
-                    {
-                        "configureIds": str(configure_id),
-                        "configureType": "SOLUTION_TYPE_D",
-                        "status": 0
-                    }
-                ]),
+                "configureJsonList": json.dumps(configure_entries),
                 "pid": pid,
                 "pname": pname,
                 "loginId": login_id
@@ -1312,7 +1315,11 @@ class DetectionAPI:
                                 'sampleName': sample_data.get('sampleName', ''),
                                 'projectName': sample_data.get('decideProjectName', ''),
                                 'standardNo': sample_data.get('standardNo', ''),
+                                'decideProjectMethodId': sample_data.get('decideProjectMethodId'),
+                                'subMethodName': sample_data.get('subMethodName', ''),
                                 'projectId': sample_data.get('id'),
+                                # 检测项目定义ID（取项目别名 detailByProject?id= 要用；字段名待 Step 0 确认）
+                                'detectionProjectId': sample_data.get('detectionProjectId') or sample_data.get('decideProjectId'),
                                 'sampleId': sample_data.get('sampleId'),
                                 'detectionNo': detection_no,
                                 'sampleSmallNo': small_no,
@@ -1480,10 +1487,26 @@ class DetectionAPI:
         weighing_equipment_ids_list = []
 
         # 遍历设备列表，按用途分类，只选择默认设备
+        if log_func and equipment_list:
+            log_func("[设备] 方法返回 {} 台: {}".format(
+                len(equipment_list), "; ".join(
+                    "{}({}/isDefault={!r})".format(e.get('name'), e.get('usedCategory'), e.get('isDefault'))
+                    for e in equipment_list)))
         for equipment in equipment_list:
             used_category = equipment.get('usedCategory', '')
-            name = equipment.get('name', '')
+            # 设备名逐级回落：selectByDetectionMethodId 返回里称样设备 name=None，真名在 equipmentBillName
+            name = (equipment.get('name') or equipment.get('equipmentName')
+                    or equipment.get('equipmentBillName') or '').strip()
             main_equipment_names_value = equipment.get('mainEquipmentNames', '')
+            # 显示名优先 mainEquipmentNames(已含"编号,名称,日期")；缺失时按 GUI(detection_entry_main:1989)
+            # 同款用 no/name/checkOutDate 拼，使称样设备也能得到"编号,名称,日期"串
+            if main_equipment_names_value:
+                display_name = main_equipment_names_value
+            else:
+                _eno = (equipment.get('no') or '').strip()
+                _cod = equipment.get('checkOutDate')
+                _edate = _cod[:10] if isinstance(_cod, str) else (str(_cod)[:10] if _cod else '')
+                display_name = "{},{},{}".format(_eno, name, _edate) if _eno else name
             is_default = equipment.get('isDefault')
             equipment_id = equipment.get('id')
             equipment_bill_id = equipment.get('equipmentBillId')
@@ -1491,14 +1514,14 @@ class DetectionAPI:
             # 优先使用 equipmentBillId，如果不存在则使用 id
             effective_id = equipment_bill_id if equipment_bill_id else equipment_id
 
-            # 只处理默认设备 (isDefault=1)
-            if is_default != 1:
+            # 只处理默认设备 (isDefault=1；兼容字符串"1"/布尔True，否则字符串"1"会被跳过→默认设备填不上)
+            if str(is_default).strip().lower() not in ("1", "true", "是"):
                 continue
+            if log_func and not display_name:
+                log_func("[设备] 默认设备无法解析名称，原始字段: {}".format(
+                    {k: v for k, v in equipment.items() if v not in (None, '', [], {})}))
 
             if used_category == '检测设备':
-                # 对于检测设备，优先使用 mainEquipmentNames，如果没有则使用 name
-                display_name = main_equipment_names_value if main_equipment_names_value else name
-
                 equipment_info = {
                     'name': name,
                     'display_name': display_name,
@@ -1515,9 +1538,6 @@ class DetectionAPI:
                     main_equipment_ids_list.append(str(effective_id))
 
             elif used_category == '称样设备':
-                # 对于称样设备，优先使用 mainEquipmentNames，如果没有则使用 name
-                display_name = main_equipment_names_value if main_equipment_names_value else name
-
                 equipment_info = {
                     'name': name,
                     'display_name': display_name,
@@ -1552,8 +1572,8 @@ class DetectionAPI:
         if weighing_equipments:
             # 只选择默认称样设备
             selected_weighing = weighing_equipments[0]
-            weighing_equipment_name = selected_weighing['name']
-            weighing_equipment_display_name = selected_weighing['display_name']
+            weighing_equipment_name = selected_weighing['name'] or ""
+            weighing_equipment_display_name = selected_weighing['display_name'] or ""
             weighing_equipment_id = selected_weighing['id']
 
             # 提取设备基本名称（去掉编码和日期信息）
@@ -1610,6 +1630,50 @@ class DetectionAPI:
         return self._query_equipment_choice_page(
             "ocChoicePage", "称样设备", sample_project_id, {}, log_func,
         )
+
+    def get_project_alias(self, detection_project_id, log_func=None):
+        """取项目别名（谱图数据采集的解析规则串）。
+
+        对应网页 检测标准管理→项目→属性 的 detectionProjectProperty/detailByProject，
+        返回 (alias, detail)。alias=otherName（如 "Chrysene;<0.005/[0.005-2.00]"）；
+        detail 为短状态串（'ok'/'空'/'success=false:...'/'HTTP nnn'/'异常:...'），便于定位。
+        id 参数是【检测项目定义ID detectionProjectId】，非样品项目ID。
+        """
+        try:
+            params = {
+                'id': detection_project_id,
+                'pid': self.get_user_pid(),
+                'pname': self.get_user_pname(),
+                'loginId': self.get_user_login_id(),
+            }
+            response = self.login_system.session.get(
+                f'{self.login_system.base_url}/detectionManager/manager/detectionProjectProperty/detailByProject',
+                params=params,
+                headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/testStandardMgt.html?menuId=294',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                verify=False, timeout=15,
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    alias = (result.get('resultData') or {}).get('otherName') or ''
+                    return alias, ('空' if not alias else 'ok')
+                detail = f"success=false: {str(result)[:150]}"
+                if log_func:
+                    log_func(detail)
+                return '', detail
+            detail = f"HTTP {response.status_code}"
+            if log_func:
+                log_func(f"detailByProject {detail}")
+            return '', detail
+        except Exception as e:
+            detail = f"异常: {e}"
+            if log_func:
+                log_func(f"取项目别名 {detail}")
+            return '', detail
 
     def save_main_equipment(self, experiment_id, items, log_func=None):
         """提交主检设备到 ocExperiment/saveMainEqubment（测试）。
@@ -1810,6 +1874,59 @@ class DetectionAPI:
             return None
 
         except Exception as e:
+            return None
+
+    def get_method_id_by_standard_no_name(self, standard_no_name, log_func=None):
+        """按 standardNoName（如 'AfPS GS 2019:01 PAK 单组份'）解析子方法 methodId。
+        一个标准号下常有多个子方法（单组份/N项之和），各为独立 methodId；
+        走 selectCheckInDecideMethodName 按 standardNoName 精确匹配取 id。命中返回 id，否则 None。"""
+        key = (standard_no_name or "").strip()
+        if not key:
+            return None
+        if key in self._std_no_name_to_id:
+            return self._std_no_name_to_id[key]
+        try:
+            today = datetime.now()
+            params = {
+                "_search": "false",
+                "nd": str(int(time.time() * 1000)),
+                "pageSize": "9999",
+                "pageNo": "1",
+                "sidx": "",
+                "sord": "asc",
+                "decideProjectMethodName": key,
+                "acceptStartDate": (today - timedelta(days=30)).strftime("%Y-%m-%d"),
+                "acceptEndDate": today.strftime("%Y-%m-%d"),
+                "checkInStatus": "CHECK_IN_STATUS_NO",
+                "decideProjectOrgName": "23",
+                "subpackage": "NO",
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+            }
+            response = self.login_system.session.get(
+                f"{self.login_system.base_url}/detectionManager/manager/resultCheckIn/selectCheckInDecideMethodName",
+                params=params,
+                headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInListMgt.html?state=state',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                verify=False,
+                timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    for m in result.get('resultData', []) or []:
+                        if (m.get('standardNoName') or "").strip() == key:
+                            mid = m.get('id')
+                            self._std_no_name_to_id[key] = mid
+                            return mid
+            return None
+        except Exception as e:
+            if log_func:
+                log_func(f"解析子方法ID异常({key}): {str(e)}")
             return None
 
     def check_and_switch_sub_method(self, method_id, log_func=None):
@@ -2110,15 +2227,21 @@ class _Box:
         self._v = v
 
 
+def _norm_cn(s):
+    """列名/参数名容错归一：NFKC(全角→半角、下标₀→0) + 去全部空白 + 小写。
+    覆盖 「分析校正系数e(%)」vs「分析校正系数E（%）」/ C₀ vs C0 等差异，避免固定参数填不上。"""
+    return "".join(unicodedata.normalize('NFKC', str(s or '')).split()).lower()
+
+
 def _match_fixed_params(fixed_params, project):
     """按触发条件筛选适用于该项目的固定参数，返回 {规范化参数名(去空白): 值}。
     触发格式「检测项目=值」/「检测方法=值」/「默认」(无条件，优先级最低，可被具体条件覆盖)；
-    条件值与项目对应字段做包含匹配。参数名去全部空白后作为键，便于与 columeName 容错匹配。"""
+    条件值与项目对应字段做包含匹配。参数名经 _norm_cn 归一(全角/大小写/下标容错)后作为键。"""
     overrides = {}
 
     def _apply(rule):
         for p in rule.get("params") or []:
-            name = "".join((p.get("name") or "").split())
+            name = _norm_cn(p.get("name"))
             if name:
                 overrides[name] = p.get("value", "")
 
@@ -2252,7 +2375,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
     # 默认触发的固定参数同时写死「计算值+报告值」时，结果全固定，无需计算公式/修约/计算方法，跳过后端 calcTheValue
     _default_fp = next((r for r in (getattr(self, "fixed_params", None) or [])
                         if (r.get("trigger") or "").strip() in ("默认", "默认触发")), None)
-    _default_names = {"".join((p.get("name") or "").split())
+    _default_names = {_norm_cn(p.get("name"))
                       for p in ((_default_fp or {}).get("params") or [])}
     skip_calc = _default_names >= {"计算值", "报告值"}
 
@@ -2311,6 +2434,13 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
 
         # 固定参数覆盖（序列模式：方法 other_params_settings.fixed_params，按触发条件匹配当前项目）
         fixed_overrides = _match_fixed_params(getattr(self, "fixed_params", None), project)
+        if fixed_overrides:
+            self.log(f"[固定参数] 项目={project.get('projectName')!r} 命中触发条件，待填: {list(fixed_overrides)}")
+            _col_norm = {_norm_cn(c.get('columeName')) for c in self.dynamic_columns if isinstance(c, dict)}
+            _miss = [k for k in fixed_overrides if k not in _col_norm]
+            if _miss:
+                self.log(f"[固定参数] 找不到同名列(参数名↔列名不符)，未填: {_miss}")
+                self.log(f"[固定参数] 实际动态列名: {[c.get('columeName') for c in self.dynamic_columns if isinstance(c, dict)]}")
 
         # 保留名「计算值/报告值」：直接固定结果值，跳过后端 calcTheValue（按方法触发，该项目下所有记录统一）
         fixed_calc_value = fixed_overrides.pop("计算值", None)
@@ -2378,11 +2508,10 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                     else:
                         dynamic_fields[col_code] = default_val
 
-                # 固定参数作为默认填充：称样表格已有值时优先使用表格值；仅当用户未填写时用固定参数补全
-                _cn = "".join(col_name.split())
-                if _cn and _cn in fixed_overrides:
-                    if not user_value:
-                        dynamic_fields[col_code] = str(fixed_overrides[_cn])
+                # 固定参数：手动模式仅当用户未填时补全(尊重手填)；序列(无头)模式覆盖列默认值(无真实输入)
+                _cn = _norm_cn(col_name)
+                if _cn and _cn in fixed_overrides and (not user_value or getattr(self, "is_headless", False)):
+                    dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
                 # 构建selectmap数据 - 与前端保持一致
                 if edit_type == 'EDIT_TYPE_SELECT' and dynamic_fields[col_code]:
@@ -2524,12 +2653,11 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
         "subMethodName": None
     }
 
-    # 获取标准物质信息
+    # 获取标准物质信息（支持逗号分隔多个标液，逐个取完整信息后拼接）
     reference_material = ""
     if hasattr(self, 'solution_type_var') and self.solution_type_var.get().strip():
-        configure_order = self.solution_type_var.get().strip()
-        # 获取完整的标准物质信息
-        reference_material = self.api.get_solution_full_info(configure_order, self.log)
+        _std_orders = [o.strip() for o in self.solution_type_var.get().replace("，", ",").split(",") if o.strip()]
+        reference_material = "; ".join(self.api.get_solution_full_info(o, self.log) for o in _std_orders)
 
     # 构建基础实验数据 - 与前端数据结构完全一致
     experiment_data = {

@@ -1,0 +1,33 @@
+{
+  "sequence_data": [
+    {
+      "id": 1,
+      "weighing_path": "",
+      "method_file": "D:/Agent/lims数据登记/methods/4大-1.yaml",
+      "reference_material": "",
+      "equipment": "",
+      "spectrum_path": "D:/Agent/lims数据登记/谱图/报告解析/ICP",
+      "sample_code": "",
+      "configure_order": "D-9387,D-9386",
+      "standard_type": "",
+      "instrument_setting": "",
+      "weighing_mode": "",
+      "temperature": "22",
+      "humidity": "55",
+      "status": "待运行",
+      "error_msg": "",
+      "experiment_code": ""
+    }
+  ],
+  "column_widths": [
+    50,
+    260,
+    220,
+    202,
+    220,
+    260,
+    90,
+    90,
+    140
+  ]
+}

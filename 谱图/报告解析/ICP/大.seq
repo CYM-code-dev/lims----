@@ -1,0 +1,27 @@
+sequence_data:
+- id: 1
+  weighing_path: ''
+  method_file: ''
+  reference_material: ''
+  equipment: ''
+  spectrum_path: ''
+  sample_code: ''
+  configure_order: ''
+  standard_type: ''
+  instrument_setting: ''
+  weighing_mode: ''
+  temperature: ''
+  humidity: ''
+  status: 待运行
+  error_msg: ''
+  experiment_code: ''
+column_widths:
+- 50
+- 260
+- 220
+- 140
+- 180
+- 260
+- 90
+- 90
+- 140

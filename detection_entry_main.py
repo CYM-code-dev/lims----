@@ -8,12 +8,27 @@ from datetime import datetime, timedelta
 import webbrowser
 import argparse
 import os
+import re
 import sys
 
 # 导入登录系统和API模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from login import MultiUserLoginSystem
 from detection_entry_api import DetectionAPI, build_grouped_experiment_data
+import threading
+import paths
+from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor
+from alias_evaluator import evaluate_alias
+
+# ponytail: 与 SequenceMaster._strip_parallel_suffix 同逻辑；两模块刻意解耦不互导，故复制。
+_PARALLEL_SUFFIX_RE = re.compile(r'^([A-Za-z]+\d{8})\d{3}([A-Za-z]*)$')
+
+
+def _strip_parallel_suffix(code):
+    """去掉称样编号的平行小号(001)：TN26070620001→TN26070620，用作谱图前缀兜底匹配
+    (ICP 文件名常只用 8 位流水 TN26070620.pdf，无小号)。不符结构原样返回。"""
+    m = _PARALLEL_SUFFIX_RE.match((code or "").strip())
+    return (m.group(1) + m.group(2)) if m else (code or "")
 
 
 def _make_large_checkbutton_style(scale=1.5):
@@ -335,6 +350,8 @@ class DetectionEntrySystem:
         ttkb.Button(button_frame, text="结果计算", command=self.calc_results, bootstyle="info").pack(side=tk.LEFT, padx=(0, 10))
         ttkb.Button(button_frame, text="提交数据", command=self.submit_data, bootstyle="primary").pack(side=tk.LEFT, padx=(0, 10))
         ttkb.Button(button_frame, text="清空数据", command=self.clear_data, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="数据采集", command=self.acquire_data, bootstyle="success").pack(side=tk.LEFT, padx=(0, 10))
+        ttkb.Button(button_frame, text="采集设置", command=self.edit_acquisition_settings, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
 
         # 添加分组信息显示
         self.group_info_var = tk.StringVar(value="")
@@ -674,6 +691,236 @@ class DetectionEntrySystem:
                      f"报告值={rv if rv is not None else '空'}  计算值={cv if cv is not None else '空'}"
                      + (f"  [{r.get('other')}]" if r.get('other') else ''))
         self.log(f"==== 结果计算 完成 ({len(records)} 条) ====")
+
+    # ---------------- 谱图数据采集（本地解析）----------------
+
+    _ACQ_SETTINGS_FILE = 'acquisition_settings.json'
+    # 方法/项目名 -> 谱图文件名类别关键词（一样多报告时挑选用）
+    _CATEGORY_HINTS = (
+        ('PAE', ('PAE', '邻苯')), ('PAHS', ('PAHS', '多环', 'PAH')),
+        ('PCN', ('PCN', '氯萘')), ('BXW', ('BXW', '苯系物')),
+        ('氯苯', ('氯苯',)), ('SCCP', ('SCCP',)), ('SVHC', ('SVHC',)),
+        ('AZO', ('AZO', '偶氮')), ('OT', ('OT',)),
+        ('ICP', ('ICP', '元素', '重金属')),
+    )
+
+    def _acq_settings_path(self):
+        return os.path.join(paths.data_dir(), self._ACQ_SETTINGS_FILE)
+
+    def _load_acquisition_settings(self):
+        try:
+            with open(self._acq_settings_path(), 'r', encoding='utf-8') as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_acquisition_settings(self, settings):
+        try:
+            with open(self._acq_settings_path(), 'w', encoding='utf-8') as f:
+                json.dump(settings, f, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"保存采集设置失败: {e}")
+
+    def edit_acquisition_settings(self):
+        """选择谱图 PDF 所在的本地/网络文件夹并持久化。"""
+        cur = self._load_acquisition_settings().get('pdf_folder', '')
+        folder = filedialog.askdirectory(title="选择谱图 PDF 文件夹", initialdir=cur or None)
+        if folder:
+            self._save_acquisition_settings({'pdf_folder': folder})
+            self.log(f"采集设置已保存：{folder}")
+
+    def _find_pdf_for_sample(self, folder, sample_code):
+        """返回目录中文件名以 sampleCode 开头(大小写不敏感)的 PDF 列表。
+        直匹配空时兜底：按去小号前缀(如 TN26070620001→TN26070620)匹配——
+        ICP 等设备文件名只用 8 位流水、无小号(001)。"""
+        sc = (sample_code or '').lower()
+        out = []
+        try:
+            fns = [fn for fn in os.listdir(folder) if fn.lower().endswith('.pdf')]
+        except Exception as e:
+            self.log(f"读取谱图文件夹失败: {e}")
+            return out
+        out = [os.path.join(folder, fn) for fn in fns if fn.lower().startswith(sc)]
+        if out:
+            return out
+        stripped = _strip_parallel_suffix(sample_code).lower()
+        if stripped and stripped != sc:
+            out = [os.path.join(folder, fn) for fn in fns if fn.lower().startswith(stripped)]
+            if out:
+                self.log(f"样品 {sample_code} 按去小号前缀 {stripped} 匹配到谱图（文件名无小号）")
+        return out
+
+    def _pick_pdf(self, pdfs, method_hint):
+        """一样多报告时按方法/项目名类别关键词挑选；仍歧义取首个并告警。"""
+        if len(pdfs) == 1:
+            return pdfs[0]
+        text = (method_hint or '').upper()
+        hint = ''
+        for cat, keys in self._CATEGORY_HINTS:
+            if any(k.upper() in text for k in keys):
+                hint = cat
+                break
+        if hint:
+            matched = [p for p in pdfs if hint.lower() in os.path.basename(p).lower()]
+            if matched:
+                return matched[0]
+        self.log(f"存在多个谱图，取首个（候选：{[os.path.basename(p) for p in pdfs]}）")
+        return pdfs[0]
+
+    def _find_result_column(self, pdf_headers=()):
+        """挑数据采集结果列：
+        1) equipRelativeTitle 精确匹配 PDF 报告表头(原系统机制，非硬编码：浓度/校准浓度等都能对上)；
+        2) 兜底：列名关键词(计算值/报告值/浓度...)。多命中取 columeOrder 最小。"""
+        if pdf_headers:
+            cands = [c for c in self.dynamic_columns
+                     if not self._is_merge_column(c) and not self._is_component_column(c)
+                     and (c.get('equipRelativeTitle') or '').strip() in pdf_headers]
+            if cands:
+                return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
+        KW = ('计算值', '报告值', '测定值', '浓度', '结果值', '含量')
+        cands = [c for c in self.dynamic_columns
+                 if not self._is_merge_column(c) and not self._is_component_column(c)
+                 and any(k in (c.get('columeName') or '') for k in KW)]
+        if not cands:
+            return None
+        return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
+
+    def acquire_data(self):
+        """数据采集：本地解析谱图 PDF -> 按项目别名求值 -> 回填检测数据结果列。"""
+        if not self.login_system.current_user:
+            messagebox.showerror("错误", "请先登录系统")
+            return
+        selected_indices = [i for i, var in enumerate(self.project_vars) if var.get()]
+        if not selected_indices:
+            messagebox.showerror("错误", "请至少选择一个检测项目")
+            return
+        if not self.dynamic_columns or not getattr(self, 'experiment_config', None):
+            messagebox.showerror("错误", "请先获取动态配置")
+            return
+        selected_projects = [self.filtered_projects[i] for i in selected_indices if i < len(self.filtered_projects)]
+        if not selected_projects:
+            messagebox.showerror("错误", "未找到选中的项目")
+            return
+
+        sample_code = selected_projects[0].get('sampleCode', '')
+        folder = self._load_acquisition_settings().get('pdf_folder', '')
+        if not folder:
+            messagebox.showwarning("数据采集", "请先点「采集设置」指定谱图 PDF 文件夹")
+            return
+        pdfs = self._find_pdf_for_sample(folder, sample_code)
+        if not pdfs:
+            messagebox.showwarning("数据采集", f"在文件夹未找到样品 {sample_code} 的谱图 PDF")
+            return
+        method_hint = getattr(self, 'actual_method_name', '') or selected_projects[0].get('projectName', '')
+        # 分类正常/稀释(-NNX)报告：超线性组分改用稀释报告读数
+        normal_pdfs = [p for p in pdfs if _dilution_factor(p) == 1.0]
+        dil_pdfs = [p for p in pdfs if _dilution_factor(p) != 1.0]
+        pdf_path = self._pick_pdf(normal_pdfs or pdfs, method_hint)
+        dil_path = self._pick_pdf(dil_pdfs, method_hint) if dil_pdfs else None
+
+        # 收集各选中项目的 detectionProjectId（取别名用）
+        project_specs = [{'projectId': p.get('projectId'), 'projectName': p.get('projectName', ''),
+                          'detectionProjectId': p.get('detectionProjectId')} for p in selected_projects]
+        project_specs = [s for s in project_specs if s['detectionProjectId']]
+        if not project_specs:
+            messagebox.showwarning("数据采集", "未取到检测项目定义ID(detectionProjectId)，无法取项目别名")
+            return
+
+        self.update_status(f"正在解析谱图 {os.path.basename(pdf_path)} ...", "blue")
+        threading.Thread(target=self._acquire_worker, args=(pdf_path, project_specs, dil_path), daemon=True).start()
+
+    def _acquire_worker(self, pdf_path, project_specs, dil_path=None):
+        """子线程：解析正常 PDF（+ 可选稀释报告），逐样品/逐项目取别名求值，回主线程填表。
+        ICP 一 PDF 多样品(A/B 平行样)：按样品序号 slot 分别求值，回填时落对应平行槽。"""
+        try:
+            samples, headers = parse_pdf_report_multi(pdf_path)
+            if not samples:
+                self.root.after(0, lambda: messagebox.showwarning("数据采集", "未从谱图解析到化合物，请检查报告格式"))
+                return
+            diluted = None
+            dilution_factor = 1.0
+            if dil_path:
+                diluted, _ = parse_pdf_report(dil_path)
+                dilution_factor = _dilution_factor(dil_path)
+            plan = []
+            for spec in project_specs:
+                alias, detail = self.api.get_project_alias(spec['detectionProjectId'], self.log)
+                if not alias:
+                    self.log(f"项目 {spec['projectName']} 别名取不到({detail})，跳过")
+                    continue
+                item = {'projectName': spec['projectName'], 'projectId': spec['projectId'], 'results': []}
+                for slot, (_sid, compounds) in enumerate(samples):
+                    for r in evaluate_alias(alias, compounds, diluted_compounds=diluted):
+                        r['slot'] = slot
+                        item['results'].append(r)
+                plan.append(item)
+            self.root.after(0, self._apply_acquired_results, plan, headers, dilution_factor, len(samples))
+        except Exception as e:
+            err = str(e)
+            self.root.after(0, lambda: messagebox.showerror("数据采集失败", err))
+
+    def _apply_acquired_results(self, plan, pdf_headers=(), dilution_factor=1.0, n_samples=1):
+        """把求值结果填入结果列对应行/组分块。超线性(稀释)组分同时填稀释列。
+        多样品(ICP A/B)：result 携带 slot，落 pos = b*N + slot 平行槽。"""
+        res_col = self._find_result_column(pdf_headers)
+        if not res_col:
+            messagebox.showerror("数据采集", "未找到结果列(计算值/报告值/浓度)，请检查动态列")
+            return
+        target = self.data_fields.get(res_col)
+        if not isinstance(target, list):
+            messagebox.showerror("数据采集", "结果列不可填（非普通列）")
+            return
+        N = getattr(self, 'test_run_count', 1) or 1
+        comp_col = next((c.get('columeCode') for c in self.dynamic_columns if self._is_component_column(c)), None)
+        comp_vars = self.data_fields.get(comp_col) if comp_col else None
+        dil_col = next((c.get('columeCode') for c in self.dynamic_columns
+                        if (c.get('equipRelativeTitle') or '').strip() == '稀释'), None)
+        records = (getattr(self, 'experiment_config', {}) or {}).get('ocAnalysisRecordList') or []
+        # 无组分列时按 projectId 定位行；有组分列时按组分名匹配
+        pid_to_block = {}
+        if comp_col is None:
+            for _r in records:
+                _pid = _r.get('projectId')
+                if _pid is not None and _pid not in pid_to_block:
+                    pid_to_block[_pid] = len(pid_to_block)
+
+        filled, total, slot_skip = 0, 0, 0
+        for item in plan:
+            for r in item['results']:
+                total += 1
+                slot = r.get('slot', 0)
+                if slot >= N:  # 平行槽不足：N=1 时放不下第2个样品
+                    slot_skip += 1
+                    continue
+                comp_name = r.get('lims_component')
+                b = None
+                if comp_name and isinstance(comp_vars, list):
+                    for idx, v in enumerate(comp_vars):
+                        if v.get() == comp_name:
+                            b = idx // N
+                            break
+                if b is None:  # 无组分列：按 projectId 落到对应项目行
+                    b = pid_to_block.get(item.get('projectId'), 0)
+                pos = b * N + slot
+                if pos < len(target):
+                    target[pos].set(r['value'])
+                    if (dilution_factor != 1.0 and dil_col is not None
+                            and r.get('raw', {}).get('diluted')):
+                        dil_target = self.data_fields.get(dil_col)
+                        if isinstance(dil_target, list) and pos < len(dil_target):
+                            dil_target[pos].set(f"{dilution_factor:g}")
+                    filled += 1
+                else:
+                    self.log(f"无法定位填入位置：{item['projectName']} = {r['value']}")
+        if filled == 0:
+            messagebox.showwarning("数据采集", "未填入任何值，请检查项目别名配置与结果列")
+            self.update_status("数据采集未填入值", "orange")
+            return
+        self.update_status(f"数据采集完成：填入 {filled}/{total} 个值（结果列 {res_col}）", "green")
+        if n_samples > 1 and N > 1:
+            self.log(f"ICP 平行样：A/B 已分别填入平行槽 0/1（N={N}）")
+        if slot_skip:
+            self.log(f"提示：{slot_skip} 个值因平行槽不足(N={N}<{n_samples})被跳过")
 
     def submit_data(self):
         """提交数据 - 对选中的复选框进行操作，并自动提交标准溶液"""
@@ -1232,16 +1479,34 @@ class DetectionEntrySystem:
         # 实验配置里的分析记录（按 record_index 顺序），用于回填随组分/方法固有的列值
         records = (getattr(self, 'experiment_config', {}) or {}).get('ocAnalysisRecordList') or []
 
+        # 项目名称（只读列）：按组分块取该块 projectId -> projectName，便于核对采集回填归属
+        name_by_pid = {p.get('projectId'): p.get('projectName', '')
+                       for p in getattr(self, 'filtered_projects', []) if isinstance(p, dict)}
+        _block_groups = {}
+        if comp_col_code and records:
+            for _r in records:
+                _block_groups.setdefault(_r.get(comp_col_code), []).append(_r)
+            block_pids = [g[0].get('projectId') for g in _block_groups.values()]
+        else:
+            block_pids = []
+            for _r in records:
+                _pid = _r.get('projectId')
+                if _pid is not None and _pid not in block_pids:
+                    block_pids.append(_pid)
+        block_project_names = [str(name_by_pid.get(pid) or '') for pid in block_pids]
+
         # ---- 表格 ----
         table = ttk.Frame(self.dynamic_fields_frame)
         table.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         table.columnconfigure(0, weight=0)
-        for c_idx in range(1, len(sorted_columns) + 1):
+        table.columnconfigure(1, weight=0)  # 项目名称（只读）
+        for c_idx in range(2, len(sorted_columns) + 2):
             table.columnconfigure(c_idx, weight=1)
 
-        # 表头：次数 + 各动态列
+        # 表头：次数 + 项目名称 + 各动态列
         ttk.Label(table, text="次数", width=6).grid(row=0, column=0, padx=3, pady=(0, 4), sticky='w')
-        for c_idx, col in enumerate(sorted_columns, start=1):
+        ttk.Label(table, text="项目名称", width=14).grid(row=0, column=1, padx=3, pady=(0, 4), sticky='w')
+        for c_idx, col in enumerate(sorted_columns, start=2):
             ttk.Label(table, text=col.get('columeName', ''), width=10).grid(
                 row=0, column=c_idx, padx=3, pady=(0, 4), sticky='w')
 
@@ -1250,8 +1515,16 @@ class DetectionEntrySystem:
             ttk.Label(table, text=str((i % N) + 1), width=6).grid(
                 row=i + 1, column=0, padx=3, pady=2, sticky='w')
 
+        # 项目名称列（只读，不写入 data_fields、不参与提交）：每个组分块跨 N 行
+        for b in range(M):
+            _pname = block_project_names[b] if b < len(block_project_names) else ''
+            _lbl = ttk.Label(table, text=_pname, width=14, anchor='w')
+            _lbl.grid(row=b * N + 1, column=1, rowspan=N, padx=3, pady=2, sticky='w')
+            if _pname:
+                _bind_tooltip(_lbl, _pname)
+
         # 各动态列控件
-        for c_idx, col in enumerate(sorted_columns, start=1):
+        for c_idx, col in enumerate(sorted_columns, start=2):
             col_id = col.get('id')
             col_code = col.get('columeCode', f'dynamic{col_id}')
             edit_type = col.get('editType', 'EDIT_TYPE_TEXT')
@@ -1329,7 +1602,8 @@ class DetectionEntrySystem:
 
     def _compute_grid_dims(self, comp_col_code):
         """计算表格维度 (M 组分数, N 平行数, comp_names 组分名列表)。
-        多组分：按组分列值对 ocAnalysisRecordList 分组（保序）；单组分：M=1，N=记录数/项目。"""
+        多组分：按组分列值对 ocAnalysisRecordList 分组（保序）；
+        无组分列：M=不同项目数(每项目一块)，N=单项目最大记录数(平行数)。"""
         records = (getattr(self, 'experiment_config', {}) or {}).get('ocAnalysisRecordList') or []
         if comp_col_code and records:
             groups = {}
@@ -1337,7 +1611,12 @@ class DetectionEntrySystem:
                 groups.setdefault(r.get(comp_col_code), []).append(r)
             if groups:
                 return len(groups), max(len(g) for g in groups.values()), list(groups.keys())
-        return 1, self._compute_test_run_count(getattr(self, 'experiment_config', {})), []
+        pids = []
+        for r in records:
+            pid = r.get('projectId')
+            if pid is not None and pid not in pids:
+                pids.append(pid)
+        return len(pids) or 1, self._compute_test_run_count(getattr(self, 'experiment_config', {})), []
 
     def _create_cell_widget(self, parent, var, select_values):
         """在表格单元格里创建输入控件：有下拉选项用 Combobox，否则 Entry"""

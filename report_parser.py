@@ -21,6 +21,20 @@ except ImportError:
     HAS_PYPDF2 = False
 
 
+class TaggedConcentration(float):
+    """带状态的浓度值：对 GUI 的阈值比较/格式化零影响（float 子类），同时携带 status 供无GUI调用读取。
+
+    status ∈ {'检出', '未检出', '未校正'}。原始解析路径把 N.D./未校正 统一塌缩成 0.0，
+    丢失了状态；数据采集的「项目别名」规则需要区分它们（未检出→报出 blank 值）。
+    """
+
+    def __new__(cls, value, status='检出', raw=None):
+        obj = float.__new__(cls, value)
+        obj.status = status
+        obj.raw = raw  # 原始数值串(保留报告有效位/末尾0，如0.100)，仅检出时有值
+        return obj
+
+
 class PDFTextExtractor:
     """PDF文本提取器"""
 
@@ -78,11 +92,15 @@ class PDFTextExtractor:
 
 class ChemicalReportAnalyzer:
     def __init__(self):
+        self._init_parser()
         self.root = tk.Tk()
         self.root.title("报告解析器")
         # 进一步减小界面大小
         self.root.geometry("700x500")
+        self.setup_ui()
 
+    def _init_parser(self):
+        """初始化解析相关状态（不依赖Tk），供无GUI子类复用全部解析方法。"""
         # 检查PDF支持状态
         self.has_pdf_support = HAS_PDFPLUMBER or HAS_PYPDF2
 
@@ -105,8 +123,6 @@ class ChemicalReportAnalyzer:
 
         # 有效的化合物名称模式 - 使用更宽松的正则表达式
         self.valid_compound_pattern = re.compile(r'^[A-Za-z0-9\-\u4e00-\u9fff,\.\'\(\)\）\（\[\]_/]+$')
-
-        self.setup_ui()
 
     def setup_ui(self):
         """设置用户界面"""
@@ -401,18 +417,18 @@ class ChemicalReportAnalyzer:
             if self.is_valid_compound(compound_name):
                 # 解析浓度值
                 if concentration_str == "N.D.":
-                    compounds[compound_name] = 0.0
+                    compounds[compound_name] = TaggedConcentration(0.0, '未检出')
                 else:
                     # 提取数值部分
                     conc_match = re.search(r'(\d+\.\d+)\s*(mg/L|μg/mL|ng/ml)', concentration_str, re.IGNORECASE)
                     if conc_match:
                         try:
                             concentration = float(conc_match.group(1))
-                            compounds[compound_name] = concentration
+                            compounds[compound_name] = TaggedConcentration(concentration, '检出', conc_match.group(1))
                         except ValueError:
-                            compounds[compound_name] = 0.0
+                            compounds[compound_name] = TaggedConcentration(0.0, '未检出')
                     else:
-                        compounds[compound_name] = 0.0
+                        compounds[compound_name] = TaggedConcentration(0.0, '未检出')
 
         return compounds, debug_info
 
@@ -732,14 +748,14 @@ class ChemicalReportAnalyzer:
             return "", 0.0, debug_info
 
         # 使用新的浓度解析方法
-        concentration, _, status = self.parse_concentration(line)
+        concentration, _, status, raw = self.parse_concentration(line)
 
         if status in ['未检出', '未校正']:
             debug_info += f" -> {status}: {compound_name}"
-            return compound_name, 0.0, debug_info
+            return compound_name, TaggedConcentration(0.0, status), debug_info
 
         debug_info += f" -> {compound_name}: {concentration}"
-        return compound_name, concentration, debug_info
+        return compound_name, TaggedConcentration(concentration, '检出', raw), debug_info
 
     def extract_compound_name_from_compact_line(self, line: str) -> str:
         """从紧凑格式行中提取化合物名称"""
@@ -830,14 +846,14 @@ class ChemicalReportAnalyzer:
             return "", 0.0, debug_info
 
         # 使用新的浓度解析方法
-        concentration, _, status = self.parse_concentration(line)
+        concentration, _, status, raw = self.parse_concentration(line)
 
         if status in ['未检出', '未校正']:
             debug_info += f" -> {status}: {compound_name}"
-            return compound_name, 0.0, debug_info
+            return compound_name, TaggedConcentration(0.0, status), debug_info
 
         debug_info += f" -> {compound_name}: {concentration}"
-        return compound_name, concentration, debug_info
+        return compound_name, TaggedConcentration(concentration, '检出', raw), debug_info
 
     def extract_compound_name_from_quant_line(self, line: str) -> str:
         """从定量报告行中提取化合物名称"""
@@ -936,14 +952,14 @@ class ChemicalReportAnalyzer:
             return "", 0.0, debug_info
 
         # 使用新的浓度解析方法
-        concentration, _, status = self.parse_concentration(line)
+        concentration, _, status, raw = self.parse_concentration(line)
 
         if status in ['未检出', '未校正']:
             debug_info += f" -> {status}: {compound_name}"
-            return compound_name, 0.0, debug_info
+            return compound_name, TaggedConcentration(0.0, status), debug_info
 
         debug_info += f" -> {compound_name}: {concentration}"
-        return compound_name, concentration, debug_info
+        return compound_name, TaggedConcentration(concentration, '检出', raw), debug_info
 
     def extract_compound_name_from_table(self, line: str) -> str:
         """从表格行中提取化合物名称"""
@@ -1019,14 +1035,14 @@ class ChemicalReportAnalyzer:
             return "", 0.0, debug_info
 
         # 使用新的浓度解析方法
-        concentration, _, status = self.parse_concentration(line)
+        concentration, _, status, raw = self.parse_concentration(line)
 
         if status in ['未检出', '未校正']:
             debug_info += f" -> {status}: {compound_name}"
-            return compound_name, 0.0, debug_info
+            return compound_name, TaggedConcentration(0.0, status), debug_info
 
         debug_info += f" -> {compound_name}: {concentration}"
-        return compound_name, concentration, debug_info
+        return compound_name, TaggedConcentration(concentration, '检出', raw), debug_info
 
     def extract_compound_name_from_standard_line(self, line: str) -> str:
         """从标准格式行中提取化合物名称"""
@@ -1053,22 +1069,22 @@ class ChemicalReportAnalyzer:
         # 如果上述方法失败，使用通用清理方法
         return self.clean_compound_name(cleaned)
 
-    def parse_concentration(self, concentration_str: str) -> Tuple[float, str, str]:
+    def parse_concentration(self, concentration_str: str) -> Tuple[float, str, str, str]:
         """
-        解析浓度字符串，返回浓度值、单位和状态
+        解析浓度字符串，返回浓度值、单位、状态和原始数值串(保留报告里的有效位/末尾0)
         """
         if not concentration_str or concentration_str.strip() == '':
-            return 0.0, '', '未检测'
+            return 0.0, '', '未检测', None
 
         concentration_str = str(concentration_str).strip()
 
         # 检查是否为未检出
         if self.nd_pattern.search(concentration_str):
-            return 0.0, '', '未检出'
+            return 0.0, '', '未检出', None
 
         # 检查是否为未校正
         if self.uncorrected_pattern.search(concentration_str):
-            return 0.0, '', '未校正'
+            return 0.0, '', '未校正', None
 
         # 提取浓度值和单位
         # 首先尝试匹配小数+单位
@@ -1078,7 +1094,7 @@ class ChemicalReportAnalyzer:
             unit = match.group(2)
             # 放宽浓度值范围限制（从0.00001到10000）
             if 0.00001 <= value <= 10000:
-                return value, unit, '检出'
+                return value, unit, '检出', match.group(1)
 
         # 特殊处理：如果文本被错误分割（如"0.3 6 mg/L"）
         parts = concentration_str.split()
@@ -1096,7 +1112,7 @@ class ChemicalReportAnalyzer:
                     unit = parts[i + 2]
                     # 放宽浓度值范围限制
                     if 0.00001 <= value <= 10000:
-                        return value, unit, '检出'
+                        return value, unit, '检出', value_str
                 except ValueError:
                     continue
 
@@ -1107,9 +1123,9 @@ class ChemicalReportAnalyzer:
             unit = match.group(2)
             # 放宽浓度值范围限制
             if 0.00001 <= value <= 10000:
-                return value, unit, '检出'
+                return value, unit, '检出', match.group(1)
 
-        return 0.0, '', '未检出'
+        return 0.0, '', '未检出', None
 
     def clean_compound_name(self, name: str) -> str:
         """
@@ -1255,15 +1271,183 @@ class ChemicalReportAnalyzer:
         self.root.mainloop()
 
 
+class _HeadlessReportAnalyzer(ChemicalReportAnalyzer):
+    """无Tk根窗与UI——供 parse_pdf_report 在主进程内调用，复用父类全部解析方法。"""
+
+    def __init__(self):
+        self._init_parser()  # 仅初始化解析器，不创建 tk.Tk、不 setup_ui
+
+
+def _extract_column_headers(text):
+    """识别报告表头行（含'化合物'+'保留时间'，如 MassHunter QT 报告），按空白拆成表头列表。
+    用于「数据采集」按 equipRelativeTitle 匹配 PDF 表头定位填充列。"""
+    for line in (text or '').splitlines():
+        if '化合物' in line and '保留时间' in line:
+            return line.split()
+    return []
+
+
+# 文件名稀释倍数：-NNX（如 TS24031359001A-50X → 50）。要求前置连字符，避免样品编号误匹配。
+# 仅用于识别稀释报告文件 + 取倍数填「稀释」列；parse_pdf_report 不据此缩放浓度（LIMS 自算）。
+_DILUTION_RE = re.compile(r'-(\d+)\s*[Xx]')
+
+
+def _dilution_factor(filename):
+    """从文件名提取稀释倍数，取最后一个 -NNX；无则 1.0。TS...A-50X → 50.0"""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    nums = _DILUTION_RE.findall(stem)
+    return float(nums[-1]) if nums else 1.0
+
+
+# ICP-OES 报告（建立者（原始）：ICP）：表头为 分析物/波长/强度/校准浓度(mg/L)/样品浓度(mg/kg)，
+# 无「目标化合物」「化合物+保留时间」标记，且一个 PDF 含多个样品(A/B 平行样)。
+# 固定表头超集：确保 LIMS 结果列 equipRelativeTitle=校准浓度 能在 _find_result_column 命中。
+_ICP_HEADERS = ['分析物', '波长', '强度', '校准浓度', '单位', '样品浓度', '标准偏差', 'RSD']
+# 元素符号：Pb/Cd/Cr/Hg/As/Y...（1 大写 + 可选 1 小写）
+_ICP_ELEM_RE = re.compile(r'^[A-Z][a-z]?$')
+
+
+def _detect_icp(content):
+    return ('建立者（原始）：ICP' in content) or ('分析物' in content and '校准浓度' in content)
+
+
+def _slice_icp_section(part, marker):
+    """从样品段中截取 marker(如「平均值数据：」) 到下一分隔线(----/====)之间的文本。"""
+    i = part.find(marker)
+    if i < 0:
+        return None
+    out = []
+    for line in part[i + len(marker):].split('\n'):
+        if '--------' in line or '========' in line:
+            break
+        out.append(line)
+    return '\n'.join(out)
+
+
+def _parse_icp_element_line(line):
+    """解析 ICP 元素行 -> (分析物, value, status, raw) 或 None。
+    行形如 'Pb 220.353 1596.9 0.394 mg/L 19.42 mg/kg'：定位 mg/L，取其前一个 token 为校准浓度(mg/L)。
+    分析物名 = 元素符号+波长(如 'Pb 220.353')，与报告单元格/项目别名一致；负值(低于检出限) -> 未检出。"""
+    toks = line.split()
+    idx = next((i for i, t in enumerate(toks) if t.lower() == 'mg/l'), -1)
+    if idx <= 0 or not _ICP_ELEM_RE.match(toks[0]):
+        return None
+    raw = toks[idx - 1]
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    # 分析物名 = 符号 + 波长(toks[1])，与报告「分析物」列及项目别名匹配
+    analyte = toks[0]
+    if len(toks) > 1:
+        try:
+            float(toks[1])  # 确认 toks[1] 是波长而非其它
+            analyte = f"{toks[0]} {toks[1]}"
+        except ValueError:
+            pass
+    if val < 0:
+        return analyte, 0.0, '未检出', None
+    return analyte, val, '检出', raw
+
+
+def parse_icp_report(content):
+    """解析 ICP-OES 报告 -> [(样品标识码, compounds), ...]。
+    按「样品识别码：」切段，每段取「平均值数据」(缺则「重复测定数据」)的元素行，校准浓度取 mg/L。
+    compounds = {元素: {'value':float,'status':str,'raw':str|None}}，与 parse_pdf_report 同形。"""
+    samples = []
+    for part in re.split(r'样品识别码：', content)[1:]:  # 第一段为开头 preamble
+        m = re.match(r'(\S+)', part)
+        sample_id = m.group(1) if m else '?'
+        seg = _slice_icp_section(part, '平均值数据：')
+        if seg is None:
+            seg = _slice_icp_section(part, '重复测定数据：')
+        if seg is None:
+            continue
+        compounds = {}
+        for line in seg.split('\n'):
+            res = _parse_icp_element_line(line.strip())
+            if res and res[0] not in compounds:
+                compounds[res[0]] = {'value': res[1], 'status': res[2], 'raw': res[3]}
+        if compounds:
+            samples.append((sample_id, compounds))
+    return samples
+
+
+def parse_pdf_report_meta(file_path, field='样品初始质量'):
+    """从报告 PDF 提取每样品段的指定数值元数据字段(默认样品初始质量)。
+    返回 [(样品标识码, 值字符串|None), ...]，按文档出现顺序(对应平行槽 0/1/...)。
+    按「样品识别码：」切段(同 parse_icp_report)，段内正则 `字段[:：]\\s*数值` 取首个数值串；
+    无该字段段值为 None。返回报告原始数值串(如 0.3100，保留末尾0)；格式化由调用方按 decimal_places 做。"""
+    content = PDFTextExtractor().extract_text_from_pdf(file_path)
+    pat = re.compile(r'%s\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)' % re.escape(field))
+    out = []
+    for part in re.split(r'样品识别码：', content)[1:]:
+        m = re.match(r'(\S+)', part)
+        sid = m.group(1) if m else '?'
+        mv = pat.search(part)
+        out.append((sid, mv.group(1) if mv else None))
+    return out
+
+
+def parse_pdf_report_multi(file_path):
+    """无GUI解析谱图PDF -> (samples, headers)。
+    samples = [(样品标识码|'A', compounds), ...]：ICP 多样品(A/B)，其它报告单样品 ('A', compounds)。
+    compounds = {名: {'value':float,'status':str,'raw':str|None}}，status ∈ {'检出','未检出','未校正'}；
+    headers = 报告表头 token 列表（ICP 固定含「校准浓度」等），供按 equipRelativeTitle 匹配选列。"""
+    analyzer = _HeadlessReportAnalyzer()
+    content = analyzer.pdf_extractor.extract_text_from_pdf(file_path)
+    if _detect_icp(content):
+        return parse_icp_report(content), list(_ICP_HEADERS)
+    raw, _ = analyzer.parse_report_content(content, os.path.basename(file_path), file_path)
+    compounds = {name: {'value': float(c), 'status': getattr(c, 'status', '检出'),
+                        'raw': getattr(c, 'raw', None)}
+                 for name, c in raw.items()}
+    return [('A', compounds)], _extract_column_headers(content)
+
+
+def parse_pdf_report(file_path):
+    """无GUI解析单个谱图PDF -> (compounds, headers)。多样品报告取首个样品（向后兼容旧调用/自检/稀释路径）。"""
+    samples, headers = parse_pdf_report_multi(file_path)
+    return (samples[0][1] if samples else {}), headers
+
+
 # 运行应用程序
 if __name__ == "__main__":
-    # 配置ttk样式为现代主题
-    try:
-        from ctypes import windll
+    import sys
+    # ponytail: 自检——稀释倍数提取
+    assert _dilution_factor('TS24031359001A-50X.pdf') == 50.0
+    assert _dilution_factor('TS24031359001A-2x.pdf') == 2.0
+    assert _dilution_factor('TS24031359001A.pdf') == 1.0
+    # ponytail: 自检——ICP 样品初始质量提取(三份报告存在时；不存在则跳过)
+    import glob as _glob, os as _os
 
-        windll.shcore.SetProcessDpiAwareness(1)
-    except:
-        pass
+    def _is_num(s):
+        try:
+            float(s); return True
+        except (TypeError, ValueError):
+            return False
+    for _icp in sorted(_glob.glob('谱图/报告解析/ICP/TN*.pdf')):
+        _meta = parse_pdf_report_meta(_icp)
+        _vals = [v for _s, v in _meta if v]
+        assert len(_meta) >= 2 and all(map(_is_num, _vals)), (_icp, _meta)
+        print(f"[meta 样品初始质量] {_os.path.basename(_icp)}: {_meta}")
+    # ponytail: 自检——带参数则解析该PDF并打印各样品化合物+status(断言至少1个)；无参数启动GUI。
+    if len(sys.argv) > 1:
+        _samples, _h = parse_pdf_report_multi(sys.argv[1])
+        assert _samples, f"未解析到化合物: {sys.argv[1]}"
+        for _sid, _c in _samples:
+            print(f"[样品 {_sid}] {len(_c)} 个化合物；表头含校准浓度={'校准浓度' in _h}")
+            for _n, _v in list(_c.items()):
+                print(f"  {_n}\t{_v['value']}\t{_v['status']}\t{_v['raw']}")
+        print(f"共 {len(_samples)} 个样品；表头={_h}")
+    else:
+        # 配置ttk样式为现代主题
+        try:
+            from ctypes import windll
 
-    app = ChemicalReportAnalyzer()
-    app.run()
+            windll.shcore.SetProcessDpiAwareness(1)
+        except:
+            pass
+
+        app = ChemicalReportAnalyzer()
+        app.run()

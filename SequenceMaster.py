@@ -12,14 +12,59 @@ import threading
 import queue
 import types
 import random
+import requests
 import yaml
 import openpyxl
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from PIL import Image, ImageTk
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from login import MultiUserLoginSystem
-from detection_entry_api import DetectionAPI, build_grouped_experiment_data, _Box
+from detection_entry_api import DetectionAPI, build_grouped_experiment_data, _Box, _norm_cn
+
+
+# ==================== 节假日/工作日（法定假日+调休，数据源：标准品服务器 10.1.93.25:5000）====================
+_HOLIDAY_HOST = "http://10.1.93.25:5000"
+_holiday_year_cache = {}  # year -> {YYYY-MM-DD: bool}(true=放假/false=补班) 或 None
+
+
+def _holiday_mapping(year):
+    """取年度节假日映射（进程内按年缓存；服务器不可达返回 None，调用方回落周一~周五）。"""
+    if year in _holiday_year_cache:
+        return _holiday_year_cache[year]
+    mapping = None
+    try:
+        r = requests.get(f"{_HOLIDAY_HOST}/holidays/{year}.json", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                mapping = data
+    except Exception:
+        mapping = None
+    _holiday_year_cache[year] = mapping
+    return mapping
+
+
+def _is_workday_holiday(d):
+    """d: datetime.date。命中映射(true=放假→非工作日/false=补班→工作日)，否则周一~周五。"""
+    mapping = _holiday_mapping(d.year)
+    if mapping:
+        v = mapping.get(d.strftime("%Y-%m-%d"))
+        if v is True:
+            return False
+        if v is False:
+            return True
+    return d.weekday() < 5
+
+
+def _prev_workday():
+    """上一个工作日（考虑法定假日/调休）：从昨天起回退到首个工作日；上限40天防异常。"""
+    cur = date.today() - timedelta(days=1)
+    for _ in range(40):
+        if _is_workday_holiday(cur):
+            return cur
+        cur -= timedelta(days=1)
+    return cur
 
 
 class DraggableHeader:
@@ -198,6 +243,94 @@ def _find_weighing_column(dynamic_columns):
             if str(v).strip() in _WEIGHING_TRUE and ("称量" in str(k) or "record" in str(k).lower() or "weigh" in str(k).lower()):
                 return col
     return None
+
+
+# 报告解析结果列定位 & 样品报告 PDF 挑选（批量浓度回填用）
+_REPORT_RESULT_KW = ('计算值', '报告值', '测定值', '浓度', '结果值', '含量')
+# 多报告按方法/项目类别关键词挑 PDF（同 detection_entry_main._CATEGORY_HINTS）
+_REPORT_CATEGORY_HINTS = (
+    ('PAE', ('PAE', '邻苯')), ('PAHS', ('PAHS', '多环', 'PAH')),
+    ('PCN', ('PCN', '氯萘')), ('BXW', ('BXW', '苯系物')),
+    ('氯苯', ('氯苯',)), ('SCCP', ('SCCP',)), ('SVHC', ('SVHC',)),
+    ('AZO', ('AZO', '偶氮')), ('OT', ('OT',)),
+    ('ICP', ('ICP', '元素', '重金属')),
+)
+
+
+def _find_result_column(dynamic_columns, pdf_headers=()):
+    """挑数据采集结果列(浓度/计算值/报告值...)：
+    1) equipRelativeTitle 精确命中 PDF 报告表头(原系统机制，浓度/校准浓度等都能对上)；
+    2) 兜底列名关键词；排除合并列(isColumnMerge)/组分列(isMutiPolyColume)；
+    多命中取 columeOrder 最小。返回 columeCode 或 None。"""
+    # ponytail: 与 detection_entry_main._find_result_column 重复(~20行)；不抽公共件以避免改动已验证的单样品代码。
+    def _is_merge(c):
+        try:
+            return int(c.get('isColumnMerge') or 0) == 1
+        except (TypeError, ValueError):
+            return False
+
+    def _is_comp(c):
+        try:
+            return int(c.get('isMutiPolyColume') or 0) == 1
+        except (TypeError, ValueError):
+            return False
+
+    cols = [c for c in (dynamic_columns or [])
+            if isinstance(c, dict) and not _is_merge(c) and not _is_comp(c)]
+    if pdf_headers:
+        cands = [c for c in cols if (c.get('equipRelativeTitle') or '').strip() in pdf_headers]
+        if cands:
+            return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
+    cands = [c for c in cols if any(k in (c.get('columeName') or '') for k in _REPORT_RESULT_KW)]
+    if not cands:
+        return None
+    return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
+
+
+def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
+    """在谱图目录中挑该样品的报告 PDF，返回 (normal_pdf, diluted_pdf)：
+    文件名以 sample_code 开头(大小写不敏感)的 .pdf，按是否含 -NNX 稀释后缀分为正常/稀释；
+    各自按方法/项目类别关键词挑(1个直取/仍歧义取首个)。对应无则该位为 None。"""
+    from report_parser import _dilution_factor
+    sc = (sample_code or '').lower()
+    if not sc or not spectrum_path or not os.path.isdir(spectrum_path):
+        return None, None
+    try:
+        pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
+                if fn.lower().endswith('.pdf') and fn.lower().startswith(sc)]
+    except Exception:
+        return None, None
+    if not pdfs:  # 兜底：文件名无小号(ICP 等只用 8 位流水)时按去小号前缀匹配
+        stripped = _strip_parallel_suffix(sample_code).lower()
+        if stripped and stripped != sc:
+            try:
+                pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
+                        if fn.lower().endswith('.pdf') and fn.lower().startswith(stripped)]
+            except Exception:
+                pdfs = []
+    if not pdfs:
+        return None, None
+    normal_pdfs = [p for p in pdfs if _dilution_factor(p) == 1.0]
+    dil_pdfs = [p for p in pdfs if _dilution_factor(p) != 1.0]
+    text = (method_hint or '').upper()
+    hint = ''
+    for cat, keys in _REPORT_CATEGORY_HINTS:
+        if any(k.upper() in text for k in keys):
+            hint = cat
+            break
+
+    def _pick(cands):
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        if hint:
+            matched = [p for p in cands if hint.lower() in os.path.basename(p).lower()]
+            if matched:
+                return matched[0]
+        return cands[0]
+
+    return _pick(normal_pdfs or pdfs), _pick(dil_pdfs)
 
 
 def _gen_random_mass(wp):
@@ -1044,6 +1177,7 @@ class UniversalCell:
         "none":    ("无需称样", True),
         "record":  ("称量记录", False),
         "process": ("过程称量", False),
+        "pdf":     ("PDF报告称样", True),
         "":        ("称样记录", False),
     }
 
@@ -1516,11 +1650,12 @@ class SelectableRow:
 class SequenceMaster:
     def __init__(self, root):
         self.root = root
-        self.root.title("SequenceMaster - 序列编辑器")
-        self.root.geometry("1400x850")
+        self.root.title("序列编辑器")
+        self.root.geometry("1600x850")
 
         # 存储序列数据
         self.sequence_data = []
+        self.current_file = None  # 当前已打开/已保存的序列文件路径（用于原地保存与标题显示）
 
         # 选择管理器
         self.selection_manager = CellSelectionManager()
@@ -1530,7 +1665,7 @@ class SequenceMaster:
         self.shift_pressed = False
 
         # 列宽配置
-        self.column_widths = [50, 260, 220, 140, 140, 260, 70, 70, 140]
+        self.column_widths = [50, 260, 220, 140, 180, 260, 90, 90, 140]
 
         # 存储分隔线引用
         self.draggable_headers = []
@@ -1588,62 +1723,54 @@ class SequenceMaster:
     def create_widgets(self):
         # 档2: 收紧 ttk 按钮默认内边距(否则 ttkbootstrap 按钮偏高偏大)
         ttkb.Style().configure("TButton", padding=(8, 2))
+        # 实心彩色按钮统一加可见边框(深色 bevel 描边)；禁用态仍由各自 disabled 映射保持灰色不可用
+        _sty = ttkb.Style()
+        for _base in ("primary", "secondary", "danger"):
+            _c = getattr(_sty.colors, _base)
+            _d = "#%02x%02x%02x" % tuple(int(int(_c[i:i + 2], 16) * 0.55) for i in (1, 3, 5))
+            _sty.configure(_base + ".TButton", relief="raised", borderwidth=2,
+                           lightcolor=_d, darkcolor=_d, bordercolor=_d)
         # 主框架（档2: 转 ttkb，主题提供底色）
         main_frame = ttkb.Frame(self.root)
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # 按钮框架
-        top_button_frame = ttkb.Frame(main_frame)
-        top_button_frame.pack(fill='x', pady=(0, 0))
+        # 快捷工具栏：添加行/删除行/向下填充 + 登录状态显示
+        quick_bar = ttkb.Frame(main_frame)
+        quick_bar.pack(fill='x', pady=(0, 4))
+        tb_add = ttkb.Button(quick_bar, text="+", command=self.add_row, width=3, padding=(2, 0), bootstyle="secondary")
+        tb_add.pack(side='left', padx=(0, 2))
+        tb_del = ttkb.Button(quick_bar, text="✕", command=self.delete_selected_rows, width=3, padding=(2, 0), bootstyle="secondary")
+        tb_del.pack(side='left', padx=2)
+        tb_fill = ttkb.Button(quick_bar, text="↓", command=self.fill_down, width=3, padding=(2, 0), bootstyle="secondary")
+        tb_fill.pack(side='left', padx=2)
+        _c = ttkb.Style().colors  # 主题配色，使 tk.Label 背景与界面一致
+        self.login_status_label = tk.Label(quick_bar, text="👤 未登录", fg="#dc2626", bg=_c.bg,
+                                          font=("Segoe UI", 9, "bold"))
+        self.login_status_label.pack(side='right', padx=4)
 
-        # 操作按钮（bootstyle 配色，弃 button_style 的 bg/fg/relief）
-        add_btn = ttkb.Button(top_button_frame, text="Add", command=self.add_row, width=4, bootstyle="secondary")
-        add_btn.pack(side='left', padx=(0, 0))
+        # 运行控制图标（与底部按钮同命令、同状态）：紧随编辑图标(➕✕↓)之后
+        self.tb_run = ttkb.Button(quick_bar, text="▶", command=self.run_sequence, width=3, padding=(2, 0), bootstyle="primary")
+        self.tb_run.pack(side='left', padx=(8, 2))
+        self.tb_load = ttkb.Button(quick_bar, text="▼", command=self.load_sequence, width=3, padding=(2, 0), bootstyle="secondary")
+        self.tb_load.pack(side='left', padx=2)
+        self.tb_pause = ttkb.Button(quick_bar, text="⏸", command=self.toggle_pause, width=3, padding=(2, 0), state='disabled', bootstyle="secondary")
+        self.tb_pause.pack(side='left', padx=2)
+        self.tb_abort = ttkb.Button(quick_bar, text="⏹", command=self.abort_run, width=3, padding=(2, 0), state='disabled', bootstyle="danger")
+        self.tb_abort.pack(side='left', padx=2)
 
-        delete_btn = ttkb.Button(top_button_frame, text="✕", command=self.delete_selected_rows,
-                                 width=3, bootstyle="secondary")
-        delete_btn.pack(side='left', padx=(0, 0))
-
-        fill_btn = ttkb.Button(top_button_frame, text="↓", command=self.fill_down,
-                               width=3, bootstyle="secondary")
-        fill_btn.pack(side='left', padx=(0, 0))
-
-        clear_btn = ttkb.Button(top_button_frame, text="Clear", command=self.clear_all, width=5, bootstyle="secondary")
-        clear_btn.pack(side='left')
-
-        edit_method_btn = ttkb.Button(top_button_frame, text="📝 方法", command=self.edit_method, width=7, bootstyle="secondary")
-        edit_method_btn.pack(side='left', padx=(8, 0))
-
-        env_btn = ttkb.Button(top_button_frame, text="🌡 保存温湿度", command=self.save_env_to_excel, width=12, bootstyle="secondary")
-        env_btn.pack(side='left', padx=(8, 0))
-
-        # 用户区（右上，整合为一个菜单按钮）：按钮文案=登录状态，下拉=登录/切换用户 + 用户管理
-        _c = ttkb.Style().colors  # 主题配色：按钮底色/下拉菜单配色都由此取，与界面保持一致
-        self.user_menu_btn = tk.Menubutton(top_button_frame, text="👤 未登录 ▾",
-                                           bg=_c.bg, fg="#dc2626", relief="flat",
-                                           font=("Segoe UI", 9, "bold"), padx=10, pady=2,
-                                           activebackground=_c.bg, cursor="hand2")
-        self.user_menu = tk.Menu(self.user_menu_btn, tearoff=0,
-                                 bg=_c.bg, fg=_c.fg,
-                                 activebackground=_c.selectbg, activeforeground=_c.selectfg,
-                                 relief="flat", borderwidth=0,
-                                 font=("Segoe UI", 9))
-        self.user_menu.add_command(label="登录", command=self._show_login_dialog)
-        self.user_menu.add_command(label="用户管理", command=self._open_user_management)
-        self.user_menu_btn.configure(menu=self.user_menu)
-        self.user_menu_btn.pack(side='right', padx=(0, 8))
+        # 工具栏图标 tooltip（鼠标悬停显示功能）
+        self._tips = [
+            ttkb.ToolTip(tb_add, text="添加行"),
+            ttkb.ToolTip(tb_del, text="删除选中行"),
+            ttkb.ToolTip(tb_fill, text="向下填充"),
+            ttkb.ToolTip(self.tb_run, text="运行序列"),
+            ttkb.ToolTip(self.tb_load, text="加载序列"),
+            ttkb.ToolTip(self.tb_pause, text="暂停 / 继续"),
+            ttkb.ToolTip(self.tb_abort, text="中止运行"),
+        ]
 
         # 创建表格容器
         self.create_table_container(main_frame)
-
-        # 运行控制按钮（阶段1）
-        run_ctrl = ttkb.Frame(main_frame)
-        run_ctrl.pack(fill='x', pady=(5, 0))
-        ttkb.Label(run_ctrl, text="运行控制:").pack(side='left', padx=(0, 5))
-        self.pause_btn = ttkb.Button(run_ctrl, text="⏸ 暂停/继续", command=self.toggle_pause, width=10, state='disabled', bootstyle="secondary")
-        self.pause_btn.pack(side='left', padx=2)
-        self.abort_btn = ttkb.Button(run_ctrl, text="⏹ 中止", command=self.abort_run, width=10, state='disabled', bootstyle="danger")
-        self.abort_btn.pack(side='left', padx=2)
 
         # 运行日志区（阶段1）：标题可点击折叠/展开
         log_frame = ttkb.Labelframe(main_frame)
@@ -1686,25 +1813,59 @@ class SequenceMaster:
         status_bar = ttkb.Label(bottom_frame, textvariable=self.status_var, anchor='w')
         status_bar.pack(side='left', fill='x', expand=True, padx=5, pady=8)
 
-        # 右侧按钮（加大宽度+垂直内边距，使底部操作栏更醒目）
-        run_btn = ttkb.Button(bottom_frame, text="运行", command=self.run_sequence, width=6, padding=(6, 4), bootstyle="primary")
+        # 运行控制（运行/暂停/中止 合并到同一行；暂停/中止初始禁用，运行中启用）
+        run_btn = ttkb.Button(bottom_frame, text="▶ 运行", command=self.run_sequence, width=8, padding=(6, 4), bootstyle="primary")
         run_btn.pack(side='right', padx=(6, 5), pady=4)
-        # 从指定行开始运行(默认1=从头)
-        start_box = ttkb.Frame(bottom_frame)
-        start_box.pack(side='right', padx=(10, 0), pady=4)
-        ttkb.Label(start_box, text="从第").pack(side='left')
-        self.start_row_var = tk.StringVar(value="1")
-        ttkb.Entry(start_box, textvariable=self.start_row_var, width=4).pack(side='left', padx=3)
-        ttkb.Label(start_box, text="行起").pack(side='left')
+        self.abort_btn = ttkb.Button(bottom_frame, text="⏹ 中止", command=self.abort_run, width=8, padding=(6, 4), state='disabled', bootstyle="danger")
+        self.abort_btn.pack(side='right', padx=2, pady=4)
+        self.pause_btn = ttkb.Button(bottom_frame, text="⏸ 暂停", command=self.toggle_pause, width=8, padding=(6, 4), state='disabled', bootstyle="secondary")
+        self.pause_btn.pack(side='right', padx=2, pady=4)
 
-        load_btn = ttkb.Button(bottom_frame, text="加载", command=self.load_sequence, width=6, padding=(6, 4), bootstyle="secondary")
-        load_btn.pack(side='right', padx=(6, 0), pady=4)
+        # 顶部菜单栏（归类原工具栏按钮：序列/编辑/工具/用户）
+        self.create_menubar()
 
-        save_btn = ttkb.Button(bottom_frame, text="保存", command=self.save_sequence, width=6, padding=(6, 4), bootstyle="secondary")
-        save_btn.pack(side='right', padx=(6, 0), pady=4)
+    def create_menubar(self):
+        """创建顶部菜单栏：序列/编辑/工具/用户（归类原界面按钮功能）"""
+        c = ttkb.Style().colors  # 主题配色，与界面保持一致
+        menu_opts = dict(
+            bg=c.bg, fg=c.fg,
+            activebackground=c.light, activeforeground=c.fg,
+            borderwidth=0, relief="flat",
+        )
+        menubar = tk.Menu(self.root, **menu_opts)
 
-        export_log_btn = ttkb.Button(bottom_frame, text="导出日志", command=self._export_log, width=8, padding=(6, 4), bootstyle="secondary")
-        export_log_btn.pack(side='right', padx=(6, 0), pady=4)
+        # 序列菜单：加载 / 保存 / 从选中行运行
+        seq_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        seq_menu.add_command(label="加载序列", command=self.load_sequence)
+        seq_menu.add_command(label="保存序列", command=self.save_sequence)
+        seq_menu.add_separator()
+        seq_menu.add_command(label="从选中行运行", command=self.run_from_selected)
+        menubar.add_cascade(label="序列", menu=seq_menu)
+
+        # 编辑菜单：添加行 / 删除行 / 向下填充 / 清空
+        edit_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        edit_menu.add_command(label="添加行", command=self.add_row)
+        edit_menu.add_command(label="删除行", command=self.delete_selected_rows)
+        edit_menu.add_command(label="向下填充", command=self.fill_down)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="清空", command=self.clear_all)
+        menubar.add_cascade(label="编辑", menu=edit_menu)
+
+        # 工具菜单：编辑方法 / 保存温湿度 / 导出日志
+        tool_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        tool_menu.add_command(label="编辑方法", command=self.edit_method)
+        tool_menu.add_command(label="保存温湿度", command=self.save_env_to_excel)
+        tool_menu.add_separator()
+        tool_menu.add_command(label="导出日志", command=self._export_log)
+        menubar.add_cascade(label="工具", menu=tool_menu)
+
+        # 用户菜单：登录(切换用户) / 用户管理；self.user_menu 供 _refresh_user_menu 复用
+        self.user_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
+        self.user_menu.add_command(label="登录", command=self._show_login_dialog)
+        self.user_menu.add_command(label="用户管理", command=self._open_user_management)
+        menubar.add_cascade(label="用户", menu=self.user_menu)
+
+        self.root.config(menu=menubar)
 
     def create_table_container(self, parent):
         """创建表格容器，包含表头和表格"""
@@ -1732,8 +1893,8 @@ class SequenceMaster:
             {"text": "标准物质", "anchor": "w"},
             {"text": "设备", "anchor": "w"},
             {"text": "谱图文件路径", "anchor": "w"},
-            {"text": "温度(℃)", "anchor": "center"},
-            {"text": "湿度(%RH)", "anchor": "center"},
+            {"text": "T", "anchor": "w"},
+            {"text": "RH", "anchor": "w"},
             {"text": "运行状态", "anchor": "center"}
         ]
 
@@ -2140,6 +2301,30 @@ class SequenceMaster:
         except Exception:
             return {}
 
+    def _method_default_desc(self, method_file):
+        """判定方法是否支持「无称样记录默认录入」并取默认试样信息/描述值。
+        返回 (supports, label, xx)：supports = 称样模式∉{record,process} 且 默认触发固定参数含
+        试样信息/试样描述；label = 命中参数名(试样信息/试样描述，多个用/连)；
+        xx = 命中值(多个用'；'连)。供运行前确认弹窗与默认 startTime 用。"""
+        wp = self._read_weighing_params(method_file)
+        wmode = (wp.get("weighing_mode") or "").strip()
+        if wmode in ("record", "process"):
+            return False, "", ""
+        fps = (self._read_other_params(method_file) or {}).get("fixed_params") or []
+        labels, vals = [], []
+        for rule in fps:
+            if (rule.get("trigger") or "").strip() not in ("默认", "默认触发"):
+                continue
+            for p in (rule.get("params") or []):
+                if _norm_cn(p.get("name")) in ("试样信息", "试样描述"):
+                    _nm = (p.get("name") or "").strip()
+                    if _nm and _nm not in labels:
+                        labels.append(_nm)
+                    v = (p.get("value") or "").strip()
+                    if v and v not in vals:
+                        vals.append(v)
+        return bool(vals), "/".join(labels), "；".join(vals)
+
     def _read_processing_rules(self, method_file):
         """读取方法 yaml 顶层 processing_rules（称量记录处理规则），返回 list"""
         if not method_file or not os.path.isfile(method_file):
@@ -2497,9 +2682,10 @@ class SequenceMaster:
             checked = {c.strip() for c in current.split(";") if c.strip()}
             selected = self._open_equipment_picker(row_index, items, checked)
         else:
-            selected = self._open_equipment_entry(
-                row_index, current,
-                "未取到方法设备列表(样品不可查或方法未配置设备)，请手动输入设备编号(; 分隔多个)")
+            # 未取到方法设备列表：不再弹出手动输入框，仅记日志/状态栏提示
+            self._log(f"第 {row_index + 1} 行：未取到方法设备列表(样品不可查或方法未配置设备)，跳过设备选择")
+            self.status_var.set(f"第 {row_index + 1} 行未取到设备列表，已跳过")
+            return
         if selected is None:
             return  # 用户取消
         row["equipment"] = ";".join(selected)
@@ -2563,36 +2749,6 @@ class SequenceMaster:
         x = rx + (self.root.winfo_width() - win.winfo_width()) // 2
         y = ry + (self.root.winfo_height() - win.winfo_height()) // 2
         win.geometry(f"+{max(0, x)}+{max(0, y)}")  # 居中到主窗口
-        win.wait_window()
-        return result["value"]
-
-    def _open_equipment_entry(self, row_index, current, hint):
-        """取不到设备列表时的手动输入对话框(; 分隔)。确定返回去重保序的编号列表；取消返回 None。"""
-        win = tk.Toplevel(self.root)
-        win.title(f"输入设备编号 - 第 {row_index + 1} 行")
-        win.transient(self.root)
-        win.grab_set()
-        ttk.Label(win, text=hint, foreground="#b91c1c", wraplength=380).pack(anchor="w", padx=10, pady=(8, 4))
-        var = tk.StringVar(value=current)
-        ttk.Entry(win, textvariable=var).pack(fill="x", padx=10, pady=4)
-        result = {"value": None}
-
-        def on_ok():
-            seen, out = set(), []
-            for c in var.get().split(";"):
-                c = c.strip()
-                if c and c not in seen:
-                    seen.add(c)
-                    out.append(c)
-            result["value"] = out
-            win.destroy()
-
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=10, pady=(4, 8))
-        ttk.Button(btns, text="确定", command=on_ok).pack(side="right", padx=4)
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
-        win.update_idletasks()
-        win.geometry("440x150")
         win.wait_window()
         return result["value"]
 
@@ -2751,20 +2907,29 @@ class SequenceMaster:
         self.refresh_table()
         self.status_var.set("已清空所有行内容")
 
+    def _update_title(self):
+        """根据当前打开的序列文件更新窗口标题"""
+        if self.current_file:
+            name = os.path.splitext(os.path.basename(self.current_file))[0]
+            self.root.title(f"序列编辑器 · {name}")
+        else:
+            self.root.title("序列编辑器")
+
     def save_sequence(self):
-        """保存序列到文件"""
+        """保存序列到文件（已打开文件则原地覆盖保存，否则弹窗选择）"""
         if not self.sequence_data:
             self.status_var.set("提示: 没有数据可保存")
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="保存序列文件",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
-        )
-
+        file_path = self.current_file
         if not file_path:
-            return
+            file_path = filedialog.asksaveasfilename(
+                title="保存序列文件",
+                defaultextension=".seq",
+                filetypes=[("序列文件", "*.seq"), ("YAML files", "*.yaml;*.yml"), ("All files", "*.*")]
+            )
+            if not file_path:
+                return
 
         try:
             save_data = {
@@ -2793,8 +2958,10 @@ class SequenceMaster:
                 })
 
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
+                yaml.dump(save_data, f, allow_unicode=True, indent=2, sort_keys=False)
 
+            self.current_file = file_path
+            self._update_title()
             self.status_var.set(f"序列已保存到: {file_path}")
         except Exception as e:
             messagebox.showerror("错误", f"保存失败: {str(e)}")
@@ -2803,7 +2970,7 @@ class SequenceMaster:
         """从文件加载序列"""
         file_path = filedialog.askopenfilename(
             title="加载序列文件",
-            filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
+            filetypes=[("序列文件", "*.seq"), ("YAML files", "*.yaml;*.yml"), ("JSON files", "*.json"), ("All files", "*.*")]
         )
 
         if not file_path:
@@ -2811,7 +2978,7 @@ class SequenceMaster:
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                loaded_data = json.load(f)
+                loaded_data = yaml.safe_load(f) or {}
 
             self.sequence_data = []
             self.selection_manager.clear_all_selection()
@@ -2843,6 +3010,8 @@ class SequenceMaster:
                 self.sequence_data.append(new_row)
 
             self.refresh_table()
+            self.current_file = file_path
+            self._update_title()
             self.status_var.set(f"已加载序列文件: {file_path}")
 
         except Exception as e:
@@ -2902,28 +3071,35 @@ class SequenceMaster:
         self.refresh_table()
         self._log(f"已从方法同步标液+设备配置到第 {target_idx + 1} 行")
 
-    def run_sequence(self):
-        """运行序列（阶段1：真实逐行提交，半自动）。支持从指定行开始。"""
+    def run_from_selected(self):
+        """从当前选中行开始运行序列（未选中则提示）。"""
         if self._running:
             self.status_var.set("提示: 序列正在运行中")
             return
         if not self.sequence_data:
             self.status_var.set("提示: 没有可运行的序列数据")
             return
-        # 起始行(1-based)；空或1=从头
+        sel = sorted(self.selection_manager.selected_rows) or sorted({r for r, _ in self.selection_manager.selected_cells})
+        if not sel:
+            self.status_var.set("提示: 请先选中要开始运行的行")
+            return
+        self.run_sequence(sel[0] + 1)  # 转为 1-based
+
+    def run_sequence(self, start_row=None):
+        """运行序列（阶段1：真实逐行提交，半自动）。start_row: 1-based 起始行，None=从头运行。"""
+        if self._running:
+            self.status_var.set("提示: 序列正在运行中")
+            return
+        if not self.sequence_data:
+            self.status_var.set("提示: 没有可运行的序列数据")
+            return
+        # 起始行(1-based)；None 或 1=从头
         n = len(self.sequence_data)
-        raw = (self.start_row_var.get() or "").strip() if hasattr(self, "start_row_var") else ""
-        start_idx = 0
-        if raw and raw != "1":
-            try:
-                sr = int(raw)
-            except ValueError:
-                self.status_var.set("提示: 起始行需为整数")
-                return
-            if sr < 1 or sr > n:
-                self.status_var.set(f"提示: 起始行需在 1~{n} 之间")
-                return
-            start_idx = sr - 1
+        sr = start_row if start_row is not None else 1
+        if sr < 1 or sr > n:
+            self.status_var.set(f"提示: 起始行需在 1~{n} 之间")
+            return
+        start_idx = sr - 1
         invalid = [i + 1 for i, r in enumerate(self.sequence_data) if i >= start_idx
                    and (not r["method_file"] or not r["spectrum_path"])]
         if invalid:
@@ -2932,6 +3108,30 @@ class SequenceMaster:
         scope = f"第 {start_idx + 1}~{n} 行" if start_idx else f"全部 {n} 行"
         if not messagebox.askyesno("确认运行", f"确定要运行{scope}序列吗？"):
             return
+        # 默认录入确认：称样模式非 record/process、且默认触发含试样信息/试样描述、且称样记录路径为空的行，
+        # 会以谱图目录全部 PDF 作样品、试样信息取方法默认、开始时间取上一工作日——运行前统一确认。
+        _def_rows = []
+        for _i in range(start_idx, n):
+            _r = self.sequence_data[_i]
+            if (_r.get("weighing_path") or "").strip():
+                continue
+            _sup, _lbl, _xx = self._method_default_desc(_r.get("method_file"))
+            if _sup:
+                _mn = os.path.splitext(os.path.basename(_r.get("method_file") or ""))[0]
+                if (_mn, _lbl, _xx) not in _def_rows:
+                    _def_rows.append((_mn, _lbl, _xx))
+        if _def_rows:
+            if len(_def_rows) == 1:
+                _info = f"录入方法中{_def_rows[0][1]}默认是「{_def_rows[0][2]}」"
+            else:
+                _info = "；".join(f"[{_m}]{_lbl}={_x}" for _m, _lbl, _x in _def_rows)
+            _pwd = _prev_workday().strftime("%Y-%m-%d")
+            _msg = (f"称量记录为空，将录入谱图文件夹中所有编号\n"
+                    f"{_info}\n"
+                    f"分析开始时间默认是{_pwd}。\n"
+                    f"是否继续录入？")
+            if not messagebox.askyesno("默认录入确认", _msg):
+                return
         if not self.logged_in:
             # 先尝试复用已保存的会话(避免每次运行都重新登录)
             if self.login_system.load_session() and self.login_system.verify_session():
@@ -2963,6 +3163,8 @@ class SequenceMaster:
         self._running = running
         self.pause_btn.configure(state='normal' if running else 'disabled', text="⏸ 暂停")
         self.abort_btn.configure(state='normal' if running else 'disabled')
+        self.tb_pause.configure(state='normal' if running else 'disabled', text="⏸")
+        self.tb_abort.configure(state='normal' if running else 'disabled')
         self.status_var.set("运行中..." if running else "就绪")
 
     def _run_worker(self, start_idx=0):
@@ -3000,6 +3202,9 @@ class SequenceMaster:
         wp = self._read_weighing_params(row.get("method_file"))
         wmode = (wp.get("weighing_mode") or "").strip() if wp else ""
         rec_path = (row.get("weighing_path") or "").strip()
+        # 无称样记录默认录入：方法支持(模式非record/process + 默认触发试样信息) 且 称样记录路径为空
+        _sup_def, _, _ = self._method_default_desc(row.get("method_file"))
+        defaults_no_record = bool(_sup_def and not rec_path)
         wmap = None
         if wmode in ("record", "process"):
             if not rec_path or not os.path.isfile(rec_path):
@@ -3020,7 +3225,7 @@ class SequenceMaster:
             wmap = _merge_parallel_groups(wmap, (wp or {}).get("non_parallel_suffixes"))
 
         # 解析本行要录入的样品：单样品，或目录多PDF按 excel∩谱图 展开
-        samples, serr = self._resolve_samples(row, wmap, log)
+        samples, serr = self._resolve_samples(row, wmap, log, defaults_no_record=defaults_no_record)
         if serr or not samples:
             self._ui_q.put(("status", (idx, "失败", "无法确定样品")))
             log(f"失败: {serr or '谱图目录无匹配PDF且未填样品编号'}")
@@ -3049,19 +3254,21 @@ class SequenceMaster:
             log("谱图检查通过")
 
         configure_order = (row.get("configure_order") or "").strip()
-        # 标准溶液预检（行级一次，各样品共用）
+        # 标准溶液预检（行级一次，各样品共用；支持逗号分隔多个标液，逐个校验）
         if configure_order:
-            log(f"校验标准溶液 {configure_order} ...")
-            cid, emsg = self.api.get_solution_configure_id(configure_order, log)
-            if not cid:
-                self._ui_q.put(("status", (idx, "失败", f"标准溶液:{emsg}")))
-                log(f"失败: 标准溶液校验未过 - {emsg}")
-                return "fail"
+            for _co in [x.strip() for x in configure_order.replace("，", ",").split(",") if x.strip()]:
+                log(f"校验标准溶液 {_co} ...")
+                cid, emsg = self.api.get_solution_configure_id(_co, log)
+                if not cid:
+                    self._ui_q.put(("status", (idx, "失败", f"标准溶液:{emsg}")))
+                    log(f"失败: 标准溶液校验未过 - {emsg}")
+                    return "fail"
 
         fixed_params = (self._read_other_params(row.get("method_file")) or {}).get("fixed_params") or []
         ctx = {
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
             "fixed_params": fixed_params, "method_file": row.get("method_file") or "",
+            "defaults_no_record": defaults_no_record,
             "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(苯)生成后供依赖项目(总和)复用
         }
 
@@ -3262,9 +3469,21 @@ class SequenceMaster:
             actual_method_name = method_name
             actual_method_id = method_id
         else:
+            # 解析方法文件规则的子方法（如 'AfPS GS 2019:01 PAK 单组份' → methodId 4489），
+            # 首次取配置即带 detectionMethod.id：一个标准号下多子方法（单组份/N项之和）若不带 id，
+            # 服务端无法定位 → 报 005"样品项目对应的方法不同"
+            sub_method_id = ""
+            _qi = batch_projects[0].get("_qr_idx")
+            if _qi is not None:
+                _qr = self._read_query_rules(ctx.get("method_file") or "")
+                if _qi < len(_qr):
+                    _rm = str(_qr[_qi].get("method") or "").strip()
+                    if _rm and not _rm.isdigit():
+                        sub_method_id = self.api.get_method_id_by_standard_no_name(_rm, log) or ""
             log("取实验配置 ...")
-            log(f"取实验配置: sp_ids={sp_ids_str} method={method_name!r} sample_id={sample_id!r}")
-            initial = self.api.get_experiment_config(sp_ids_str, method_name, "", sample_id, log)
+            log(f"取实验配置: sp_ids={sp_ids_str} method={method_name!r} sample_id={sample_id!r}"
+                + (f" subMethodId={sub_method_id}" if sub_method_id else ""))
+            initial = self.api.get_experiment_config(sp_ids_str, method_name, "", sample_id, log, sub_method_id or None)
             if not initial:
                 self._ui_q.put(("status", (idx, "失败", "取实验配置失败")))
                 log("失败: get_experiment_config 返回空")
@@ -3479,12 +3698,60 @@ class SequenceMaster:
                 _fill_desc_column(records, desc_by_sample)
                 first_sc = batch_items[0]["sample_code"] if batch_items else ""
                 analysis_start = (ctx["wmap"].get(first_sc) or {}).get("time")
+        elif wmode == "pdf":
+            # PDF报告 - 称样量取自报告(样品初始质量)，按 decimal_places 保留末尾0(0.31→0.3100)
+            mass_col = _find_weighing_column(dynamic_columns)
+            if mass_col is None:
+                log("称样量(pdf) 未找到称量记录列(isWeighing=1)，跳过")
+            else:
+                from report_parser import parse_pdf_report_meta
+                field = (mass_col.get('equipRelativeTitle') or '').strip() or '样品初始质量'
+                try:
+                    _mdp = int((wp or {}).get("decimal_places") or 4)  # 天平标准4位(0.0001g)
+                except (TypeError, ValueError):
+                    _mdp = 4
+                records = (experiment_config or {}).get("ocAnalysisRecordList") or []
+                sp = (row.get("spectrum_path") or "").strip()
+                pmasses_by_sample, desc_by_sample = {}, {}
+                for it in batch_items:
+                    sc = it["sample_code"]
+                    if sc in pmasses_by_sample:
+                        continue
+                    rv = primary_cache.get(sc)
+                    if rv:
+                        pmasses_by_sample[sc] = list(rv["masses"])
+                        desc_by_sample[sc] = rv["desc"]
+                        continue
+                    pdf, _dil = _pick_sample_report_pdf(sp, sc, actual_method_name)
+                    raw = []
+                    if pdf:
+                        try:
+                            raw = [v for _sid, v in parse_pdf_report_meta(pdf, field) if v]
+                        except Exception as e:
+                            log(f"称样量(pdf) 样品 {sc} 报告解析失败({e})")
+                    else:
+                        log(f"称样量(pdf) 样品 {sc} 谱图目录未找到报告 PDF，称样量留空")
+                    masses = [f"{float(v):.{_mdp}f}" for v in raw]  # 报告段顺序=平行槽(A→0,B→1)
+                    pmasses_by_sample[sc] = masses
+                    desc_by_sample[sc] = ((ctx["wmap"] or {}).get(sc) or {}).get("desc") or ""
+                    primary_cache[sc] = {"masses": list(masses), "desc": desc_by_sample[sc]}
+                mass_code = mass_col.get("columeCode", "")
+                host.data_fields[mass_code] = _mass_field_by_project(records, pid_to_sample, pmasses_by_sample)
+                _npars = sorted({len(v) for v in pmasses_by_sample.values() if v}) or [0]
+                log(f"称样量(pdf) {mass_col.get('columeName', '')} 字段[{field}] 跨{len(pmasses_by_sample)}样品 按报告段({'/'.join(map(str, _npars))})")
+                _fill_desc_column(records, desc_by_sample)
+                first_sc = batch_items[0]["sample_code"] if batch_items else ""
+                analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
         elif wmode:
-            log(f"称样量模式={wmode} 暂未接入(本轮支持 random/none/record/process)")
+            log(f"称样量模式={wmode} 暂未接入(本轮支持 random/none/record/process/pdf)")
 
         _reused = [sc for sc in batch_samples if sc in cached_before]
         if _reused:
             log(f"复用首项目(苯)试样描述/称样量: {len(_reused)}/{len(batch_samples)} 样品")
+
+        # 报告解析→浓度回填：方法勾选「启用报告解析」时，按各样品谱图目录报告 PDF 解析浓度写入结果列
+        self._fill_result_from_report(host, dynamic_columns, experiment_config,
+                                      batch_items, row, actual_method_name, ctx, log)
 
         # 构造载荷 + 注入谱图 + 提交
         log("构建并提交 ...")
@@ -3499,9 +3766,14 @@ class SequenceMaster:
             except (AttributeError, ValueError):
                 log(f"警告: 称样时间格式无法解析({analysis_start!r})")
         if not _start_set:
-            # 无有效称样时间：开始时间取结束时间
-            experiment_data["startTime"] = experiment_data["endTime"]
-            log(f"无称样时间，开始时间(startTime) <- 结束时间: {experiment_data['endTime']}")
+            if ctx.get("defaults_no_record"):
+                # 无称样记录默认模式：开始时间取上一工作日(考虑法定假日/调休)
+                experiment_data["startTime"] = _prev_workday().strftime("%Y-%m-%d") + " 00:00:00"
+                log(f"无称样时间(默认模式)，开始时间(startTime) <- 上一工作日: {experiment_data['startTime']}")
+            else:
+                # 无有效称样时间：开始时间取结束时间
+                experiment_data["startTime"] = experiment_data["endTime"]
+                log(f"无称样时间，开始时间(startTime) <- 结束时间: {experiment_data['endTime']}")
         # 注入谱图 fileIds/spectrumJsonList：每个谱图只绑定到「实际用到它的项目」(按 fileId 归并 projectId)。
         # 标记分流时(总和/苯并[a]芘用基样谱、5mm以内用M谱)，不可把整样所有谱图绑到全部 projectId，
         # 否则 5mm以内 会同时挂上基样谱与M谱。同谱图被多项目复用则 projectId 取并集。
@@ -3564,6 +3836,14 @@ class SequenceMaster:
             else:
                 # 默认主检设备 = 方法检测设备中 isDefault=1 的（即 mainEquipmentIds 列出的）
                 main_ids = set((equipment_config or {}).get("mainEquipmentIds", "").split(","))
+                log(f"[设备] mainEquipmentIds={sorted(x for x in main_ids if x)}; raw_data: " + "; ".join(
+                    f"{e.get('name')}({e.get('usedCategory')}/billId={e.get('equipmentBillId')!r},id={e.get('id')!r})"
+                    for e in (equipment_config or {}).get("raw_data") or []))
+                _we = equipment_config or {}
+                if _we.get("weighingEquipmentId"):
+                    log(f"[设备] 称样设备: {_we.get('weighingEquipment')} (id={_we.get('weighingEquipmentId')})")
+                else:
+                    log("[设备] 称样设备: (方法未配置默认称样设备)")
                 default_items = [
                     {"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
                     for eq in (equipment_config or {}).get("raw_data") or []
@@ -3591,12 +3871,13 @@ class SequenceMaster:
         log(f"本批完成，实验编号 {real_code}")
         return True, real_code
 
-    def _resolve_samples(self, row, wmap, log):
+    def _resolve_samples(self, row, wmap, log, defaults_no_record=False):
         """解析本行要录入的样品。返回 (samples, err)。
         samples = [(sample_code, [pdf_path,...]), ...]；err 非空=无法解析。
         - 谱图是文件 / 目录单PDF / 目录+已填样品编号：单样品
         - 目录+多PDF+未填样品编号：用 wmap(称样记录)样品编号 ∩ 目录PDF(startswith)展开；
-          wmap 缺失则 err。一个样品匹配多个PDF(如A/B平行)全部收集、都上传。"""
+          wmap 缺失则 err。一个样品匹配多个PDF(如A/B平行)全部收集、都上传。
+        - defaults_no_record=True(无称样记录默认模式)：wmap 缺失时不报错，目录内每个编号各成一样品。"""
         sp = (row.get("spectrum_path") or "").strip()
         sc = (row.get("sample_code") or "").strip()
         if os.path.isfile(sp):
@@ -3616,6 +3897,13 @@ class SequenceMaster:
             return [(code, [pdfs[0]])], None
         # 多PDF + 未填样品编号 → 用称样记录编号 ∩ 目录PDF 展开(只有两边都有的编号才参与录入)
         if not wmap:
+            if defaults_no_record:
+                # 无称样记录默认模式：目录内每个编号(按文件名前缀去平行小号)各成一样品，全部参与录入
+                _by_code = {}
+                for _p in pdfs:
+                    _c = os.path.splitext(os.path.basename(_p))[0].split("-", 1)[0]
+                    _by_code.setdefault(_c, []).append(_p)
+                return [(_c, _ps) for _c, _ps in _by_code.items()], None
             return [], "目录有多个PDF且未填样品编号，请在「称样记录路径」填称样记录excel(按 excel∩谱图 展开)"
         # 先收集有谱图的候选 (编号, 试样描述, 匹配PDF)
         cands = []
@@ -3710,6 +3998,163 @@ class SequenceMaster:
         return [{"project": str(r.get("project") or ""), "filter": str(r.get("filter") or "")}
                 for r in rules if isinstance(r, dict)]
 
+    def _read_report_parse_settings(self, method_file):
+        """读方法文件 spectrum_upload_settings 的报告解析设置。
+        返回 {enabled, undetected_threshold, instrument_type, marker}；空/异常返回 {}。"""
+        if not method_file or not os.path.isfile(method_file):
+            return {}
+        try:
+            with open(method_file, "r", encoding="utf-8") as f:
+                y = yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+        su = y.get("spectrum_upload_settings") or {}
+        return {
+            "enabled": bool(su.get("report_parse_enabled")),
+            "undetected_threshold": su.get("undetected_threshold"),
+            "instrument_type": su.get("instrument_type"),
+            "marker": su.get("marker"),
+        }
+
+    def _fill_result_from_report(self, host, dynamic_columns, experiment_config,
+                                 batch_items, row, actual_method_name, ctx, log):
+        """报告解析→浓度回填（批量）：方法勾选「启用报告解析」时，按各样品谱图目录的报告 PDF
+        解析浓度并写入结果列 host.data_fields[res_col]，供 build_grouped_experiment_data 提交。
+        PDF 缺失/解析失败→告警留空，不阻断批量。复用 parse_pdf_report + evaluate_alias + get_project_alias。
+        主支持无组分列场景(PAHs：每记录一化合物/项目，evaluate_alias 单段取值)；
+        多组分列场景按记录组分名匹配段，best-effort(报告格式未全面验证)。"""
+        settings = self._read_report_parse_settings(ctx.get("method_file"))
+        if not settings or not settings.get("enabled"):
+            return  # 方法未启用报告解析：保持现状(结果列留默认)
+        try:
+            nd_thr = float(settings.get("undetected_threshold") or 0.05)
+        except (TypeError, ValueError):
+            nd_thr = 0.05
+        spectrum_path = (row.get("spectrum_path") or "").strip()
+        if not spectrum_path:
+            log("报告解析: 本行未设置谱图文件路径，跳过浓度回填")
+            return
+
+        # 1) 按样品解析报告 PDF（正常 + 可选稀释）；同一样品多项目共用
+        # ICP 一 PDF 多样品(A/B 平行样)：samples = [(标识码, compounds), ...]，按平行槽分取
+        from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor
+        parsed_by_sample = {}   # {sample_code: (samples, diluted_compounds, headers)}
+        factor_by_sample = {}   # {sample_code: 稀释倍数}
+        missing_samples = []
+        for it in batch_items:
+            sc = it.get("sample_code")
+            if sc in parsed_by_sample or sc in missing_samples:
+                continue
+            pdf, dil_pdf = _pick_sample_report_pdf(spectrum_path, sc, actual_method_name)
+            if not pdf:
+                log(f"报告解析: 样品 {sc} 在谱图目录未找到报告 PDF，浓度留空")
+                missing_samples.append(sc)
+                continue
+            try:
+                samples, headers = parse_pdf_report_multi(pdf)
+            except Exception as e:
+                log(f"报告解析: 样品 {sc} 解析失败({e})，浓度留空")
+                missing_samples.append(sc)
+                continue
+            if not samples:
+                log(f"报告解析: 样品 {sc} 未解析到化合物，浓度留空")
+                missing_samples.append(sc)
+                continue
+            diluted = None
+            if dil_pdf:
+                try:
+                    diluted, _ = parse_pdf_report(dil_pdf)
+                except Exception as e:
+                    log(f"报告解析: 样品 {sc} 稀释报告解析失败({e})，按正常报告处理")
+                factor_by_sample[sc] = _dilution_factor(dil_pdf)
+            parsed_by_sample[sc] = (samples, diluted, headers)
+            n_cmp = len(samples[0][1]) if samples else 0
+            log(f"报告解析: 样品 {sc} 解析到 {len(samples)} 个样品×{n_cmp} 化合物 ({os.path.basename(pdf)})"
+                + (f"，含稀释报告 {os.path.basename(dil_pdf)}×{factor_by_sample[sc]:g}" if dil_pdf else ""))
+        if not parsed_by_sample:
+            return  # 无一样品可解析：结果列保持默认
+
+        # 2) 定位结果列(用任一已解析样品的 PDF 表头做 equipRelativeTitle 精确匹配)
+        any_headers = next(iter(parsed_by_sample.values()))[2]
+        res_col = _find_result_column(dynamic_columns, any_headers)
+        if not res_col:
+            log("报告解析: 未找到结果列(计算值/报告值/浓度)，浓度留默认")
+            return
+
+        # 3) 逐记录求值：记录→projectId→样品→报告→别名→evaluate_alias→选段值
+        from alias_evaluator import evaluate_alias
+        records = (experiment_config or {}).get("ocAnalysisRecordList") or []
+        pid_to_item = {str(it["project"].get("projectId")): it for it in batch_items
+                       if it.get("project", {}).get("projectId") is not None}
+
+        def _is_comp(c):
+            try:
+                return int(c.get('isMutiPolyColume') or 0) == 1
+            except (TypeError, ValueError):
+                return False
+
+        comp_col_code = next((c.get("columeCode") for c in (dynamic_columns or [])
+                              if isinstance(c, dict) and _is_comp(c)), None)
+        alias_cache = {}   # {detectionProjectId: alias_str}
+
+        parallel_of, _n_par = _parallel_indices(records)  # 每条记录的平行槽(用 serialNumber)
+
+        def _value_for_record(rec, slot):
+            item = pid_to_item.get(str(rec.get("projectId")))
+            if not item:
+                return "", False
+            parsed = parsed_by_sample.get(item.get("sample_code"))
+            if not parsed:
+                return "", False  # 该样品 PDF 缺失/解析失败 → 留空
+            samples, diluted_compounds, _headers = parsed
+            # 取该平行槽样品；槽超界(平行数<样品数，如 N=1 而报告有 A/B)则取首个
+            compounds = samples[slot][1] if slot < len(samples) else samples[0][1]
+            det_pid = item["project"].get("detectionProjectId")
+            if not det_pid:
+                return "", False
+            if det_pid not in alias_cache:
+                alias, _detail = self.api.get_project_alias(det_pid, log)
+                alias_cache[det_pid] = alias or ""
+            alias = alias_cache.get(det_pid)
+            if not alias:
+                return "", False
+            try:
+                results = evaluate_alias(alias, compounds, nd_thr, diluted_compounds=diluted_compounds)
+            except Exception:
+                return "", False
+            if not results:
+                return "", False
+            if comp_col_code:  # 多组分：按记录组分名匹配段(组分名取自记录该列值)
+                comp_name = str(rec.get(comp_col_code) or "").strip()
+                if comp_name:
+                    seg = next((r for r in results if r.get("lims_component") == comp_name), None)
+                    if seg is not None:
+                        return seg.get("value", ""), bool(seg.get('raw', {}).get('diluted'))
+            seg0 = results[0]
+            return seg0.get("value", ""), bool(seg0.get('raw', {}).get('diluted'))  # 无组分列(PAHs)：单段即该化合物浓度
+
+        rec_values = [_value_for_record(r, parallel_of.get(g, 0)) for g, r in enumerate(records)]
+        values = [v for v, _d in rec_values]
+        diluted_flags = [_d for _v, _d in rec_values]
+        host.data_fields[res_col] = [_Box(v) for v in values]
+        # 稀释列：超线性(稀释)记录填倍数，其余填 1（LIMS 据稀释列×结果自算）
+        dil_col = next((c.get("columeCode") for c in (dynamic_columns or [])
+                        if isinstance(c, dict) and (c.get('equipRelativeTitle') or '').strip() == '稀释'), None)
+        if dil_col:
+            def _dil_val(i, rec):
+                if not diluted_flags[i]:
+                    return "1"
+                _item = pid_to_item.get(str(rec.get("projectId")))
+                _f = factor_by_sample.get(_item.get("sample_code")) if _item else None
+                return f"{_f:g}" if _f and _f != 1.0 else "1"
+            host.data_fields[dil_col] = [_Box(_dil_val(i, rec)) for i, rec in enumerate(records)]
+            _dil_filled = sum(1 for i in range(len(records)) if i < len(diluted_flags) and diluted_flags[i])
+            if _dil_filled:
+                log(f"报告解析: 稀释列 {dil_col} 填 {_dil_filled} 条超线性组分")
+        filled = sum(1 for v in values if v)
+        log(f"报告解析: 结果列 {res_col} 浓度回填 {filled}/{len(values)} 条"
+            + (f"，{len(missing_samples)} 个样品缺报告PDF" if missing_samples else ""))
+
     def _filter_projects_by_method(self, projects, row, log):
         """按方法文件 query_rules 指定的方法过滤 projects。
         返回 (projects, error_msg)。error_msg 非空表示无法确定单一方法——
@@ -3745,22 +4190,27 @@ class SequenceMaster:
             pname = (p.get("projectName") or "").strip()
             return any(_project_match(pname, pv) for pv in project_vals)
 
-        # 解析每条规则的方法 → 标准号（数字ID查服务端，文本直接用）。多条不同方法时取并集，
-        # 每个项目归入首个命中规则并标记 _qr_idx，供批次规划按方法分批（如 XRF 多元素方法各成一个实验）
-        rule_stds = []  # [(规则序号, 标准号)]，仅含有 method 的规则
+        # 解析每条规则的方法 → (标准号, 子方法ID)。数字ID查服务端取标准号；文本(如 'AfPS GS 2019:01 PAK 单组份')
+        # 再解析子方法ID。一个标准号下常有多个子方法(单组份/N项之和)，各为独立 methodId，须按子方法ID精确过滤，
+        # 否则同标准号的项目混在一起会让 getOcExperiment 报 005"样品项目对应的方法不同"。
+        rule_stds = []  # [(规则序号, 标准号, 子方法ID或None)]，仅含有 method 的规则
         for _i, q in enumerate(qr):
             mv = str(q.get("method") or "").strip()
             if not mv:
                 continue
+            _sub_id = None
             if mv.isdigit():
+                # 数字方法ID：维持原行为（按 standardNo 模糊匹配），不加子方法过滤——
+                # 数字可能是主方法ID而非项目所带的子方法ID，过滤会误删。仅文本标准号名走子方法精确过滤。
                 try:
                     ts = (self.api.get_method_standard_no_by_id(mv, log) or "").strip()
                 except Exception:
                     ts = ""
             else:
                 ts = mv
+                _sub_id = self.api.get_method_id_by_standard_no_name(mv, log)
             if ts:
-                rule_stds.append((_i, ts))
+                rule_stds.append((_i, ts, _sub_id))
 
         if rule_stds:
             filtered = []
@@ -3770,8 +4220,11 @@ class SequenceMaster:
                 # 同时按 method+project 命中首条规则：方法匹配且(规则无 project 或项目名命中)。
                 # 这样多方法各自独立分批(XRF 汞/六价铬/镉铅 各一实验)，单方法多项目(苯/总和)也各归其规则
                 _matched = None
-                for _i, ts in rule_stds:
+                for _i, ts, _sub_id in rule_stds:
                     if not _std_loose_match(_pstd, ts):
+                        continue
+                    # 规则解析出子方法ID时，项目 decideProjectMethodId 必须一致(剔除同标准号下别的子方法)
+                    if _sub_id and str(p.get("decideProjectMethodId") or "") != str(_sub_id):
                         continue
                     _rp = str(qr[_i].get("project") or "").strip()
                     if not _rp or _project_match(_pname, _rp):
@@ -3782,11 +4235,16 @@ class SequenceMaster:
                 p["_qr_idx"] = _matched
                 filtered.append(p)
             if filtered:
-                distinct = sorted({ts for _i, ts in rule_stds})
+                distinct = sorted({ts for _i, ts, _ in rule_stds})
+                _sub_ids = sorted({str(_s) for _i, _ts, _s in rule_stds if _s})
                 proj_hint = f"，项目名过滤={project_vals!r}" if project_vals else ""
-                log(f"按方法过滤出 {len(filtered)} 个项目(共 {len(rule_stds)} 条方法规则：{', '.join(distinct)}{proj_hint})")
+                sub_hint = f"，子方法ID={_sub_ids}" if _sub_ids else ""
+                _pstds = sorted({str(p.get("standardNo") or "") for p in filtered})
+                _pnames = [str(p.get("projectName") or "") for p in filtered]
+                log(f"按方法过滤出 {len(filtered)} 个项目(共 {len(rule_stds)} 条方法规则：{', '.join(distinct)}{proj_hint}{sub_hint})；"
+                    f"标准号集合: {_pstds}；项目名: {_pnames}")
                 return filtered, None
-            hit_methods = ', '.join(sorted({ts for _i, ts in rule_stds}))
+            hit_methods = ', '.join(sorted({ts for _i, ts, _ in rule_stds}))
             return None, (f"方法文件指定的方法（{hit_methods}）不在此样品项目中。"
                           f"样品实际方法: {', '.join(stdnos)}。请检查录入方法文件。")
 
@@ -3978,6 +4436,7 @@ class SequenceMaster:
             actual_method_name=actual_method_name,
             actual_method_id=actual_method_id,
             fixed_params=fixed_params or [],
+            is_headless=True,  # 序列无头模式：固定参数覆盖列默认值(无真实手填输入)
             temperature_var=_Box(""),
             humidity_var=_Box(""),
             start_date_var=_Box(today),
@@ -4111,11 +4570,13 @@ class SequenceMaster:
         if self._pause.is_set():
             self._pause.clear()
             self.pause_btn.configure(text="▶ 继续")
+            self.tb_pause.configure(text="▶")
             self._log("已暂停(行边界生效)")
             self.status_var.set("已暂停")
         else:
             self._pause.set()
             self.pause_btn.configure(text="⏸ 暂停")
+            self.tb_pause.configure(text="⏸")
             self._log("已继续")
             self.status_var.set("运行中...")
 
@@ -4212,15 +4673,15 @@ class SequenceMaster:
         return self.logged_in
 
     def _refresh_user_menu(self):
-        """根据登录状态刷新用户菜单按钮(文案 + 菜单首项 登录/切换用户)"""
+        """根据登录状态刷新用户菜单首项(登录/切换用户)与登录状态显示"""
         if self.logged_in and self.login_system.current_user:
             disp = self.login_system.users.get(self.login_system.current_user, {}).get(
                 'display_name', self.login_system.current_user)
-            self.user_menu_btn.configure(text=f"👤 {disp} ▾", fg="#16a34a")
             self.user_menu.entryconfigure(0, label="切换用户")
+            self.login_status_label.configure(text=f"👤 {disp}", fg="#16a34a")
         else:
-            self.user_menu_btn.configure(text="👤 未登录 ▾", fg="#dc2626")
             self.user_menu.entryconfigure(0, label="登录")
+            self.login_status_label.configure(text="👤 未登录", fg="#dc2626")
 
     def _open_user_management(self):
         """打开用户管理对话框(复用 login.CompactLoginApp 的增/删/查用户 UI)"""

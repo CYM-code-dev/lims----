@@ -144,8 +144,8 @@ class QueryTab:
 
         ttk.Label(row1, text="Retest:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
         self.query_cancel_test_var = tk.BooleanVar()
-        self.query_cancel_test_check = ttkb.Checkbutton(
-            row1, variable=self.query_cancel_test_var, bootstyle="primary")
+        self.query_cancel_test_check = ttk.Checkbutton(
+            row1, variable=self.query_cancel_test_var, style=self.app.large_cb_style)
         self.query_cancel_test_check.grid(row=0, column=1, padx=(0, 10), pady=1, sticky='w')
 
         ttk.Label(row1, text="最大选中数量:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
@@ -1335,6 +1335,9 @@ class WeighingTab:
         ttkb.Radiobutton(mode_frame, text="无需称样量",
                         variable=self.weighing_mode, value="none",
                         command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
+        ttkb.Radiobutton(mode_frame, text="PDF报告",
+                        variable=self.weighing_mode, value="pdf",
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
 
         # 平行样合并设置：不并入平行样的标记后缀字母(如 M=基体加标)
         parallel_frame = ttk.LabelFrame(weighing_frame, text="平行样合并", padding=5)
@@ -1586,6 +1589,11 @@ class WeighingTab:
             # 无需称样量 - 两个区域都禁用
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
+        elif mode == "pdf":
+            # PDF报告 - 称样量取自报告(样品初始质量)；仅「小数位数」可编辑(按其保留末尾0，如0.3100)，min/max 与处理区禁用
+            self.set_frame_state(self.random_frame, "disabled")
+            self.set_frame_state(self.process_frame, "disabled")
+            self.decimal_entry.configure(state="normal")
 
     def set_frame_state(self, frame, state):
         """设置框架及其子组件的状态"""
@@ -1794,9 +1802,10 @@ class SpectrumUploadTab:
             "sample": {"enabled": False, "count": "", "keyword": ""}
         }
         # 新增参数
-        self.quantitative_report_path = r"\\192.168.12.232\ElimsEquipIOTSMO\CIRS-Equip"
+        self.instrument_type = ""  # 仪器类型(GCMS/GC/LC/LCMSMS/XRF/ICP)
         self.undetected_threshold = ""
         self.marker = ""  # 新增：标记物参数
+        self.report_parse_enabled = False  # 报告解析启用开关（仪器类型/N.D/标记物）
         self.clear_spectrum = False  # 新增：录入前是否清空谱图
         self.spectrum_filter_rules = []  # 按项目筛选谱图文件名 [{project, filter}]
         self.create_tab()
@@ -1833,25 +1842,7 @@ class SpectrumUploadTab:
             command=self.on_mode_change, bootstyle="primary")
         self.local_upload_radio.pack(side='left', padx=(0, 20))
 
-        # 数据采集单选按钮（与"本地上传"互斥）
-        self.data_acquisition_radio = ttkb.Radiobutton(
-            mode_selection_frame,
-            text="数据采集",
-            variable=self.mode_var,
-            value="data_acquisition",
-            command=self.on_mode_change, bootstyle="primary")
-        self.data_acquisition_radio.pack(side='left', padx=(0, 20))
-
-        # 新增：本地+采集单选按钮
-        self.local_acquisition_radio = ttkb.Radiobutton(
-            mode_selection_frame,
-            text="本地+采集",
-            variable=self.mode_var,
-            value="local_acquisition",
-            command=self.on_mode_change, bootstyle="primary")
-        self.local_acquisition_radio.pack(side='left')
-
-        # 无需谱图（与上述模式互斥）
+        # 无需谱图（与"本地上传"互斥）
         self.no_spectrum_radio = ttkb.Radiobutton(
             mode_selection_frame,
             text="无需谱图",
@@ -1862,11 +1853,11 @@ class SpectrumUploadTab:
 
         # 是否清空谱图：选中后序列运行录入数据前调 deleteSpectrumByProjectIds 删除谱图再录入
         self.clear_spectrum_var = tk.BooleanVar(value=self.clear_spectrum)
-        self.clear_spectrum_check = ttkb.Checkbutton(
+        self.clear_spectrum_check = ttk.Checkbutton(
             mode_selection_frame,
             text="录入前清空谱图",
             variable=self.clear_spectrum_var,
-            command=self.on_clear_spectrum_change, bootstyle="primary")
+            command=self.on_clear_spectrum_change, style=self.app.large_cb_style)
         self.clear_spectrum_check.pack(side='left', padx=(30, 0))
 
     def create_content_area(self, parent):
@@ -1972,7 +1963,7 @@ class SpectrumUploadTab:
     def toggle_spectrum_filter(self):
         """复选框控制谱图分流区域的显示/隐藏"""
         if self.spf_enable_var.get():
-            self.spf_frame.pack(fill='x', pady=(0, 5))
+            self.spf_frame.pack(fill='x', pady=(0, 5), before=self.report_parse_toggle_frame)
         else:
             self.spf_frame.pack_forget()
 
@@ -2042,21 +2033,32 @@ class SpectrumUploadTab:
         entry.bind("<Escape>", cancel_edit)
 
     def create_additional_params_section(self, parent):
-        """创建新增参数设置区域"""
-        # 创建参数框架
-        params_frame = ttk.LabelFrame(parent, text="采集参数", padding=0)
-        params_frame.pack(fill='x', pady=0)  # 顶部不留边距
+        """创建报告解析设置区域"""
+        # 启用复选框 - 单独一行（样式同「启用谱图分流」），选中后下方三项才可编辑
+        self.report_parse_toggle_frame = ttk.Frame(parent)
+        self.report_parse_toggle_frame.pack(fill='x', padx=5, pady=(14, 0))
+        self.report_parse_enabled_var = tk.BooleanVar(value=self.report_parse_enabled)
+        ttk.Checkbutton(self.report_parse_toggle_frame, text=" 启用报告解析",
+                        variable=self.report_parse_enabled_var,
+                        style=self.app.large_cb_style,
+                        command=self.on_report_parse_enabled_change).pack(side='left')
+
+        # 报告解析参数（无单独标题框，置于「启用报告解析」下方）
+        params_frame = ttk.Frame(parent)
+        params_frame.pack(fill='x', pady=0)
 
         # 使用网格布局实现输入框两端对齐
         params_frame.columnconfigure(0, weight=0)  # 标签列，不扩展
         params_frame.columnconfigure(1, weight=1)  # 输入框列，占据剩余空间
 
-        # 定量报告上传地址 - 第一行
-        ttk.Label(params_frame, text="报告上传IP:").grid(row=0, column=0, padx=(5, 5), pady=2, sticky='w')
-        self.report_path_var = tk.StringVar(value=self.quantitative_report_path)
-        self.report_path_entry = ttk.Entry(params_frame, textvariable=self.report_path_var)
-        self.report_path_entry.grid(row=0, column=1, padx=(0, 10), pady=2, sticky='ew')
-        self.report_path_entry.bind('<KeyRelease>', self.on_report_path_change)
+        # 仪器类型 - 第一行
+        ttk.Label(params_frame, text="仪器类型:").grid(row=0, column=0, padx=(5, 5), pady=2, sticky='w')
+        self.instrument_type_var = tk.StringVar(value=self.instrument_type)
+        self.instrument_type_combo = ttk.Combobox(params_frame, textvariable=self.instrument_type_var,
+                                                  values=["GCMS", "GC", "LC", "LCMSMS", "XRF", "ICP"],
+                                                  state="readonly")
+        self.instrument_type_combo.grid(row=0, column=1, padx=(0, 10), pady=2, sticky='w')
+        self.instrument_type_combo.bind('<<ComboboxSelected>>', self.on_instrument_type_change)
 
         # 未检出判断值 - 第二行
         ttk.Label(params_frame, text="N.D判断值:").grid(row=1, column=0, padx=(5, 5), pady=2, sticky='w')
@@ -2078,9 +2080,9 @@ class SpectrumUploadTab:
         row.pack(fill='x', pady=1)
 
         check_var = tk.BooleanVar(value=self.spectrum_check_params[param_type]["enabled"])
-        cb = ttkb.Checkbutton(row, text=label, variable=check_var,
+        cb = ttk.Checkbutton(row, text=label, variable=check_var,
                               command=lambda pt=param_type, cv=check_var: self.on_spectrum_check_change(pt, cv),
-                              bootstyle="primary")
+                              style=self.app.large_cb_style)
         cb.pack(side='left')
 
         ttk.Label(row, text="数").pack(side='left', padx=(4, 0))
@@ -2111,10 +2113,23 @@ class SpectrumUploadTab:
         self.spectrum_check_params[param_type][param_name] = value
         self.app.mark_modified()
 
-    def on_report_path_change(self, event=None):
-        """定量报告上传地址改变"""
-        self.quantitative_report_path = self.report_path_var.get()
+    def on_instrument_type_change(self, event=None):
+        """仪器类型改变"""
+        self.instrument_type = self.instrument_type_var.get()
         self.app.mark_modified()
+
+    def on_report_parse_enabled_change(self):
+        """报告解析启用复选框状态改变"""
+        self.report_parse_enabled = self.report_parse_enabled_var.get()
+        self._update_report_parse_inputs_state()
+        self.app.mark_modified()
+
+    def _update_report_parse_inputs_state(self):
+        """仪器类型/N.D判断值/标记物 仅在「非无需谱图 且 勾选启用」时可编辑。"""
+        active = (self.mode_var.get() != "no_spectrum") and self.report_parse_enabled_var.get()
+        self.instrument_type_combo.config(state="readonly" if active else "disabled")
+        self.threshold_entry.config(state="normal" if active else "disabled")
+        self.marker_entry.config(state="normal" if active else "disabled")
 
     def on_threshold_change(self, event=None):
         """未检出判断值改变"""
@@ -2151,38 +2166,17 @@ class SpectrumUploadTab:
         """模式改变时的处理"""
         mode = self.mode_var.get()
 
-        # 根据当前选择的模式启用或禁用本地上传模式区域
         if mode == "no_spectrum":
             # 无需谱图：禁用全部参数
             self.set_local_upload_frame_state("disabled")
-            self.report_path_entry.config(state="disabled")
-            self.threshold_entry.config(state="disabled")
-            self.marker_entry.config(state="disabled")
             self.local_upload_frame.configure(text="本地参数设置(禁用)")
-        elif mode == "local_upload" or mode == "local_acquisition":
-            # 本地上传和本地+采集模式都启用本地上传模式区域
+        else:
+            # 本地上传：启用全部参数（含报告解析：仪器类型/N.D判断值/标记物）
             self.set_local_upload_frame_state("normal")
-
-            # 只有在本地+采集模式下才启用采集参数
-            if mode == "local_acquisition":
-                self.report_path_entry.config(state="normal")
-                self.threshold_entry.config(state="normal")
-                self.marker_entry.config(state="normal")
-            else:
-                self.report_path_entry.config(state="disabled")
-                self.threshold_entry.config(state="disabled")
-                self.marker_entry.config(state="disabled")
-
-            # 更新标签框标题
             self.local_upload_frame.configure(text="本地参数设置")
-        else:  # data_acquisition
-            # 数据采集模式：启用报告上传IP，禁用其他采集参数
-            self.set_local_upload_frame_state("disabled")
-            # 但特别启用报告上传IP输入框
-            self.report_path_entry.config(state="normal")
 
-            # 更新标签框标题，添加"(禁用)"提示
-            self.local_upload_frame.configure(text="本地参数设置(禁用)")
+        # 报告解析三项再按复选框门控
+        self._update_report_parse_inputs_state()
 
         # 标记已修改
         self.app.mark_modified()
@@ -2207,11 +2201,12 @@ class SpectrumUploadTab:
         return {
             "upload_mode": self.mode_var.get(),
             "spectrum_check_params": self.spectrum_check_params,
-            "quantitative_report_path": self.quantitative_report_path,
+            "instrument_type": self.instrument_type,  # 仪器类型(GCMS/GC/LC/LCMSMS/XRF/ICP)
             "undetected_threshold": self.undetected_threshold,
             "marker": self.marker,  # 新增标记物参数
             "clear_spectrum": self.clear_spectrum,  # 新增：录入前是否清空谱图
-            "spectrum_filter_rules": self.spectrum_filter_rules  # 按项目筛选谱图
+            "spectrum_filter_rules": self.spectrum_filter_rules,  # 按项目筛选谱图
+            "report_parse_enabled": self.report_parse_enabled  # 报告解析启用开关
         }
 
     def set_settings(self, settings):
@@ -2250,10 +2245,15 @@ class SpectrumUploadTab:
                         keyword_var.set(kw)
                         self.spectrum_check_params[param_type]["keyword"] = kw
 
-        # 设置新增参数
-        if "quantitative_report_path" in settings:
-            self.quantitative_report_path = settings["quantitative_report_path"]
-            self.report_path_var.set(self.quantitative_report_path)
+        # 设置仪器类型
+        if "instrument_type" in settings:
+            self.instrument_type = settings["instrument_type"]
+            self.instrument_type_var.set(self.instrument_type)
+
+        # 设置报告解析启用开关
+        if "report_parse_enabled" in settings:
+            self.report_parse_enabled = bool(settings["report_parse_enabled"])
+            self.report_parse_enabled_var.set(self.report_parse_enabled)
 
         if "undetected_threshold" in settings:
             self.undetected_threshold = settings["undetected_threshold"]
@@ -2278,7 +2278,7 @@ class SpectrumUploadTab:
             self.refresh_spf_tree()
             if self.spectrum_filter_rules:
                 self.spf_enable_var.set(True)
-                self.spf_frame.pack(fill='x', pady=(0, 5))
+                self.spf_frame.pack(fill='x', pady=(0, 5), before=self.report_parse_toggle_frame)
 
         # 更新显示
         self.on_mode_change()
@@ -2834,6 +2834,8 @@ class OtherParamsTab:
             width=80  # 增加宽度
         )
         self.preparation_entry.pack(side='left')
+        ttk.Label(self.preparation_frame, text="（多个标液用逗号分隔，如 D-9210,D-9211）",
+                  foreground="gray").pack(side='left', padx=(5, 0))
 
         # 绑定配制序号变化事件
         self.preparation_number_var.trace('w', self.on_preparation_number_change)
