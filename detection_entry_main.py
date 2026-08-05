@@ -17,7 +17,7 @@ from login import MultiUserLoginSystem
 from detection_entry_api import DetectionAPI, build_grouped_experiment_data
 import threading
 import paths
-from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor
+from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor, filter_samples_by_code
 from alias_evaluator import evaluate_alias
 
 # ponytail: 与 SequenceMaster._strip_parallel_suffix 同逻辑；两模块刻意解耦不互导，故复制。
@@ -223,7 +223,7 @@ class DetectionEntrySystem:
         row1_frame.pack(fill=tk.X, pady=5)
 
         ttk.Label(row1_frame, text="样品编号:").pack(side=tk.LEFT)
-        self.sample_code_var = tk.StringVar(value="TR26070030")  # 测试期默认值，上线前去掉
+        self.sample_code_var = tk.StringVar(value="")  # 默认空；原测试期默认 TR26070030 会污染"只按检测方法"查询(被当成 keyword 与方法取交集)
         sample_code_entry = ttk.Entry(row1_frame, textvariable=self.sample_code_var, width=20)
         sample_code_entry.pack(side=tk.LEFT, padx=(5, 20))
 
@@ -827,9 +827,9 @@ class DetectionEntrySystem:
             return
 
         self.update_status(f"正在解析谱图 {os.path.basename(pdf_path)} ...", "blue")
-        threading.Thread(target=self._acquire_worker, args=(pdf_path, project_specs, dil_path), daemon=True).start()
+        threading.Thread(target=self._acquire_worker, args=(pdf_path, project_specs, dil_path, sample_code), daemon=True).start()
 
-    def _acquire_worker(self, pdf_path, project_specs, dil_path=None):
+    def _acquire_worker(self, pdf_path, project_specs, dil_path=None, sample_code=''):
         """子线程：解析正常 PDF（+ 可选稀释报告），逐样品/逐项目取别名求值，回主线程填表。
         ICP 一 PDF 多样品(A/B 平行样)：按样品序号 slot 分别求值，回填时落对应平行槽。"""
         try:
@@ -837,6 +837,7 @@ class DetectionEntrySystem:
             if not samples:
                 self.root.after(0, lambda: messagebox.showwarning("数据采集", "未从谱图解析到化合物，请检查报告格式"))
                 return
+            samples = filter_samples_by_code(samples, sample_code)  # ICP 多报验批共一份 PDF：只取当前样品段
             diluted = None
             dilution_factor = 1.0
             if dil_path:
@@ -1733,7 +1734,7 @@ class DetectionEntrySystem:
         filtered_projects = all_projects
 
         # 应用额外的客户端过滤（确保完全匹配）
-        filtered_projects = self.apply_client_filters(filtered_projects, sample_code, project_name, method_name,
+        filtered_projects = self.apply_client_filters(filtered_projects, sample_code, project_name,
                                                       retest_checked)
         self.filtered_projects = filtered_projects
 
@@ -1744,7 +1745,7 @@ class DetectionEntrySystem:
         self.update_status(f"查询完成: 找到 {len(filtered_projects)} 条记录", "green")
         self.result_count_var.set(f"查询结果: {len(filtered_projects)} 条")
 
-    def apply_client_filters(self, projects, sample_code, project_name, method_name, retest_checked):
+    def apply_client_filters(self, projects, sample_code, project_name, retest_checked):
         """在客户端应用额外的过滤条件（确保完全匹配）"""
         filtered = projects
 
@@ -1757,19 +1758,19 @@ class DetectionEntrySystem:
             # 使用更宽松的匹配方式，确保包含关键字的项目都能被找到
             filtered = [p for p in filtered if project_name.lower() in p.get('projectName', '').lower()]
 
-        # 检测方法过滤（模糊匹配）- 只有当输入了检测方法时才应用
-        if method_name:
-            filtered = [p for p in filtered if method_name.lower() in p.get('standardNo', '').lower()]
+        # 检测方法过滤已移除：服务端 query_samples_by_conditions 已按 decideProjectMethodName
+        # 过滤且结果精准，客户端再按 standardNo 子串过滤会误杀（standardNo 不含 subMethodName
+        # 如「单组份」，导致完整方法名查询 389 条全被删）。
 
-        # 注销复测过滤 - 基于oldSampleProjectId字段 - 只有当复选框被选中时才应用
+        # 注销复测过滤 - 基于 oldSampleProjectId 字段:勾选=仅复测(有值),未勾选=仅非复测(为空)
         if retest_checked:
             # 只显示 oldSampleProjectId 有值的记录（注销复测）
             filtered = [p for p in filtered if p.get('oldSampleProjectId') is not None]
             if not filtered:
                 pass
         else:
-            # 复选框未选中时，显示所有记录（包括注销复测和非注销复测）
-            pass  # 不过滤
+            # 未勾选：只显示非复测记录（oldSampleProjectId 为空）
+            filtered = [p for p in filtered if p.get('oldSampleProjectId') is None]
 
         return filtered
 

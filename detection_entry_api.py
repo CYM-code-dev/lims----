@@ -227,24 +227,84 @@ class DetectionAPI:
             return None, str(e)
 
 
-    def get_solution_configure_id(self, configure_order, log_func=None):
-        """根据配置序号查询配置ID - 严格审核检查版本，完全阻止未审核提交"""
+    def get_solution_configure_id_history(self, configure_order, sample_time, log_func=None):
+        """查历史标液(dtSolutionConfigure/getSolutionAdata, status=1&configStatus=1)。
+        LIMS 前端不支持按 D-XXXX 关键字搜索 → 逐页拉取(每页100, 上限20页)后客户端匹配 configureOrder。
+        业务规则：称样时间(分析开始时间) ≤ validityDate 才可选用于录入。
+        返回 (configure_id, error_msg)。"""
         try:
-            # 只使用动态查询（包含严格审核检查）
+            base_params = {
+                "_search": "false",
+                "pageSize": "100", "sidx": "", "sord": "asc",
+                "solutionName": "", "solutionCode": "", "customType": "",
+                "configStatus": "1", "controlledNo": "", "storageLocation": "",
+                "configureStartDate": "", "configureEndDate": "",
+                "configureUserName": "", "receiveUserName": "", "auditStatus": "",
+                "status": "1", "type": "SOLUTION_TYPE_D",
+                "keyword": "",
+                "pid": self.get_user_pid(), "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+            }
+            headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                'Referer': f"{self.login_system.base_url}/web/detectionResultCheckInCalc.html",
+                'X-Requested-With': 'XMLHttpRequest',
+            }
+            page_size = 100
+            total_seen = 0
+            # ponytail: 上限20页(2000条)，标液历史超此规模再调大；LIMS 不支持 D-XXXX 搜索故逐页客户端匹配
+            for page_no in range(1, 21):
+                params = dict(base_params, nd=int(time.time() * 1000), pageNo=str(page_no))
+                response = self.login_system.session.get(
+                    f"{self.login_system.base_url}/detectionManager/manager/dtSolutionConfigure/getSolutionAdata",
+                    params=params, headers=headers, verify=False, timeout=30)
+                if response.status_code != 200:
+                    return None, f"HTTP {response.status_code}"
+                result = response.json()
+                if not result.get('success'):
+                    return None, (result.get('errorCtx') or {}).get('errorMsg', '未知错误')
+                vo_list = result.get('resultData', {}).get('voList', [])
+                total_seen += len(vo_list)
+                vo = next((s for s in vo_list if s.get('configureOrder') == configure_order), None)
+                if vo:
+                    if not vo.get('auditUserName'):
+                        return None, "未审核"
+                    # 有效期校验：称样时间 ≤ validityDate。ISO 日期字符串字典序 = 时间序
+                    vd = (vo.get('validityDate') or '').strip()
+                    if vd and sample_time is not None:
+                        stime = sample_time.strftime("%Y-%m-%d") if hasattr(sample_time, 'strftime') else str(sample_time)[:10]
+                        if stime > vd:
+                            return None, f"已过期(有效期{vd}，称样时间{stime})"
+                    return str(vo.get('id')), None
+                if len(vo_list) < page_size:  # 最后一页
+                    break
+            return None, f"未找到配置序号(历史标液翻页{total_seen}条)"
+        except Exception as e:
+            if log_func:
+                log_func(f"查询历史标液异常: {str(e)}")
+            return None, str(e)
+
+    def get_solution_configure_id(self, configure_order, log_func=None, sample_time=None):
+        """根据配置序号查询配置ID。先查当前可用标液(ocExperiment)；找不到再查历史标液
+        (dtSolutionConfigure)，并按「称样时间 ≤ 有效期」校验。sample_time 用于历史有效期校验。"""
+        try:
             configure_id, error_msg = self.get_solution_configure_id_dynamic(configure_order, log_func)
 
-            # 如果检测到未审核错误，立即返回
+            # 未审核立即返回（当前/历史都不得用未审核标液）
             if error_msg == "未审核":
                 if log_func:
                     log_func(f"配置序号 {configure_order} 未审核")
                 return None, error_msg
 
-            # 如果动态查询成功返回配置ID，返回配置ID
             if configure_id:
                 return configure_id, None
 
-            # 其他所有情况都阻止提交
-            return None, error_msg
+            # 当前可用列表没有 → 查历史标液(按有效期校验)
+            hid, herr = self.get_solution_configure_id_history(configure_order, sample_time, log_func)
+            if hid:
+                return hid, None
+            return None, herr or error_msg or "未找到配置序号"
 
         except Exception as e:
             if log_func:
@@ -558,8 +618,12 @@ class DetectionAPI:
         except Exception as e:
             return None
 
-    def submit_experiment_data(self, experiment_data, project_name, log_func=None):
-        """提交实验数据 - 修复版本，确保与前端请求一致"""
+    def submit_experiment_data(self, experiment_data, project_name, log_func=None, require_signature=False):
+        """提交实验数据 - 修复版本，确保与前端请求一致
+
+        require_signature=True 时改调 submitOcExperiment（提交签名/推进工作流），
+        否则 saveOcExperiment（仅保存）。两接口请求体一致。
+        """
         try:
             if not experiment_data:
                 return False, None
@@ -578,8 +642,9 @@ class DetectionAPI:
                 'Accept-Language': 'zh-CN,zh;q=0.9'
             }
 
+            endpoint = "submitOcExperiment" if require_signature else "saveOcExperiment"
             response = self.login_system.session.post(
-                f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/saveOcExperiment",
+                f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/{endpoint}",
                 json=experiment_data,
                 headers=headers,
                 verify=False,
@@ -1233,15 +1298,55 @@ class DetectionAPI:
         except Exception as e:
             return {}
 
+    def get_oc_compare_show_data(self, sample_code, items, log_func=None):
+        """读取"对比展示"数据：给定样品号 + 组分项目名列表(items)，返回各组分已录入实验记录
+        (含 projectName/reportValue/calculatedValue/serialNumber/sampleCode …)。
+        用于"总和"项目取各组分报告值。响应双层 resultData：resp['resultData']['resultData'] = 记录列表；失败/空返回 []。"""
+        try:
+            params = {
+                "sampleCodes": sample_code,
+                "items": json.dumps(items, ensure_ascii=False),
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+                "_": int(time.time() * 1000),
+            }
+            headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                'Referer': f"{self.login_system.base_url}/web/detectionResultCheckInCalc.html",
+                'X-Requested-With': 'XMLHttpRequest',
+            }
+            response = self.login_system.session.get(
+                f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/getOcCompareShowData",
+                params=params, headers=headers, verify=False, timeout=30,
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    outer = result.get('resultData') or {}
+                    return outer.get('resultData') or []
+                if log_func:
+                    log_func(f"getOcCompareShowData success=false: {result.get('errorCtx')}")
+                return []
+            if log_func:
+                log_func(f"getOcCompareShowData HTTP {response.status_code}: {response.text[:200]}")
+            return []
+        except Exception as e:
+            if log_func:
+                log_func(f"getOcCompareShowData 异常: {e}")
+            return []
+
     def query_samples_by_conditions(self, sample_code=None, project_name=None, method_name=None, retest_checked=False,
-                                    log_func=None, exact_match=False):
-        """通过多个条件查询样品信息 - 支持精确匹配和模糊查询"""
+                                    log_func=None, exact_match=False, days=30):
+        """通过多个条件查询样品信息 - 支持精确匹配和模糊查询
+        days: 受理日期窗口(天)，默认30；方法池查询可按方法文件配置收窄提速，逐样品精确查保持30(系统可查上限)。"""
         if not self.login_system.current_user:
             return []
 
         try:
             today = datetime.now()
-            one_month_ago = today - timedelta(days=30)
+            one_month_ago = today - timedelta(days=days)
 
             # 优化分页参数
             page_size = 500
@@ -1281,7 +1386,6 @@ class DetectionAPI:
                 if retest_checked:
                     params["cancelRetesting"] = "1"
 
-                start_time = time.time()
                 response = self.login_system.session.get(
                     f"{self.login_system.base_url}/detectionManager/manager/resultCheckIn/pagePCObjAndSample",
                     params=params,
@@ -1290,9 +1394,8 @@ class DetectionAPI:
                         'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInListMgt.html'
                     },
                     verify=False,
-                    timeout=15
+                    timeout=60
                 )
-                request_time = time.time() - start_time
 
                 if response.status_code == 200:
                     result = response.json()
@@ -1348,6 +1451,8 @@ class DetectionAPI:
             return all_projects
 
         except Exception as e:
+            if log_func:
+                log_func(f"[API异常] {type(e).__name__}: {str(e)[:200]}")
             return []
 
     def get_all_configs(self, sample_project_ids, method_standard_no, result_checkin_ids=None, sample_id=None,
@@ -2265,7 +2370,7 @@ def _match_fixed_params(fixed_params, project):
     return overrides
 
 
-def build_grouped_experiment_data(host, projects, experiment_code, method_name):
+def build_grouped_experiment_data(host, projects, experiment_code, method_name, experiment_process_override=None):
     """构建分组实验数据 - 包含完整标准物质信息（共享实现，阶段0从 detection_entry_main 抽出）。
 
     host 需提供: login_system(.current_user/.users)、experiment_config、equipment_config、
@@ -2303,7 +2408,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
     round_method = self.experiment_config.get('roundMethod')
     round_method_level_json = self.experiment_config.get('roundMethodLevelJson')
     calc_method = self.experiment_config.get('calcMethod')
-    experiment_process = self.experiment_config.get('experimentProcess')
+    experiment_process = experiment_process_override or self.experiment_config.get('experimentProcess')
 
     # 使用保存的实际方法名称和方法ID（可能经过子方法切换）
     actual_method_name = getattr(self, 'actual_method_name', method_name)
@@ -2508,9 +2613,12 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name):
                     else:
                         dynamic_fields[col_code] = default_val
 
-                # 固定参数：手动模式仅当用户未填时补全(尊重手填)；序列(无头)模式覆盖列默认值(无真实输入)
+                # 固定参数：仅当该列无真实值(手填或报告解析填入)时补全默认值；有值则尊重不覆盖。
+                # 序列(无头)模式不再强覆盖——报告解析已把实测浓度填进 data_fields(如「样品浓度C」)，
+                # 固定参数(默认 <检出限)只应兜底无值列(如试剂空白C₀、校正系数e)，不应冲掉实测浓度
+                # (否则可溶性汞等由 样品浓度C 计算的结果会被钉死在 <0.004)。
                 _cn = _norm_cn(col_name)
-                if _cn and _cn in fixed_overrides and (not user_value or getattr(self, "is_headless", False)):
+                if _cn and _cn in fixed_overrides and not user_value:
                     dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
                 # 构建selectmap数据 - 与前端保持一致

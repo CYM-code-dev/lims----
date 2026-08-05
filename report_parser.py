@@ -118,7 +118,8 @@ class ChemicalReportAnalyzer:
         # 改进浓度匹配模式
         self.concentration_pattern = re.compile(r'(\d+\.\d+)\s*(ppm|mg/L|μg/mL|ng/ml)', re.IGNORECASE)
         self.concentration_pattern_int = re.compile(r'(\d+)\s*(ppm|mg/L|μg/mL|ng/ml)', re.IGNORECASE)
-        self.nd_pattern = re.compile(r'N\.?\s*D\.?', re.IGNORECASE)
+        # ponytail: 前后向否定断言保证 ND/N.D. 是独立标记，否则 "I{nd}eno"、"E{nd}osulfan" 等化合物名会被误判为未检出
+        self.nd_pattern = re.compile(r'(?<![A-Za-z])N\.?\s*D\.?(?![A-Za-z])', re.IGNORECASE)
         self.uncorrected_pattern = re.compile(r'未校正', re.IGNORECASE)
 
         # 有效的化合物名称模式 - 使用更宽松的正则表达式
@@ -1405,6 +1406,31 @@ def parse_pdf_report_multi(file_path):
     return [('A', compounds)], _extract_column_headers(content)
 
 
+def filter_samples_by_code(samples, sample_code):
+    """从 parse_pdf_report_multi 的 samples=[(样品识别码, compounds|值), ...] 中，只保留属于
+    sample_code 的段。ICP 一份 PDF 可能含多个报验批样品——样品识别码形如 TN26070722001A
+    (报验编号+3位小号+平行后缀A/B)，去末尾字母得 base=TN26070722001。
+
+    匹配用前缀而非精确相等：sample_code 可能只到报验编号(无小号，如目录+单PDF 时由文件名
+    TN26070722.pdf 解析得 sc='TN26070722')，也可能含小号('TN26070722001')。前缀匹配两种都成立，
+    且仍能把 21 批(TN26070721001A)与 22 批(TN26070722001A)区分开(报验编号不同)。
+
+    base 为空(如非 ICP 报告的 'A'、'Blank'/'STD' 等纯字母识别码)不参与匹配，避免 ''.startswith 误命中。
+    无任何段匹配时原样返回：兼容非 ICP 报告(parse_pdf_report_multi 对单样品报告返回 [('A', ...)])，
+    避免回归。对 parse_pdf_report_meta 的 [(sid, 值), ...] 同样适用。"""
+    def _base(sid):
+        return re.sub(r'[A-Za-z]+$', '', (sid or '').strip())
+    target = (sample_code or '').strip()
+    if not target:
+        return samples
+    matched = []
+    for s in samples:
+        sb = _base(s[0])
+        if sb and (sb.startswith(target) or target.startswith(sb)):
+            matched.append(s)
+    return matched if matched else samples
+
+
 def parse_pdf_report(file_path):
     """无GUI解析单个谱图PDF -> (compounds, headers)。多样品报告取首个样品（向后兼容旧调用/自检/稀释路径）。"""
     samples, headers = parse_pdf_report_multi(file_path)
@@ -1418,6 +1444,15 @@ if __name__ == "__main__":
     assert _dilution_factor('TS24031359001A-50X.pdf') == 50.0
     assert _dilution_factor('TS24031359001A-2x.pdf') == 2.0
     assert _dilution_factor('TS24031359001A.pdf') == 1.0
+    # ponytail: 自检——多报验批样品段按 sampleCode 过滤(21/22 批共一份 PDF)
+    _src = [('TN26070721001A', {}), ('TN26070721001B', {}),
+            ('TN26070722001A', {}), ('TN26070722001B', {})]
+    _fs = filter_samples_by_code(_src, 'TN26070722001')  # sc 含小号
+    assert len(_fs) == 2 and _fs[0][0] == 'TN26070722001A' and _fs[1][0] == 'TN26070722001B', _fs
+    _fs2 = filter_samples_by_code(_src, 'TN26070722')  # sc 只到报验编号(文件名解析)
+    assert len(_fs2) == 2 and _fs2[0][0] == 'TN26070722001A', _fs2
+    assert filter_samples_by_code([('A', {})], 'TN26070722001') == [('A', {})]  # 非 ICP 回退
+    assert filter_samples_by_code([('Blank', {})], 'TN26070722001') == [('Blank', {})]  # 空基不误匹配
     # ponytail: 自检——ICP 样品初始质量提取(三份报告存在时；不存在则跳过)
     import glob as _glob, os as _os
 

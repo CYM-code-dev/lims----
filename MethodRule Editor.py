@@ -3,7 +3,7 @@ import tkinter.font as tkfont
 from tkinter import ttk
 from tkinter import messagebox, filedialog
 import ttkbootstrap as ttkb  # 档1: 现代主题(sandstone-light)，ttk 控件自动套用
-import yaml
+from method_file import load_method, save_method
 import os
 import paths
 import random
@@ -38,13 +38,14 @@ def _make_large_cb_style(scale=1.3):
         return None
 
 
-def _setup_cell_tooltip(tree, columns):
-    """为 tree 指定列悬停显示单元格全部内容(项目/检测方法/设备编号等长文本列)。"""
+def _setup_cell_tooltip(tree, columns, wraplength=420):
+    """为 tree 指定列悬停显示单元格全部内容(项目/检测方法/设备编号等长文本列)。
+    wraplength: 提示框折行宽度(像素)，长文本列(如试验过程)可调大以免提示过高。"""
     tip = tk.Toplevel(tree)
     tip.withdraw()
     tip.overrideredirect(True)
     label = ttk.Label(tip, background="#ffffe0", relief="solid", borderwidth=1,
-                      padding=(6, 3), wraplength=420)
+                      padding=(6, 3), wraplength=wraplength)
     label.pack()
     last = [None]  # (item, col) 避免同一格反复重绘
 
@@ -103,7 +104,6 @@ class QueryTab:
         self.app = app
         self.query_rules = []
         self.exclusion_rules = []  # 新增：排除项目规则
-        self.sum_rules = []  # 新增：总和规则
         self.create_tab()
 
     def create_tab(self):
@@ -114,11 +114,29 @@ class QueryTab:
         # 查询条件规则管理区域
         self.create_query_rules_management(query_frame)
 
+        # 查询策略(方法池 vs 按样品；日期窗口) —— 方法文件级，存 query_rules 外层
+        strat = ttk.Frame(query_frame)
+        strat.pack(side='bottom', fill='x', padx=5, pady=(2, 4))
+        strat_row = ttk.Frame(strat)
+        strat_row.pack(fill='x')
+        ttk.Label(strat_row, text="按样品查询阈值:").pack(side='left', padx=(0, 3))
+        self.sample_parallel_threshold_var = tk.StringVar(value="20")
+        e_threshold = ttk.Entry(strat_row, width=6, textvariable=self.sample_parallel_threshold_var)
+        e_threshold.pack(side='left', padx=(0, 12))
+        ttk.Label(strat_row, text="日期窗口(天):").pack(side='left', padx=(0, 3))
+        self.date_window_days_var = tk.StringVar(value="30")
+        e_days = ttk.Entry(strat_row, width=6, textvariable=self.date_window_days_var)
+        e_days.pack(side='left', padx=(0, 12))
+        ttk.Label(strat, text="样品数≤阈值→按样品并行查；>阈值→方法池。日期窗口仅对方法池生效",
+                  foreground="gray").pack(fill='x')
+        for _e in (e_threshold, e_days):
+            _e.bind("<KeyRelease>", lambda _ev: self.app.mark_modified())
+
     def create_query_rules_management(self, parent):
         """创建查询条件规则管理区域"""
         # 创建规则管理框架
         rules_frame = ttk.LabelFrame(parent, text="查询条件规则管理", padding=5)
-        rules_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        rules_frame.pack(fill='x', padx=5, pady=5)  # 不 expand：收紧到内容自然高度，treeview 按实际行数显示
 
         # 创建规则输入区域 - 分两行：第一行文本输入(描述/项目/检测方法)，第二行选项与按钮(Retest/最大选中数量/Mode/添加)
         input_frame = ttk.Frame(rules_frame)
@@ -167,7 +185,7 @@ class QueryTab:
 
         # 创建规则表格 - 列顺序与输入框一致：项目/检测方法/Retest/最大选中数量；Mode 为非输入项置末
         columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode")
-        self.query_rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=8)
+        self.query_rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=10)
 
         # 设置列标题和宽度
         # 短列(No/Retest/Max/Mode)固定窄列宽不随窗口拉伸；文本列(项目/检测方法)随窗口伸缩
@@ -200,7 +218,7 @@ class QueryTab:
         # 项目/检测方法 列悬停显示全部内容
         _setup_cell_tooltip(self.query_rules_tree, ("项目", "检测方法"))
 
-        # 创建规则操作按钮 - 新增上移、下移按钮，以及排除和总和按钮
+        # 创建规则操作按钮 - 新增上移、下移按钮，以及排除按钮
         button_frame = ttk.Frame(rules_frame)
         button_frame.pack(fill='x', pady=3)
 
@@ -209,9 +227,8 @@ class QueryTab:
         ttkb.Button(button_frame, text="下移", command=self.move_query_rule_down, bootstyle="secondary").pack(side='left', padx=2)
         ttkb.Button(button_frame, text="删除", command=self.delete_query_rule, bootstyle="danger").pack(side='left', padx=2)
 
-        # 右侧按钮 - 新增排除和总和按钮
+        # 右侧按钮 - 排除按钮
         ttkb.Button(button_frame, text="排除", command=self.show_exclusion_dialog, bootstyle="secondary").pack(side='right', padx=2)
-        ttkb.Button(button_frame, text="总和", command=self.show_sum_dialog, bootstyle="secondary").pack(side='right', padx=2)
 
     def show_exclusion_dialog(self):
         """显示排除项目设置对话框"""
@@ -412,182 +429,6 @@ class QueryTab:
         entry.bind("<FocusOut>", save_edit)
         entry.bind("<Escape>", cancel_edit)
 
-    def show_sum_dialog(self):
-        """显示总和设置对话框"""
-        dialog = ttkb.Toplevel(self.parent)
-        dialog.title("总和设置")
-        dialog.geometry("1020x760")  # 增加宽度以容纳更多内容
-        dialog.transient(self.parent)
-        dialog.grab_set()
-
-        # 允许对话框调整大小
-        dialog.resizable(True, True)
-
-        # 计算居中位置
-        self.center_dialog(dialog, 1020, 760)
-
-        # 主容器
-        main_frame = ttk.Frame(dialog, padding=10)
-        main_frame.pack(fill='both', expand=True)
-        main_frame.columnconfigure(0, weight=1)
-
-        # 创建输入区域 - 所有控件在一行
-        input_frame = ttk.LabelFrame(main_frame, text="添加总和条款", padding=5)
-        input_frame.pack(fill='x', pady=(0, 5))
-
-        # 配置列权重，使所有输入框都能扩展
-        input_frame.columnconfigure(0, weight=0)  # 项目标签
-        input_frame.columnconfigure(1, weight=3)  # 项目输入框 - 增加权重
-        input_frame.columnconfigure(2, weight=0)  # 方法标签
-        input_frame.columnconfigure(3, weight=3)  # 方法输入框 - 增加权重
-        input_frame.columnconfigure(4, weight=0)  # ID1标签
-        input_frame.columnconfigure(5, weight=1)  # ID1输入框 - 减少权重
-        input_frame.columnconfigure(6, weight=0)  # ID2标签
-        input_frame.columnconfigure(7, weight=1)  # ID2输入框 - 减少权重
-        input_frame.columnconfigure(8, weight=0)  # 添加按钮
-
-        # 项目输入 - 增加初始宽度
-        ttk.Label(input_frame, text="项目:").grid(row=0, column=0, padx=(0, 0), pady=3, sticky='w')
-        sum_project_var = tk.StringVar()
-        sum_project_entry = ttk.Entry(input_frame, textvariable=sum_project_var, width=15)
-        sum_project_entry.grid(row=0, column=1, padx=(0, 10), pady=3, sticky='ew')
-
-        # 检测方法输入 - 增加初始宽度
-        ttk.Label(input_frame, text="检测方法:").grid(row=0, column=2, padx=(0, 0), pady=3, sticky='w')
-        sum_method_var = tk.StringVar()
-        sum_method_entry = ttk.Entry(input_frame, textvariable=sum_method_var, width=15)
-        sum_method_entry.grid(row=0, column=3, padx=(0, 10), pady=3, sticky='ew')
-
-        # ID1输入 - 减少初始宽度
-        ttk.Label(input_frame, text="ID1:").grid(row=0, column=4, padx=(0, 0), pady=3, sticky='w')
-        sum_id1_var = tk.StringVar()
-        sum_id1_entry = ttk.Entry(input_frame, textvariable=sum_id1_var, width=8)
-        sum_id1_entry.grid(row=0, column=5, padx=(0, 10), pady=3, sticky='ew')
-
-        # ID2输入 - 减少初始宽度
-        ttk.Label(input_frame, text="ID2:").grid(row=0, column=6, padx=(0, 0), pady=3, sticky='w')
-        sum_id2_var = tk.StringVar()
-        sum_id2_entry = ttk.Entry(input_frame, textvariable=sum_id2_var, width=8)
-        sum_id2_entry.grid(row=0, column=7, padx=(0, 10), pady=3, sticky='ew')
-
-        # 添加按钮
-        def add_sum_rule():
-            project = sum_project_var.get().strip()
-            method = sum_method_var.get().strip()
-            id1 = sum_id1_var.get().strip()
-            id2 = sum_id2_var.get().strip()
-
-            # 修改验证逻辑：只要有一个字段不为空即可，不要求所有字段都必须填写
-            if not project and not method and not id1 and not id2:
-                messagebox.showwarning("输入错误", "请至少填写一个字段")
-                return
-
-            # 检查是否已存在相同的规则
-            new_rule = {
-                "project": project,
-                "method": method,
-                "id1": id1,
-                "id2": id2
-            }
-
-            # 检查重复
-            for existing_rule in self.sum_rules:
-                if (existing_rule.get("project", "") == project and
-                        existing_rule.get("method", "") == method and
-                        existing_rule.get("id1", "") == id1 and
-                        existing_rule.get("id2", "") == id2):
-                    messagebox.showwarning("重复条目", "已存在相同的总和条款，无法重复添加")
-                    return
-
-            self.sum_rules.append(new_rule)
-            refresh_sum_list()
-
-            # 清空输入框
-            sum_project_var.set("")
-            sum_method_var.set("")
-            sum_id1_var.set("")
-            sum_id2_var.set("")
-
-            # 标记已修改
-            self.app.mark_modified()
-
-        ttkb.Button(input_frame, text="添加", command=add_sum_rule, bootstyle="secondary").grid(row=0, column=8, padx=5, pady=3, sticky='e')
-
-        ttkb.Button(input_frame, text="添加", command=add_sum_rule, bootstyle="secondary").grid(row=0, column=8, padx=5, pady=3, sticky='e')
-
-        # 总和条款列表
-        list_frame = ttk.LabelFrame(main_frame, text="已添加的总和条款", padding=5)
-        list_frame.pack(fill='both', expand=True, pady=(0, 5))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-
-        # 创建列表
-        columns = ("项目", "检测方法", "ID1", "ID2")
-        sum_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
-
-        # 设置列宽 - 增加项目和方法列宽，减少ID1和ID2列宽
-        sum_tree.heading("项目", text="项目", anchor="w")
-        sum_tree.column("项目", width=190, anchor="w")
-        sum_tree.heading("检测方法", text="检测方法", anchor="w")
-        sum_tree.column("检测方法", width=190, anchor="w")
-        sum_tree.heading("ID1", text="ID1", anchor="w")
-        sum_tree.column("ID1", width=40, anchor="w")  # 减少ID1列宽
-        sum_tree.heading("ID2", text="ID2", anchor="w")
-        sum_tree.column("ID2", width=40, anchor="w")  # 减少ID2列宽
-
-        # 添加滚动条
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=sum_tree.yview)
-        sum_tree.configure(yscrollcommand=scrollbar.set)
-
-        sum_tree.grid(row=0, column=0, sticky='nsew')
-        scrollbar.grid(row=0, column=1, sticky='ns')
-
-        # 绑定双击事件，用于编辑总和规则
-        sum_tree.bind("<Double-1>", lambda event: self.on_sum_rule_double_click(event, sum_tree))
-
-        def refresh_sum_list():
-            # 清空现有列表
-            for item in sum_tree.get_children():
-                sum_tree.delete(item)
-
-            # 添加总和规则到列表
-            for rule in self.sum_rules:
-                sum_tree.insert("", "end", values=(
-                    rule.get("project", ""),
-                    rule.get("method", ""),
-                    rule.get("id1", ""),
-                    rule.get("id2", "")
-                ))
-
-        # 初始刷新列表
-        refresh_sum_list()
-
-        # 底部按钮框架
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill='x', pady=5)
-
-        # 删除选中按钮
-        def delete_selected_sum():
-            selected_items = sum_tree.selection()
-            if not selected_items:
-                messagebox.showwarning("选择错误", "请先选择要删除的总和条款")
-                return
-
-            if messagebox.askyesno("确认删除", "确定要删除选中的总和条款吗？"):
-                # 从后往前删除
-                for item in reversed(selected_items):
-                    index = sum_tree.index(item)
-                    if 0 <= index < len(self.sum_rules):
-                        del self.sum_rules[index]
-
-                refresh_sum_list()
-                self.app.mark_modified()
-
-        ttkb.Button(button_frame, text="删除选中", command=delete_selected_sum, bootstyle="danger").pack(side='left', padx=5)
-
-        # 关闭按钮
-        ttkb.Button(button_frame, text="关闭", command=dialog.destroy, bootstyle="secondary").pack(side='right', padx=5)
-
     def center_dialog(self, dialog, width, height):
         """将对话框居中显示在主窗口中间"""
         # 更新对话框以确保获取正确的尺寸
@@ -606,65 +447,6 @@ class QueryTab:
 
         # 设置对话框位置
         dialog.geometry(f"{width}x{height}+{x}+{y}")
-    def on_sum_rule_double_click(self, event, tree):
-        """双击总和规则进行编辑"""
-        item = tree.selection()
-        if not item:
-            return
-
-        item = item[0]
-        column = tree.identify_column(event.x)
-        column_index = int(column.replace('#', '')) - 1  # 列索引从0开始
-
-        # 获取当前值
-        current_values = tree.item(item, 'values')
-        current_value = current_values[column_index]
-
-        # 获取单元格坐标
-        x, y, width, height = tree.bbox(item, column)
-
-        # 创建编辑框
-        entry = ttk.Entry(tree)
-        entry.place(x=x, y=y-4, width=width, height=height+8)
-        entry.insert(0, current_value)
-        entry.focus_set()
-
-        def save_edit(event=None):
-            # 获取新值
-            new_value = entry.get()
-
-            # 更新显示
-            new_values = list(current_values)
-            new_values[column_index] = new_value
-            tree.item(item, values=new_values)
-
-            # 更新数据
-            index = tree.index(item)
-            if 0 <= index < len(self.sum_rules):
-                rule = self.sum_rules[index]
-                if column_index == 0:  # 项目列
-                    rule["project"] = new_value
-                elif column_index == 1:  # 检测方法列
-                    rule["method"] = new_value
-                elif column_index == 2:  # ID1列
-                    rule["id1"] = new_value
-                elif column_index == 3:  # ID2列
-                    rule["id2"] = new_value
-
-            # 标记已修改
-            self.app.mark_modified()
-
-            # 销毁编辑框
-            entry.destroy()
-
-        def cancel_edit(event=None):
-            entry.destroy()
-
-        # 绑定事件
-        entry.bind("<Return>", save_edit)
-        entry.bind("<FocusOut>", save_edit)
-        entry.bind("<Escape>", cancel_edit)
-
     # 其他方法保持不变...
     def on_query_rule_double_click(self, event):
         """双击查询条件规则进行编辑"""
@@ -935,10 +717,17 @@ class QueryTab:
 
     def get_rules(self):
         """获取查询规则"""
+        def _iv(var, default):
+            try:
+                n = int((var.get() or "").strip())
+                return n if n > 0 else default
+            except (TypeError, ValueError, tk.TclError):
+                return default
         return {
             "query_rules": self.query_rules,
             "exclusion_rules": self.exclusion_rules,
-            "sum_rules": self.sum_rules
+            "sample_parallel_threshold": _iv(self.sample_parallel_threshold_var, 20),
+            "date_window_days": _iv(self.date_window_days_var, 30),
         }
 
     def set_rules(self, rules_data):
@@ -952,9 +741,12 @@ class QueryTab:
                 rule["max_select"] = ""
         self.query_rules = query_rules
 
-        # 设置排除规则和总和规则
+        # 设置排除规则
         self.exclusion_rules = rules_data.get("exclusion_rules", [])
-        self.sum_rules = rules_data.get("sum_rules", [])
+
+        # 查询策略(方法文件级，默认值兼容旧文件)
+        self.sample_parallel_threshold_var.set(str(rules_data.get("sample_parallel_threshold", 20)))
+        self.date_window_days_var.set(str(rules_data.get("date_window_days", 30)))
 
         self.refresh_query_rules_tree()
 
@@ -1342,10 +1134,14 @@ class WeighingTab:
         # 平行样合并设置：不并入平行样的标记后缀字母(如 M=基体加标)
         parallel_frame = ttk.LabelFrame(weighing_frame, text="平行样合并", padding=5)
         parallel_frame.pack(fill='x', padx=5, pady=(0, 5))
-        ttk.Label(parallel_frame, text="非平行样标记后缀:").pack(side='left', padx=(0, 5))
+        nps_input = ttk.Frame(parallel_frame)
+        nps_input.pack(fill='x')
+        ttk.Label(nps_input, text="非平行样标记后缀:").pack(side='left', padx=(0, 5))
         self.non_parallel_suffixes = tk.StringVar(value="")
-        ttk.Entry(parallel_frame, textvariable=self.non_parallel_suffixes, width=16).pack(side='left', padx=(0, 8))
-        ttk.Label(parallel_frame, text="这些后缀(如 M=基体加标)不计入平行样；其称样量用于谱图filter=该标记的项目，逗号分隔").pack(side='left')
+        ttk.Entry(nps_input, textvariable=self.non_parallel_suffixes, width=16).pack(side='left', padx=(0, 8))
+        # 说明另起一行
+        ttk.Label(parallel_frame, text="这些后缀(如 M=基体加标)不计入平行样；其称样量用于谱图filter=该标记的项目，逗号分隔",
+                  foreground="gray").pack(fill='x', pady=(2, 0))
 
         # 创建内容区域 - 所有模式的内容都显示
         self.weighing_content_frame = ttk.Frame(weighing_frame)
@@ -2337,9 +2133,11 @@ class QueryAppFixed:
         # 创建五个标签页
         self.query_tab = QueryTab(self.notebook, self)
         self.method_tab = MethodTab(self.notebook, self)
-        self.weighing_tab = WeighingTab(self.notebook, self)
-        self.spectrum_tab = SpectrumUploadTab(self.notebook, self)
-        self.other_params_tab = OtherParamsTab(self.notebook, self)  # 新增其他参数标签页
+        self.other_params_tab = OtherParamsTab(self.notebook, self)
+        self.other_params_tab.create_standard_tab()          # 标液设备
+        self.weighing_tab = WeighingTab(self.notebook, self)  # 称样量
+        self.spectrum_tab = SpectrumUploadTab(self.notebook, self)  # 谱图获取
+        self.other_params_tab.create_submit_tab()            # 其他参数(固定参数+提交签名)
 
         # 创建菜单栏（置于标签页上方）
         self.create_menubar()
@@ -2452,8 +2250,7 @@ class QueryAppFixed:
                 self.current_config_file = last_config
                 self.config_file_name = os.path.basename(last_config)
 
-                with open(last_config, 'r', encoding='utf-8') as f:
-                    rules_data = yaml.safe_load(f)
+                rules_data = load_method(last_config)
 
                 # 加载方法切换规则（优先新格式，回退旧格式）
                 switch_rules = rules_data.get("switch_rules")
@@ -2488,13 +2285,12 @@ class QueryAppFixed:
                 return
 
             # 如果没有上次打开的配置文件，尝试加载默认配置文件
-            default_config = "switch_rules.yaml"
+            default_config = "switch_rules.mtd"
             if os.path.exists(default_config):
                 self.current_config_file = default_config
                 self.config_file_name = os.path.basename(default_config)
 
-                with open(default_config, 'r', encoding='utf-8') as f:
-                    rules_data = yaml.safe_load(f)
+                rules_data = load_method(default_config)
 
                 # 加载方法切换规则（优先新格式，回退旧格式）
                 switch_rules = rules_data.get("switch_rules")
@@ -2534,8 +2330,7 @@ class QueryAppFixed:
         if not file_path or not os.path.exists(file_path):
             return False
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                rules_data = yaml.safe_load(f) or {}
+            rules_data = load_method(file_path)
         except Exception as e:
             messagebox.showerror("错误", f"加载方法文件失败:\n{e}")
             return False
@@ -2594,9 +2389,11 @@ class QueryAppFixed:
         # 重建各标签页（构造时以默认空值初始化）
         self.query_tab = QueryTab(self.notebook, self)
         self.method_tab = MethodTab(self.notebook, self)
-        self.weighing_tab = WeighingTab(self.notebook, self)
-        self.spectrum_tab = SpectrumUploadTab(self.notebook, self)
         self.other_params_tab = OtherParamsTab(self.notebook, self)
+        self.other_params_tab.create_standard_tab()          # 标液设备
+        self.weighing_tab = WeighingTab(self.notebook, self)  # 称样量
+        self.spectrum_tab = SpectrumUploadTab(self.notebook, self)  # 谱图获取
+        self.other_params_tab.create_submit_tab()            # 其他参数(固定参数+提交签名)
         # 重置文件状态
         self.current_config_file = None
         self.config_file_name = "未加载配置文件"
@@ -2639,7 +2436,7 @@ class QueryAppFixed:
         self.method_tab.update_rules_display()
 
     def save_all_rules(self):
-        """保存所有规则到当前配置文件（使用YAML格式）"""
+        """保存所有规则到当前配置文件（.mtd 二进制格式）"""
         # 验证谱图检查参数
         spectrum_errors = self.spectrum_tab.validate_spectrum_check_params()
         if spectrum_errors:
@@ -2649,8 +2446,8 @@ class QueryAppFixed:
 
         if not self.current_config_file:
             # 如果没有当前配置文件，使用默认名称
-            self.current_config_file = "switch_rules.yaml"
-            self.config_file_name = "switch_rules.yaml"
+            self.current_config_file = "switch_rules.mtd"
+            self.config_file_name = "switch_rules.mtd"
 
         # 获取各标签页的规则
         method_rules = self.method_tab.get_rules()
@@ -2669,8 +2466,7 @@ class QueryAppFixed:
         }
 
         try:
-            with open(self.current_config_file, 'w', encoding='utf-8') as f:
-                yaml.dump(rules_data, f, allow_unicode=True, indent=2, sort_keys=False)
+            save_method(self.current_config_file, rules_data)
 
             # 保存后重置修改标记
             self.modified = False
@@ -2680,11 +2476,11 @@ class QueryAppFixed:
             messagebox.showerror("保存失败", f"保存规则时出错: {str(e)}")
 
     def save_as_rules(self):
-        """另存所有规则到新的配置文件（使用YAML格式）"""
+        """另存所有规则到新的配置文件（.mtd 二进制格式）"""
         file_path = filedialog.asksaveasfilename(
             title="另存配置文件",
-            defaultextension=".yaml",
-            filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")]
+            defaultextension=".mtd",
+            filetypes=[("方法文件", "*.mtd"), ("All files", "*.*")]
         )
 
         if not file_path:
@@ -2695,19 +2491,18 @@ class QueryAppFixed:
         self.save_all_rules()
 
     def load_rules(self):
-        """从文件加载规则（使用YAML格式）"""
+        """从文件加载规则（.mtd 二进制格式）"""
         file_path = filedialog.askopenfilename(
             title="选择配置文件",
-            defaultextension=".yaml",
-            filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")]
+            defaultextension=".mtd",
+            filetypes=[("方法文件", "*.mtd"), ("All files", "*.*")]
         )
 
         if not file_path:
             return  # 用户取消了选择
 
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                rules_data = yaml.safe_load(f)
+            rules_data = load_method(file_path)
 
             # 加载方法切换规则（优先新格式，回退旧格式）
             switch_rules = rules_data.get("switch_rules")
@@ -2762,30 +2557,53 @@ class OtherParamsTab:
         self.device_number = ""  # 设备编号
         self.equipment_rules = []  # 条件设备匹配规则: [{filename, desc, project_name, device_number}, ...]
         self.fixed_params = []  # 固定参数规则：[{trigger, param_name, param_value}]
-        self.create_tab()
+        self.lab_proc_rules = []  # 条件实验过程规则: [{filename, desc, project_name, lab_proc}]，命中用 lab_proc 覆盖 experimentProcess
+        # 不在 __init__ 建标签页：由 app 调 create_standard_tab / create_submit_tab 分两步建，
+        # 以便「标液设备」与「其他参数」之间插入称样量/谱图获取(标签页顺序见 app 建页处)。
 
-    def create_tab(self):
-        """创建其他参数标签页"""
-        other_frame = ttk.Frame(self.parent)
-        self.parent.add(other_frame, text="其他参数")
+    def create_standard_tab(self):
+        """建「标液设备」标签页(标液类型+仪器设备)。"""
+        std_frame = ttk.Frame(self.parent)
+        self.parent.add(std_frame, text="标液设备")
+        self.create_standard_type_section(std_frame)
+        self.create_instrument_setting_section(std_frame)
 
-        # 创建标液类型设置区域
-        self.create_standard_type_section(other_frame)
+    def create_submit_tab(self):
+        """建「其他参数」标签页(固定参数+提交签名)。"""
+        submit_frame = ttk.Frame(self.parent)
+        self.parent.add(submit_frame, text="其他参数")
 
-        # 创建仪器设置区域
-        self.create_instrument_setting_section(other_frame)
-
-        # 创建固定参数设置区域（默认隐藏，通过复选框控制）
+        # 启用固定参数设置（默认隐藏，通过复选框控制）
         self.fp_enable_var = tk.BooleanVar(value=False)
-        fp_toggle_frame = ttk.Frame(other_frame)
+        fp_toggle_frame = ttk.Frame(submit_frame)
         fp_toggle_frame.pack(fill='x', padx=5, pady=(2, 0))
-        ttk.Checkbutton(fp_toggle_frame, text=" 启用固定参数设置",
+        ttk.Checkbutton(fp_toggle_frame, text=" 启用固定列参数设置",
                         variable=self.fp_enable_var,
                         style=self.app.large_cb_style,
                         command=self.toggle_fixed_params).pack(side='left')
-        self.create_fixed_params_section(other_frame)
+        self.create_fixed_params_section(submit_frame)
         # 加载时初始隐藏（set_settings 里根据数据有无再打开）
         self.fp_frame.pack_forget()
+
+        # 启用条件实验过程 labProc（默认隐藏，通过复选框控制）
+        self.lab_proc_enable_var = tk.BooleanVar(value=False)
+        self.lab_proc_toggle_frame = ttk.Frame(submit_frame)
+        self.lab_proc_toggle_frame.pack(fill='x', padx=5, pady=(2, 0))
+        ttk.Checkbutton(self.lab_proc_toggle_frame, text=" 启用条件实验过程 labProc",
+                        variable=self.lab_proc_enable_var,
+                        style=self.app.large_cb_style,
+                        command=self.toggle_lab_proc).pack(side='left')
+        self.create_lab_proc_section(submit_frame)
+        self.lab_proc_frame.pack_forget()
+
+        # 提交签名：勾选后序列录入完数据改调 submitOcExperiment（提交签名/推进工作流），否则 saveOcExperiment（仅保存）。
+        self.require_signature_var = tk.BooleanVar(value=False)
+        self.sign_frame = ttk.Frame(submit_frame)
+        self.sign_frame.pack(fill='x', padx=5, pady=(2, 5))
+        ttk.Checkbutton(self.sign_frame, text=" 提交签名（序列录入后调用 submitOcExperiment）",
+                        variable=self.require_signature_var,
+                        style=self.app.large_cb_style,
+                        command=self.app.mark_modified).pack(side='left')
 
     def create_standard_type_section(self, parent):
         """创建标液类型设置区域"""
@@ -2834,8 +2652,12 @@ class OtherParamsTab:
             width=80  # 增加宽度
         )
         self.preparation_entry.pack(side='left')
-        ttk.Label(self.preparation_frame, text="（多个标液用逗号分隔，如 D-9210,D-9211）",
-                  foreground="gray").pack(side='left', padx=(5, 0))
+
+        # 配制序号说明另起一行
+        prep_hint = ttk.Frame(standard_frame)
+        prep_hint.pack(fill='x', padx=(20, 5), pady=(0, 2))
+        ttk.Label(prep_hint, text="（多个标液用逗号分隔，如 D-9210,D-9211）",
+                  foreground="gray").pack(side='left')
 
         # 绑定配制序号变化事件
         self.preparation_number_var.trace('w', self.on_preparation_number_change)
@@ -2930,6 +2752,7 @@ class OtherParamsTab:
         er_scroll.pack(side='right', fill='y')
         self.er_tree.configure(yscrollcommand=er_scroll.set)
         _setup_cell_tooltip(self.er_tree, ("设备编号",))
+        self.er_tree.bind("<Double-1>", self.on_equipment_rule_double_click)
         # 操作按钮
         er_btn = ttk.Frame(self.equipment_rules_frame)
         er_btn.pack(fill='x', pady=2)
@@ -2942,8 +2765,8 @@ class OtherParamsTab:
 
     def create_fixed_params_section(self, parent):
         """创建固定参数设置区域：一个触发条件显示为一行，可含多个「参数=值」"""
-        self.fp_frame = ttk.LabelFrame(parent, text="固定参数设置", padding=5)
-        self.fp_frame.pack(fill='both', expand=True, padx=5, pady=2)
+        self.fp_frame = ttk.LabelFrame(parent, text="固定列参数设置", padding=5)
+        self.fp_frame.pack(fill='x', padx=5, pady=2)
         frame = self.fp_frame
 
         # 输入区：触发条件(字段=值) + 参数名 + 值
@@ -3171,9 +2994,16 @@ class OtherParamsTab:
     def toggle_fixed_params(self):
         """复选框控制固定参数设置的显示/隐藏"""
         if self.fp_enable_var.get():
-            self.fp_frame.pack(fill='both', expand=True, padx=5, pady=2)
+            self.fp_frame.pack(fill='x', padx=5, pady=2, before=self.lab_proc_toggle_frame)
         else:
             self.fp_frame.pack_forget()
+
+    def toggle_lab_proc(self):
+        """复选框控制条件实验过程设置的显示/隐藏"""
+        if self.lab_proc_enable_var.get():
+            self.lab_proc_frame.pack(fill='x', padx=5, pady=2, before=self.sign_frame)
+        else:
+            self.lab_proc_frame.pack_forget()
 
     def on_device_number_change(self, *args):
         """设备编号改变时的处理"""
@@ -3188,7 +3018,10 @@ class OtherParamsTab:
             "instrument_setting": self.instrument_setting_var.get(),
             "device_number": self.device_number_var.get().strip(),
             "equipment_rules": self.equipment_rules,
-            "fixed_params": self.fixed_params
+            "fixed_params": self.fixed_params,
+            "lab_proc_enabled": self.lab_proc_enable_var.get(),
+            "lab_proc_rules": self.lab_proc_rules,
+            "require_signature": self.require_signature_var.get()
         }
 
     def set_settings(self, settings):
@@ -3203,6 +3036,10 @@ class OtherParamsTab:
         # 设置配制序号
         if "preparation_number" in settings:
             self.preparation_number_var.set(settings["preparation_number"])
+
+        # 设置提交签名
+        if "require_signature" in settings:
+            self.require_signature_var.set(bool(settings["require_signature"]))
 
         # 设置仪器设置
         if "instrument_setting" in settings:
@@ -3223,7 +3060,16 @@ class OtherParamsTab:
         self.refresh_fixed_params_tree()
         if fp_data:
             self.fp_enable_var.set(True)
-            self.fp_frame.pack(fill='both', expand=True, padx=5, pady=2)
+            self.fp_frame.pack(fill='x', padx=5, pady=2, before=self.lab_proc_toggle_frame)
+
+        # 设置条件实验过程规则
+        if "lab_proc_enabled" in settings:
+            self.lab_proc_enable_var.set(bool(settings["lab_proc_enabled"]))
+        if "lab_proc_rules" in settings:
+            self.lab_proc_rules = list(settings["lab_proc_rules"])
+            self.refresh_lab_proc_rules_tree()
+        if self.lab_proc_enable_var.get() and self.lab_proc_rules:
+            self.lab_proc_frame.pack(fill='x', padx=5, pady=2, before=self.sign_frame)
 
         # 更新显示
         self.on_standard_type_change()
@@ -3295,6 +3141,166 @@ class OtherParamsTab:
                                values=(str(i + 1), r.get("filename", ""),
                                        r.get("project_name", ""), r.get("desc", ""),
                                        r.get("device_number", "")))
+
+    def on_equipment_rule_double_click(self, event):
+        """双击条件设备规则单元格就地编辑（序号列不可编辑；对齐 on_fixed_param_double_click 模式）"""
+        sel = self.er_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        column_index = int(self.er_tree.identify_column(event.x).replace('#', '')) - 1
+        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "device_number"}.get(column_index)
+        if col_key is None:  # 序号列或越界
+            return
+
+        current_values = self.er_tree.item(item, 'values')
+        current_value = current_values[column_index]
+
+        x, y, width, height = self.er_tree.bbox(item, self.er_tree.identify_column(event.x))
+        entry = ttk.Entry(self.er_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.er_tree.item(item, values=new_values)
+            idx = int(item) - 1
+            if 0 <= idx < len(self.equipment_rules):
+                self.equipment_rules[idx][col_key] = new_value
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
+
+    # ---------- 条件实验过程(labProc)规则 ----------
+    # 镜像条件设备规则：文件名/项目名/试样描述 关键词 AND 匹配 → 命中取首条，用其 lab_proc 覆盖该样品 experimentProcess。
+
+    def create_lab_proc_section(self, parent):
+        """创建条件实验过程规则区域(初始会被 create_submit_tab pack_forget)。"""
+        self.lab_proc_frame = ttk.LabelFrame(parent, text="条件实验过程设置", padding=5)
+        self.lab_proc_frame.pack(fill='x', padx=5, pady=2)
+        lp_input = ttk.Frame(self.lab_proc_frame)
+        lp_input.pack(fill='x', pady=2)
+        ttk.Label(lp_input, text="文件名:").pack(side='left', padx=(0, 3))
+        self.lp_filename_var = tk.StringVar()
+        ttk.Entry(lp_input, textvariable=self.lp_filename_var, width=8).pack(side='left', padx=(0, 6))
+        ttk.Label(lp_input, text="项目名:").pack(side='left', padx=(0, 3))
+        self.lp_project_var = tk.StringVar()
+        ttk.Entry(lp_input, textvariable=self.lp_project_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(lp_input, text="试样描述:").pack(side='left', padx=(0, 3))
+        self.lp_desc_var = tk.StringVar()
+        ttk.Entry(lp_input, textvariable=self.lp_desc_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(lp_input, text="试验过程:").pack(side='left', padx=(0, 3))
+        self.lp_proc_var = tk.StringVar()
+        ttk.Entry(lp_input, textvariable=self.lp_proc_var, width=16).pack(side='left', padx=(0, 6))
+        ttkb.Button(lp_input, text="添加", command=self.add_lab_proc_rule, bootstyle="secondary").pack(side='left')
+        lp_list = ttk.Frame(self.lab_proc_frame)
+        lp_list.pack(fill='both', expand=True, pady=3)
+        cols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "试验过程")
+        self.lp_tree = ttk.Treeview(lp_list, columns=cols, show="headings", height=3)
+        for c in cols:
+            self.lp_tree.heading(c, text=c, anchor='w')
+        self.lp_tree.column("序号", width=8, anchor='w')
+        self.lp_tree.column("文件名关键词", width=70, anchor='w')
+        self.lp_tree.column("项目名关键词", width=80, anchor='w')
+        self.lp_tree.column("试样描述关键词", width=80, anchor='w')
+        self.lp_tree.column("试验过程", width=300, anchor='w')
+        self.lp_tree.pack(side='left', fill='both', expand=True)
+        lp_scroll = ttk.Scrollbar(lp_list, orient="vertical", command=self.lp_tree.yview)
+        lp_scroll.pack(side='right', fill='y')
+        self.lp_tree.configure(yscrollcommand=lp_scroll.set)
+        _setup_cell_tooltip(self.lp_tree, ("试验过程",), wraplength=700)
+        self.lp_tree.bind("<Double-1>", self.on_lab_proc_rule_double_click)
+        lp_btn = ttk.Frame(self.lab_proc_frame)
+        lp_btn.pack(fill='x', pady=2)
+        ttkb.Button(lp_btn, text="删除选中", command=self.delete_lab_proc_rule, bootstyle="danger").pack(side='left', padx=2)
+
+    def add_lab_proc_rule(self):
+        """添加一条条件实验过程规则"""
+        proc = self.lp_proc_var.get().strip()
+        if not proc:
+            messagebox.showwarning("输入错误", "请填写试验过程")
+            return
+        self.lab_proc_rules.append({
+            "filename": self.lp_filename_var.get().strip(),
+            "project_name": self.lp_project_var.get().strip(),
+            "desc": self.lp_desc_var.get().strip(),
+            "lab_proc": proc
+        })
+        self.refresh_lab_proc_rules_tree()
+        self.lp_filename_var.set(""); self.lp_project_var.set(""); self.lp_desc_var.set(""); self.lp_proc_var.set("")
+        self.app.mark_modified()
+
+    def delete_lab_proc_rule(self):
+        """删除选中的条件实验过程规则"""
+        sel = self.lp_tree.selection()
+        if not sel:
+            messagebox.showwarning("选择错误", "请先选择要删除的规则")
+            return
+        idx = int(sel[0]) - 1
+        if 0 <= idx < len(self.lab_proc_rules):
+            del self.lab_proc_rules[idx]
+            self.refresh_lab_proc_rules_tree()
+            self.app.mark_modified()
+
+    def refresh_lab_proc_rules_tree(self):
+        """重建条件实验过程规则表格"""
+        for item in self.lp_tree.get_children():
+            self.lp_tree.delete(item)
+        for i, r in enumerate(self.lab_proc_rules):
+            self.lp_tree.insert("", "end", iid=str(i + 1),
+                               values=(str(i + 1), r.get("filename", ""), r.get("project_name", ""),
+                                       r.get("desc", ""), r.get("lab_proc", "")))
+
+    def on_lab_proc_rule_double_click(self, event):
+        """双击条件实验过程规则单元格就地编辑（序号列不可编辑）"""
+        sel = self.lp_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        column_index = int(self.lp_tree.identify_column(event.x).replace('#', '')) - 1
+        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "lab_proc"}.get(column_index)
+        if col_key is None:
+            return
+        current_values = self.lp_tree.item(item, 'values')
+        current_value = current_values[column_index]
+        x, y, width, height = self.lp_tree.bbox(item, self.lp_tree.identify_column(event.x))
+        entry = ttk.Entry(self.lp_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.lp_tree.item(item, values=new_values)
+            idx = int(item) - 1
+            if 0 <= idx < len(self.lab_proc_rules):
+                self.lab_proc_rules[idx][col_key] = new_value
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
 
 
 if __name__ == "__main__":

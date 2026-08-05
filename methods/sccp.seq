@@ -1,0 +1,25 @@
+sequence_data:
+- id: 1
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/SCCP/称量记录1.xlsx
+  method_file: D:/Agent/lims数据登记/methods/跑道SCCP.mtd
+  reference_material: ''
+  equipment: ''
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/SCCP
+  sample_code: ''
+  configure_order: D-9044
+  standard_type: fixed
+  instrument_setting: conditional
+  weighing_mode: random
+  temperature: '24'
+  humidity: '60'
+  experiment_code: ''
+column_widths:
+- 50
+- 260
+- 220
+- 140
+- 180
+- 260
+- 90
+- 90
+- 140
