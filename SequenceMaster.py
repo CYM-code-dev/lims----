@@ -4313,42 +4313,67 @@ class SequenceMaster:
         if not comp_cols:
             log("总和录入: 未找到带 compareShowItemName 的组分列，跳过")
             return
-        items = [str(c["compareShowItemName"]).strip() for c in comp_cols]
+        # items：各列 compareShowItemName 按 @ 拆别名后扁平去重（服务端做精确匹配也能命中其一）
+        items = []
+        for c in comp_cols:
+            for _a in str(c.get("compareShowItemName") or "").split("@"):
+                _a = _a.strip()
+                if _a and _a not in items:
+                    items.append(_a)
 
         records = (experiment_config or {}).get("ocAnalysisRecordList") or []
-        batch_samples = list(dict.fromkeys(it.get("sample_code") for it in batch_items if it.get("sample_code")))
+        # 样品号用完整号 detectionNo+sampleSmallNo（与 build_grouped_experiment_data 同源），
+        # 不能用报验编号 it["sample_code"]——getOcCompareShowData 按记录 sampleCode 匹配，报验编号对不上会返 0 条
+        def _full_code(it):
+            p = it.get("project") or {}
+            return f"{p.get('detectionNo','')}{p.get('sampleSmallNo','')}".strip()
+        batch_samples = list(dict.fromkeys(_c for _c in (_full_code(it) for it in batch_items) if _c))
+        if not batch_samples:  # 回落到报验编号(旧字段)
+            batch_samples = list(dict.fromkeys(it.get("sample_code") for it in batch_items if it.get("sample_code")))
         _fallback_sc = batch_samples[0] if batch_samples else ""
 
         def _rec_sample(rec):
             sc = str(rec.get("sampleCode") or "").strip()
-            return sc or _fallback_sc
+            if sc:
+                return sc
+            d = str(rec.get("detectionNo") or "").strip()
+            s = str(rec.get("sampleSmallNo") or "").strip()
+            return (d + s) if d and s else _fallback_sc
 
-        # 逐样品取组分对比数据，索引 {sample: {item: {serialNumber: rec}}}
+        # 逐样品取组分对比数据，索引 {sample: {norm_projectName: {serialNumber: rec}}}
         comp_by_sample = {}
         for sc in batch_samples:
             cr = self.api.get_oc_compare_show_data(sc, items, log)
             idx = {}
             for r in cr or []:
-                pn = str(r.get("projectName") or "").strip()
+                pn = _norm_cn(r.get("projectName"))  # NFKC 归一，兼容 @ 别名的全角/半角逗号等变体
                 try:
                     sn = int(r.get("serialNumber")) if r.get("serialNumber") is not None else 1
                 except (TypeError, ValueError):
                     sn = 1
                 idx.setdefault(pn, {})[sn] = r
             comp_by_sample[sc] = idx
-            log(f"总和录入: 样品 {sc} 取到 {len(cr or [])} 条组分对比记录（{len(items)} 组分）")
+            log(f"总和录入: 样品 {sc} 取到 {len(cr or [])} 条组分对比记录（{len(items)} 别名/{len(comp_cols)} 列）")
 
         def _val(rec, col):
-            item_name = str(col["compareShowItemName"]).strip()
             title = str(col.get("compareShowTitleName") or "报告值")
             field = "calculatedValue" if "计算值" in title else "reportValue"
             try:
                 sn = int(rec.get("serialNumber")) if rec.get("serialNumber") is not None else 1
             except (TypeError, ValueError):
                 sn = 1
-            item_map = comp_by_sample.get(_rec_sample(rec), {}).get(item_name, {})
-            cr = item_map.get(sn) or (next(iter(item_map.values())) if item_map else None)
-            return str((cr or {}).get(field) or "")
+            sample_map = comp_by_sample.get(_rec_sample(rec), {})
+            # 列的 @ 别名逐个归一后命中任一即取值
+            for _a in str(col.get("compareShowItemName") or "").split("@"):
+                _a = _a.strip()
+                if not _a:
+                    continue
+                item_map = sample_map.get(_norm_cn(_a))
+                if item_map:
+                    cr = item_map.get(sn) or (next(iter(item_map.values())) if item_map else None)
+                    if cr is not None:
+                        return str(cr.get(field) or "")
+            return ""
 
         for col in comp_cols:
             col_code = col.get("columeCode", "")

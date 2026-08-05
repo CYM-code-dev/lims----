@@ -1,4 +1,4 @@
-"""总和录入自检：桩数据验证 _fill_result_from_sum 的组分列定位、取值字段、样品×平行匹配。无网络/GUI。
+"""总和录入自检：桩数据验证 _fill_result_from_sum 的全号派生、组分列定位、取值字段、@ 别名匹配、平行分槽。无网络/GUI。
 运行：.venv/Scripts/python test_sum_entry.py"""
 import types
 from SequenceMaster import SequenceMaster, _is_sum_project
@@ -29,6 +29,11 @@ def _run(dyn_cols, records, batch_items, comp_by_sample):
     return api, host
 
 
+# batch_items 样板：project 带 detectionNo/sampleSmallNo（全号源）；sample_code 为报验编号(旧字段，不应被采用)
+def _item(det_no, small_no):
+    return {"sample_code": det_no, "project": {"detectionNo": det_no, "sampleSmallNo": small_no}}
+
+
 def test_is_sum_project():
     assert _is_sum_project("甲苯、二甲苯及乙苯总和")
     assert _is_sum_project("AfPS GS 2019:01 PAK 4项之和")
@@ -38,7 +43,8 @@ def test_is_sum_project():
     print("ok _is_sum_project")
 
 
-def test_report_value_single_parallel():
+def test_full_sample_code_and_report_value():
+    # Fix-A：sampleCodes 用全号 detectionNo+sampleSmallNo，不是报验编号
     dyn_cols = [
         {"columeCode": "dynamic6321", "compareShowItemName": "菲（PHE）", "compareShowTitleName": "报告值"},
         {"columeCode": "dynamic6322", "compareShowItemName": "蒽（Ant）", "compareShowTitleName": "报告值"},
@@ -49,20 +55,32 @@ def test_report_value_single_parallel():
         {"projectName": "菲（PHE）", "serialNumber": 1, "reportValue": "1.0", "calculatedValue": "0.976"},
         {"projectName": "蒽（Ant）", "serialNumber": 1, "reportValue": "1.6", "calculatedValue": "1.601"},
     ]
-    api, host = _run(dyn_cols, records, [{"sample_code": "TS26072901001"}], {"TS26072901001": comp})
-    # items 仅含 2 个组分(不含称样量列)
-    assert api.calls == [("TS26072901001", ["菲（PHE）", "蒽（Ant）"])], api.calls
+    api, host = _run(dyn_cols, records, [_item("TS26072901", "001")], {"TS26072901001": comp})
+    assert api.calls == [("TS26072901001", ["菲（PHE）", "蒽（Ant）"])], api.calls  # 全号，非 TS26072901
     assert [b.get() for b in host.data_fields["dynamic6321"]] == ["1.0"]
     assert [b.get() for b in host.data_fields["dynamic6322"]] == ["1.6"]
     assert "dynamic9999" not in host.data_fields  # 非组分列不经本方法
-    print("ok 报告值/单平行/组分列筛选")
+    print("ok 全号派生/报告值/组分列筛选")
+
+
+def test_at_alias_matching():
+    # Fix-B：compareShowItemName 含 @ 别名；记录 projectName 命中任一归一化别名即取值
+    dyn_cols = [{"columeCode": "d1",
+                 "compareShowItemName": "二苯并(a，h)蒽（DBA）@二苯并(a,h)蒽（DBA）",
+                 "compareShowTitleName": "报告值"}]
+    records = [{"serialNumber": 1, "sampleCode": "S1"}]
+    comp = [{"projectName": "二苯并(a,h)蒽（DBA）", "serialNumber": 1, "reportValue": "0.5"}]  # 半角逗号变体
+    api, host = _run(dyn_cols, records, [_item("S", "1")], {"S1": comp})
+    assert api.calls == [("S1", ["二苯并(a，h)蒽（DBA）", "二苯并(a,h)蒽（DBA）"])], api.calls  # @ 拆成两条别名
+    assert [b.get() for b in host.data_fields["d1"]] == ["0.5"]
+    print("ok @ 别名匹配")
 
 
 def test_calc_value_field():
     dyn_cols = [{"columeCode": "d1", "compareShowItemName": "菲（PHE）", "compareShowTitleName": "计算值"}]
     records = [{"serialNumber": 1, "sampleCode": "S1"}]
     comp = [{"projectName": "菲（PHE）", "serialNumber": 1, "reportValue": "1.0", "calculatedValue": "0.976"}]
-    _, host = _run(dyn_cols, records, [{"sample_code": "S1"}], {"S1": comp})
+    _, host = _run(dyn_cols, records, [_item("S", "1")], {"S1": comp})
     assert [b.get() for b in host.data_fields["d1"]] == ["0.976"]  # compareShowTitleName=计算值→calculatedValue
     print("ok 计算值字段")
 
@@ -75,14 +93,15 @@ def test_two_parallels():
         {"projectName": "菲（PHE）", "serialNumber": 1, "reportValue": "1.0"},
         {"projectName": "菲（PHE）", "serialNumber": 2, "reportValue": "2.0"},
     ]
-    _, host = _run(dyn_cols, records, [{"sample_code": "S1"}], {"S1": comp})
+    _, host = _run(dyn_cols, records, [_item("S", "1")], {"S1": comp})
     assert [b.get() for b in host.data_fields["d1"]] == ["1.0", "2.0"], host.data_fields["d1"]
     print("ok 多平行按 serialNumber 分槽")
 
 
 if __name__ == "__main__":
     test_is_sum_project()
-    test_report_value_single_parallel()
+    test_full_sample_code_and_report_value()
+    test_at_alias_matching()
     test_calc_value_field()
     test_two_parallels()
     print("sum-entry self-check OK")
