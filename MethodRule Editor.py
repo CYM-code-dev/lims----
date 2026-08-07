@@ -9,19 +9,19 @@ import paths
 import random
 
 
-_BIG_CB_STYLE = {'name': None}  # 模块级缓存：幂等。重复构建会重建图像并覆盖持有引用，旧 PhotoImage 被 GC 后已建复选框的勾选标记消失
-
-
 def _make_large_cb_style(scale=1.3):
     """放大 ttk.Checkbutton 勾选框：复用 ttkbootstrap 内置位图按 scale 重建 indicator element。
-    幂等：重复调用直接返回已建样式，不重建(否则旧勾选框图像被 GC)。ponytail: 与 detection_entry_main.py 同实现。"""
-    if _BIG_CB_STYLE['name']:
-        return _BIG_CB_STYLE['name']
+    幂等标记挂在 ttkb.Style() 单例上(而非模块级字典)：SequenceMaster 经 importlib 每次重执行本模块，
+    模块级缓存会被重置→重建样式→旧 PhotoImage 被 GC→已建勾选框的勾选标记消失。
+    Style 单例依附 Tk root、跨模块重执行存活，故只建一次。"""
+    s = ttkb.Style()
+    _cached = getattr(s, '_big_cb_style_name', None)
+    if _cached:
+        return _cached
     try:
         from ttkbootstrap.style.layout import image_element, layout, El
         from ttkbootstrap.style.assets import RecolorRenderer
         from PIL import ImageTk
-        s = ttkb.Style()
         c = s.colors
         size = int(20 * scale)
         def _img(name, ink):
@@ -38,7 +38,7 @@ def _make_large_cb_style(scale=1.3):
                children=[El('Checkbutton.label', sticky=tk.NSEW)])]))
         s.configure(sn, background=c.bg, foreground=c.fg, focuscolor=c.fg)
         s._big_cb_imgs = (chk, unk, dchk, dunk)  # 持有 PhotoImage 引用防 GC
-        _BIG_CB_STYLE['name'] = sn
+        s._big_cb_style_name = sn  # 缓存在 Style 单例上，跨模块重执行存活
         return sn
     except Exception:
         return None
@@ -133,7 +133,7 @@ class QueryTab:
         self.date_window_days_var = tk.StringVar(value="30")
         e_days = ttk.Entry(strat_row, width=6, textvariable=self.date_window_days_var)
         e_days.pack(side='left', padx=(0, 12))
-        ttk.Label(strat, text="样品数≤阈值→按样品并行查；>阈值→方法池。日期窗口仅对方法池生效",
+        ttk.Label(strat, text="样品数≤阈值→按样品并行查；>阈值→方法池。日期窗口对方法池与逐样品查询均生效",
                   foreground="gray").pack(fill='x')
         for _e in (e_threshold, e_days):
             _e.bind("<KeyRelease>", lambda _ev: self.app.mark_modified())
@@ -797,40 +797,44 @@ class MethodTab:
         rules_frame = ttk.LabelFrame(parent, text="切换规则管理", padding=5)
         rules_frame.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # 创建规则输入区域
+        # 创建规则输入区域 - 分两行：第一行(项目名/文件名/试样描述)，第二行(原ID/目标ID/添加)
         input_frame = ttk.Frame(rules_frame)
         input_frame.pack(fill='x', pady=2)
 
-        # 配置列权重
-        for i in range(11):
-            input_frame.columnconfigure(i, weight=0)
-        input_frame.columnconfigure(10, weight=1)  # 空白区域扩展
-        input_frame.columnconfigure(11, weight=0)  # 添加按钮
+        # 第一行：项目名 / 文件名 / 试样描述
+        row0 = ttk.Frame(input_frame)
+        row0.pack(fill='x', pady=1)
+        row0.columnconfigure(5, weight=1)  # 末尾空白撑开
 
-        # 项目名
-        self.project_name_label = ttk.Label(input_frame, text="项目名:")
-        self.project_name_entry = ttk.Entry(input_frame, width=12)
+        ttk.Label(row0, text="项目名:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
+        self.project_name_entry = ttk.Entry(row0, width=12)
+        self.project_name_entry.grid(row=0, column=1, padx=(0, 10), pady=1, sticky='w')
         _bind_entry_tooltip(self.project_name_entry)
 
-        # 文件名
-        self.filename_label = ttk.Label(input_frame, text="文件名:")
-        self.filename_entry = ttk.Entry(input_frame, width=12)
+        ttk.Label(row0, text="文件名:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
+        self.filename_entry = ttk.Entry(row0, width=12)
+        self.filename_entry.grid(row=0, column=3, padx=(0, 10), pady=1, sticky='w')
 
-        # 试样描述
-        self.desc_label = ttk.Label(input_frame, text="试样描述:")
-        self.desc_entry = ttk.Entry(input_frame, width=12)
+        ttk.Label(row0, text="试样描述:").grid(row=0, column=4, padx=(0, 5), pady=1, sticky='w')
+        self.desc_entry = ttk.Entry(row0, width=12)
+        self.desc_entry.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='ew')
 
-        # 原方法ID
-        self.from_id_label = ttk.Label(input_frame, text="原ID:")
-        self.from_id_entry = ttk.Entry(input_frame, width=10)
+        # 第二行：原ID / 目标ID / 添加按钮
+        row1 = ttk.Frame(input_frame)
+        row1.pack(fill='x', pady=1)
+        row1.columnconfigure(4, weight=1)  # 末尾空白撑开，把添加按钮推到右侧
 
-        # 目标方法ID
-        self.to_id_label = ttk.Label(input_frame, text="目标ID:")
-        self.to_id_entry = ttk.Entry(input_frame, width=15)
+        ttk.Label(row1, text="原ID:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
+        self.from_id_entry = ttk.Entry(row1, width=10)
+        self.from_id_entry.grid(row=0, column=1, padx=(0, 10), pady=1, sticky='w')
+
+        ttk.Label(row1, text="目标ID:").grid(row=0, column=2, padx=(0, 5), pady=1, sticky='w')
+        self.to_id_entry = ttk.Entry(row1, width=15)
+        self.to_id_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='w')
 
         # 添加规则按钮
-        self.add_rule_btn = ttkb.Button(input_frame, text="添加", command=self.add_rule, bootstyle="secondary")
-        self.add_rule_btn.grid(row=0, column=11, padx=(5, 0), pady=1, sticky='e')
+        self.add_rule_btn = ttkb.Button(row1, text="添加", command=self.add_rule, bootstyle="secondary")
+        self.add_rule_btn.grid(row=0, column=5, padx=(5, 0), pady=1, sticky='e')
 
         # 创建规则显示区域
         display_frame = ttk.Frame(rules_frame)
@@ -1002,18 +1006,7 @@ class MethodTab:
         self.rules_tree.selection_set(self.rules_tree.get_children()[index + 1])
 
     def update_rules_display(self):
-        # 始终显示全部字段：项目名 / 文件名 / 试样描述 / 原ID / 目标ID
-        self.project_name_label.grid(row=0, column=0, padx=(0, 0), pady=1, sticky='w')
-        self.project_name_entry.grid(row=0, column=1, padx=(0, 5), pady=1, sticky='w')
-        self.filename_label.grid(row=0, column=2, padx=(0, 0), pady=1, sticky='w')
-        self.filename_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='w')
-        self.desc_label.grid(row=0, column=4, padx=(0, 0), pady=1, sticky='w')
-        self.desc_entry.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='w')
-        self.from_id_label.grid(row=0, column=6, padx=(0, 0), pady=1, sticky='w')
-        self.from_id_entry.grid(row=0, column=7, padx=(0, 5), pady=1, sticky='w')
-        self.to_id_label.grid(row=0, column=8, padx=(0, 0), pady=1, sticky='w')
-        self.to_id_entry.grid(row=0, column=9, padx=(0, 5), pady=1, sticky='w')
-
+        # 输入控件已在 create_rules_management 中布局(两行)，此处仅刷新规则表格
         self.refresh_rules_tree()
 
     def refresh_rules_tree(self):

@@ -482,13 +482,13 @@ def _filter_pdfs_by_rule(pdf_paths, project_name, filter_rules):
     return [p for p in paths if (kw in os.path.basename(p).lower()) != exclude]
 
 
-def _plan_submission_batches(query_rules, items, max_sel):
+def _plan_submission_batches(query_rules, items):
     """按 query_rules 顺序规划提交批次（纯函数，可单测）。
     items: 每项为 dict，需含 switch_mid / sample_code / projectName / wdate(称样日期,可空)。
     返回 [{"switch_mid","wdate","items","force_new","_equipment"}, ...]，顺序 = 规则顺序，同规则内按 switch_mid、
     再按条件设备(可选)、再按称样日期、再按样品。不同设备需拆独立批。
     同 switch_mid 内称样日期不同(跨天)拆独立批(各自实验编号)；同日/无日期仍合并。
-    input_method=方法：同(switch_mid,设备,日期)的样品合并，max_sel 超限切片(多片 force_new=True)；
+    input_method=方法：同(switch_mid,设备,日期)的样品合并，每条规则各自的 max_select 超限切片(多片 force_new=True)；
     input_method=样品：每样品各一片。无 query_rules 退化为单条空规则(全中,方法)。
     多个不同 method(如 XRF 多元素方法)：每条规则按项目 _qr_idx 认领各自方法，一方法一实验、不重复。"""
     plan = []
@@ -501,6 +501,8 @@ def _plan_submission_batches(query_rules, items, max_sel):
         if not remaining:
             break
         mode = str(rule.get("input_method") or "方法").strip()
+        ms = str(rule.get("max_select") or "").strip()
+        rule_max = int(ms) if ms.isdigit() else 0
         if multi_method:
             rule_items = [it for it in remaining if it.get("_qr_idx") == i]
         else:
@@ -532,8 +534,8 @@ def _plan_submission_batches(query_rules, items, max_sel):
                         samples = list(dict.fromkeys(it.get("sample_code", "") for it in d_items))
                         if mode == "样品":
                             slices = [[sc] for sc in samples]
-                        elif max_sel > 0 and len(samples) > max_sel:
-                            slices = [samples[i:i + max_sel] for i in range(0, len(samples), max_sel)]
+                        elif rule_max > 0 and len(samples) > rule_max:
+                            slices = [samples[i:i + rule_max] for i in range(0, len(samples), rule_max)]
                         else:
                             slices = [samples]
                         sub_batches.append((d, d_items, slices))
@@ -3134,7 +3136,7 @@ class SequenceMaster:
         spec = importlib.util.spec_from_file_location("method_rule_editor", editor_path)
         mre = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mre)
-        top = tk.Toplevel(self.root)
+        top = ttkb.Toplevel(self.root)
         top.title("录入方法编辑器")
         top.transient(self.root)  # 置于序列编辑器之上(owned)：加载方法时序列窗口不再抢占到最前端
         app = mre.QueryAppFixed(top)
@@ -3375,28 +3377,31 @@ class SequenceMaster:
         # 阶段A：逐样品查询+过滤(此阶段不上传谱图)，收集所有样品的项目
         # 某样品查询失败仅跳过(尽量多录入)，不影响其余样品的合并提交
         # 自适应：样品数≤阈值→按样品并行精确查(避免1样品却拉方法池全量234条)；>阈值→方法池(1请求)摊销固定开销。
-        # 日期窗口仅喂方法池(可按方法文件收窄提速)；逐样品精确查固定30天(系统可查上限)，作正确性兜底——池漏的样品仍能查到。
+        # 日期窗口统一喂方法池与逐样品精确查：按方法文件配置收窄提速/放宽找旧样品。
         mf = row.get("method_file") or ""
         threshold = self._read_sample_parallel_threshold(mf)
-        pool_days = self._read_date_window_days(mf)
+        window_days = self._read_date_window_days(mf)
+        ctx["date_window_days"] = window_days  # 透传给 _collect_sample_projects 兜底查询
         method_names = self._method_query_names(mf)
         target_codes = [sc for sc, _ in samples]
         projects_by_sample = {}
-        if method_names and target_codes:
-            # ponytail: 服务器对同session请求串行，小批量也走池(按方法1次/标准号 < N次逐样品精确)；池漏的 missing 仍精确兜底
-            pooled = self._query_projects_by_methods(method_names, log, days=pool_days)
+        use_pool = len(target_codes) > threshold
+        if use_pool and method_names and target_codes:
+            pooled = self._query_projects_by_methods(method_names, log, days=window_days)
             if pooled:
                 for _p in pooled:
                     projects_by_sample.setdefault(_p.get("sampleCode"), []).append(_p)
-                log(f"按方法查询完成：{len(pooled)} 个项目，覆盖 {len(projects_by_sample)} 个样品（窗口{pool_days}天）")
+                log(f"按方法查询完成：{len(pooled)} 个项目，覆盖 {len(projects_by_sample)} 个样品（窗口{window_days}天）")
             else:
                 log("按方法查询无结果，全部走逐样品精确查询")
-        # 样品少 或 方法池未覆盖的样品：并行精确查询(固定30天)
+        else:
+            log(f"样品数 {len(target_codes)} ≤ 阈值 {threshold}，按样品并行精确查询（跳过方法池，窗口{window_days}天）")
+        # 样品少 或 方法池未覆盖的样品：并行精确查询(同一窗口)
         missing = [sc for sc in target_codes if sc not in projects_by_sample]
         if missing:
             t0 = time.time()
-            log(f"逐样品精确查询 {len(missing)} 个(并行) ...")
-            fetched = self._query_samples_parallel(missing, log)
+            log(f"逐样品精确查询 {len(missing)} 个(并行, 窗口{window_days}天) ...")
+            fetched = self._query_samples_parallel(missing, log, days=window_days)
             for sc, plist in fetched.items():
                 projects_by_sample.setdefault(sc, []).extend(plist)
             log(f"逐样品精确查询完成：{len(fetched)}/{len(missing)} 命中，用时 {time.time()-t0:.1f}s")
@@ -3417,7 +3422,12 @@ class SequenceMaster:
             all_items.extend(items)
         if not all_items:
             self._ui_q.put(("status", (idx, "失败", "无可用样品项目")))
+            self._ui_q.put(("rowdata", (idx, {"skipped_list": list(skipped_samples)})))
             log("失败: 所有样品均无可录入项目")
+            if skipped_samples:
+                log(f"各样品未录入原因（{len(skipped_samples)} 个）：")
+                for sc, reason in skipped_samples:
+                    log(f"  - {sc}：{reason}")
             return "fail"
 
         # 清空旧实验暂存与谱图(等价前端清空: cancleOcExperiment 连带删除旧谱图)；
@@ -3532,8 +3542,7 @@ class SequenceMaster:
                     log(f"[{it['sample_code']}] 命中实验过程规则 → {lp}（项目:{pname}）")
 
         rules = self._read_query_rules(method_file)
-        max_sel = self._read_max_select(method_file)
-        plan = _plan_submission_batches(rules, all_items, max_sel)
+        plan = _plan_submission_batches(rules, all_items)
 
         codes = []
         for b in plan:
@@ -3573,20 +3582,33 @@ class SequenceMaster:
         返回 (items, err)。items = [{project, sample_code, sample_id, pdf_paths}, ...]。
         err 非空表示该样品不可用(查不到/无匹配项目)，调用方跳过该样品。
         projects_by_sample: 批量查询缓存 {sampleCode: [project...]}，提供则不再逐样品查 LIMS(省往返)。"""
+        _days = (ctx or {}).get("date_window_days", 30)  # 与方法池/逐样品共用同一窗口
         if projects_by_sample is not None:
             projects = list(projects_by_sample.get(sample_code) or [])
             if not projects:  # 方法池未含该样品(方法关键字与服务端索引不一致)，精确查询兜底，防漏查
                 log(f"方法池未含 {sample_code}，精确查询兜底 ...")
                 projects = self.api.query_samples_by_conditions(
-                    sample_code=sample_code, exact_match=True, log_func=log)
+                    sample_code=sample_code, exact_match=True, log_func=log, days=_days)
         else:
             log(f"查询样品 {sample_code} ...")
             projects = self.api.query_samples_by_conditions(
-                sample_code=sample_code, exact_match=True, log_func=log)
+                sample_code=sample_code, exact_match=True, log_func=log, days=_days)
         if not projects:
-            return [], self.api.diagnose_missing_sample(sample_code, log)
+            return [], self.api.diagnose_missing_sample(sample_code, log, days=_days)
         projects, ferr = self._filter_projects_by_method(projects, row, log)
         if ferr:
+            # 方法过滤失败：可能该样品的这些项目已登记(在 ALREADY 列表，未登记查询不返回)。
+            # 复用同一过滤逻辑查 ALREADY 列表，命中则报"已登记"，避免误报"方法不在此样品中"。
+            try:
+                _done = self.api.query_samples_by_conditions(
+                    sample_code=sample_code, exact_match=True, log_func=None, days=_days,
+                    check_in_status="CHECK_IN_STATUS_ALREADY")
+                if _done:
+                    _filt, _ferr2 = self._filter_projects_by_method(_done, row, lambda *a, **k: None)
+                    if _filt:
+                        return [], "已登记"
+            except Exception:
+                pass
             return [], ferr
         if not projects:
             return [], "该样品下没有匹配方法文件的项目"
@@ -3618,9 +3640,6 @@ class SequenceMaster:
             # 方法配置了目标切换方法ID：先切换服务端项目方法，再用目标方法取配置(默认方法可能缺计算公式)
             log(f"切换检测方法 -> 方法ID {switch_mid}")
             self.api.update_method(sp_ids_str, switch_mid, project_names, log)
-            switched_std = self.api.get_method_standard_no_by_id(switch_mid, log)
-            if switched_std:
-                method_name = switched_std
             method_id = switch_mid
             actual_method_name = method_name
             actual_method_id = method_id
@@ -3652,9 +3671,6 @@ class SequenceMaster:
                 sub = self.api.sub_method_map[str(method_id)]
                 actual_method_id = sub.get("sub_method_id")
                 self.api.update_method(sp_ids_str, actual_method_id, project_names, log)
-                std = self.api.get_method_standard_no_by_id(actual_method_id, log)
-                if std:
-                    actual_method_name = std
         log("取全量配置 ...")
         all_cfg = self.api.get_all_configs(sp_ids_str, method_name, "", sample_id, log, method_id, project_names)
         if not all_cfg:
@@ -4209,8 +4225,7 @@ class SequenceMaster:
         return 20
 
     def _read_date_window_days(self, method_file):
-        """query_rules.date_window_days(方法池查询受理日期窗口)。默认 30。仅方法池路径用；
-        逐样品精确查固定30天(系统可查上限)，缩池窗口不丢样品、只可能多几次逐样品兜底。"""
+        """query_rules.date_window_days(查询受理日期窗口)。默认 30。方法池与逐样品精确查共用。"""
         try:
             y = load_method(method_file)
         except Exception:
@@ -4278,9 +4293,10 @@ class SequenceMaster:
                     pooled.append(dict(p))
         return pooled
 
-    def _query_samples_parallel(self, sample_codes, log, max_workers=6):
+    def _query_samples_parallel(self, sample_codes, log, max_workers=6, days=30):
         """并行按样品编号精确查(I/O 密集、各样品独立)，返回 {sampleCode: [project...]}。
-        固定30天窗口(系统可查上限/正确性兜底)；单样品异常不影响其余。worker 内静默，日志由调用方汇总。"""
+        days: 受理日期窗口(天)，默认30；与方法池共用 date_window_days 配置，按方法文件收窄/放宽。
+        单样品异常不影响其余。worker 内静默，日志由调用方汇总。"""
         from concurrent.futures import ThreadPoolExecutor
         out = {}
         codes = [c for c in sample_codes if c]
@@ -4290,7 +4306,7 @@ class SequenceMaster:
         def _one(code):
             try:
                 return code, self.api.query_samples_by_conditions(
-                    sample_code=code, exact_match=True, log_func=None) or []
+                    sample_code=code, exact_match=True, log_func=None, days=days) or []
             except Exception:
                 return code, []  # ponytail: 单样品失败静默，调用方按空结果跳过
 
@@ -4727,30 +4743,6 @@ class SequenceMaster:
         return None, (f"样品含 {len(stdnos)} 个不同方法，但方法文件未在 query_rules 指定要提交的方法。"
                       f"方法列表: {', '.join(stdnos)}")
 
-    def _read_max_select(self, method_file):
-        """读方法文件 query_rules[0].max_select（最大选择量=每批样品数上限）。返回 int；
-        空/非数字/≤0 返回 0(不限)。兼容 query_rules 的 dict/list 两种 yaml 结构。"""
-        if not method_file:
-            return 0
-        try:
-            y = load_method(method_file)
-            qr_raw = y.get("query_rules")
-            if isinstance(qr_raw, dict):
-                qr = qr_raw.get("query_rules") or []
-            elif isinstance(qr_raw, list):
-                qr = qr_raw
-            else:
-                qr = []
-            if not qr:
-                return 0
-            ms = str(qr[0].get("max_select") or "").strip()
-            if not ms:
-                return 0
-            n = int(ms)
-            return n if n > 0 else 0
-        except Exception:
-            return 0
-
     def _read_switch_method_id(self, method_file):
         """读方法文件 query_rules[0].method_id（录入前要切换到的目标方法ID）。返回 str；空则 ''。
         用于 PD-苯 等需从默认方法切换到子方法才含计算公式的场景(对照主窗口 switch_method_id)。"""
@@ -4983,8 +4975,17 @@ class SequenceMaster:
                 for sc, reason in skipped:
                     self._append_log(f"  - {sc}：{reason}")
         if fail:
-            lines = [f"  · 第{i + 1}行 [{r.get('sample_code') or '?'}] {r.get('error_msg') or ''}"
-                     for i, r in enumerate(self.sequence_data) if r.get("status") == "失败"]
+            lines = []
+            for i, r in enumerate(self.sequence_data):
+                if r.get("status") == "失败":
+                    _code = r.get('sample_code')
+                    _sp = os.path.basename((r.get('spectrum_path') or '').rstrip('/\\')) or ''
+                    # 标识：优先样品编号，无则用谱图文件夹名(多样品行从称样记录展开，前端无编号输入)
+                    _tag = f"[{_code}]" if _code else (f"[{_sp}]" if _sp else "")
+                    _head = f"{_tag} " if _tag else ""
+                    lines.append(f"  · 第{i + 1}行 {_head}{r.get('error_msg') or ''}")
+                    for sc, reason in r.get("skipped_list", []):
+                        lines.append(f"      - {sc}：{reason}")
             self._append_log("失败明细：\n" + "\n".join(lines))
         self.status_var.set(f"完成: 成功 {ok} / 失败 {fail}")
 
@@ -5226,30 +5227,33 @@ def _selfcheck():
                {"project": "甲苯、二甲苯及乙苯总和", "input_method": "方法"}]
 
     # 方法模式：苯(2样品合并)在前、总和(2样品合并)在后，各1批，force_new=False
-    p = _plan_submission_batches(rules_m, items, 30)
+    p = _plan_submission_batches(rules_m, items)
     assert [(b["switch_mid"], len(b["items"]), b["force_new"]) for b in p] \
         == [("4678", 2, False), ("4679", 2, False)], p
 
     # 样品模式：每样品各1批，苯先于总和
     rules_s = [{"project": "苯", "input_method": "样品"},
                {"project": "甲苯、二甲苯及乙苯总和", "input_method": "样品"}]
-    p2 = _plan_submission_batches(rules_s, items, 30)
+    p2 = _plan_submission_batches(rules_s, items)
     assert [(b["switch_mid"], b["items"][0]["sample_code"]) for b in p2] \
         == [("4678", "S1"), ("4678", "S2"), ("4679", "S1"), ("4679", "S2")], p2
 
-    # 方法模式 max_select=1：苯拆2批，两批 force_new=True
-    p3 = _plan_submission_batches(rules_m, items, 1)
+    # 方法模式 max_select=1(按行)：苯规则限 1 → 拆2批，两批 force_new=True；总和规则不限 → 合1批
+    rules_max = [{"project": "苯", "input_method": "方法", "max_select": "1"},
+                 {"project": "甲苯、二甲苯及乙苯总和", "input_method": "方法"}]
+    p3 = _plan_submission_batches(rules_max, items)
     assert [b["force_new"] for b in p3 if b["switch_mid"] == "4678"] == [True, True], p3
+    assert [b["force_new"] for b in p3 if b["switch_mid"] == "4679"] == [False], p3
 
     # 称样日期拆批(方法模式)：同 switch_mid 跨日 → 拆 2 批 force_new=True；同日仍合 1 批
     di = [item("S1", "苯", "4678"), item("S2", "苯", "4678")]
     di[0]["wdate"] = "2026-07-28"
     di[1]["wdate"] = "2026-07-29"
-    pd = _plan_submission_batches([{"project": "苯", "input_method": "方法"}], di, 30)
+    pd = _plan_submission_batches([{"project": "苯", "input_method": "方法"}], di)
     assert len(pd) == 2 and all(b["force_new"] for b in pd), pd
     assert [b["items"][0]["sample_code"] for b in pd] == ["S1", "S2"], pd
     di[1]["wdate"] = "2026-07-28"  # 改同日 → 合 1 批
-    pd2 = _plan_submission_batches([{"project": "苯", "input_method": "方法"}], di, 30)
+    pd2 = _plan_submission_batches([{"project": "苯", "input_method": "方法"}], di)
     assert len(pd2) == 1 and not pd2[0]["force_new"], pd2
 
     # _parallel_indices：同 projectId 多组分(总和 5组分×2平行) 按 serialNumber 正确归平行
@@ -5358,7 +5362,7 @@ def _selfcheck():
     mm_rules = [{"project": "", "method": "IEC 62321-5", "input_method": "方法"},
                 {"project": "", "method": "IEC 62321-4", "input_method": "方法"},
                 {"project": "", "method": "IEC 62321-7-2", "input_method": "方法"}]
-    pm = _plan_submission_batches(mm_rules, mm, 50)
+    pm = _plan_submission_batches(mm_rules, mm)
     assert len(pm) == 3 and sum(len(b["items"]) for b in pm) == 4, pm  # 3 批、4 项目无重复
     assert sorted(len(b["items"]) for b in pm) == [1, 1, 2], pm        # 方法0=镉铅2个，其余各1
     assert all(b["force_new"] for b in pm), pm                         # 多方法各批独立编号

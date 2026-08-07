@@ -533,13 +533,9 @@ class DetectionAPI:
                     if log_func:
                         log_func(f"警告: 检测方法更新失败，可能无法正确切换子方法")
 
-                # 获取子方法的标准号
-                sub_method_standard_no = self.get_method_standard_no_by_id(actual_method_id, log_func)
-                if sub_method_standard_no:
-                    actual_method_name = sub_method_standard_no
-                else:
-                    # 如果无法获取子方法标准号，使用原始方法标准号
-                    actual_method_name = method_name
+                # 不覆写 actual_method_name：saveOcExperiment 的 detectionMethod.standardNo
+                # 应为父方法标准号（与浏览器行为一致），子方法已通过 update_method 激活
+                actual_method_name = method_name
 
             return actual_method_id, actual_method_name
 
@@ -1347,9 +1343,10 @@ class DetectionAPI:
             return []
 
     def query_samples_by_conditions(self, sample_code=None, project_name=None, method_name=None, retest_checked=False,
-                                    log_func=None, exact_match=False, days=30):
+                                    log_func=None, exact_match=False, days=30, check_in_status="CHECK_IN_STATUS_NO"):
         """通过多个条件查询样品信息 - 支持精确匹配和模糊查询
-        days: 受理日期窗口(天)，默认30；方法池查询可按方法文件配置收窄提速，逐样品精确查保持30(系统可查上限)。"""
+        days: 受理日期窗口(天)，默认30；方法池查询可按方法文件配置收窄提速，逐样品精确查保持30(系统可查上限)。
+        check_in_status: CHECK_IN_STATUS_NO(未登记，默认) / CHECK_IN_STATUS_ALREADY(已登记)。"""
         if not self.login_system.current_user:
             return []
 
@@ -1372,7 +1369,7 @@ class DetectionAPI:
                     "pageNo": page_no,
                     "acceptStartDate": one_month_ago.strftime("%Y-%m-%d"),
                     "acceptEndDate": today.strftime("%Y-%m-%d"),
-                    "checkInStatus": "CHECK_IN_STATUS_NO",
+                    "checkInStatus": check_in_status,
                     "decideProjectOrgId": "23",
                     "sampleStatus": "one",
                     "pid": self.get_user_pid(),
@@ -1465,9 +1462,10 @@ class DetectionAPI:
                 log_func(f"[API异常] {type(e).__name__}: {str(e)[:200]}")
             return []
 
-    def diagnose_missing_sample(self, sample_code, log_func=None):
+    def diagnose_missing_sample(self, sample_code, log_func=None, days=30):
         """录入查询查不到样品时，按 收样→制样→登记 生命周期定位真实原因，返回具体中文理由。
-        串行：项目已登记(录入端点 checkInStatus=YES 重查)→未制样(pageObjByMakeStatus)→未收样(pageObj)→兜底。
+        串行：项目已登记(录入端点 checkInStatus=ALREADY 重查)→未制样(pageObjByMakeStatus)→未收样(pageObj)→兜底。
+        days: 受理日期窗口(天)，与主查询共用方法文件 date_window_days，避免窗口不一致致已登记样品误报"不存在"。
         报验编号=字母前缀+8位流水(_detection_no_of 提取)；各端点 keyword 统一用报验编号。
         异常仅记日志不抛、退回兜底文案，保证不阻断序列运行。"""
         base = self.login_system.base_url
@@ -1485,15 +1483,15 @@ class DetectionAPI:
             return bool((r.json().get('resultData') or {}).get('voList'))
 
         try:
-            # 1) 项目已登记：重查录入端点，checkInStatus 改 YES(含30天受理窗，keyword=全码)
+            # 1) 项目已登记：重查录入端点，checkInStatus 用 ALREADY(非 YES——抓包确认已登记列表页用此枚举)
             today = datetime.now()
-            one_month_ago = today - timedelta(days=30)
+            window_ago = today - timedelta(days=days)
             if _hit(f"{base}/detectionManager/manager/resultCheckIn/pagePCObjAndSample",
                     {**common, "_search": "false", "nd": int(time.time() * 1000),
                      "pageSize": 30, "pageNo": 1, "sampleStatus": "one", "decideProjectOrgId": "23",
-                     "acceptStartDate": one_month_ago.strftime("%Y-%m-%d"),
+                     "acceptStartDate": window_ago.strftime("%Y-%m-%d"),
                      "acceptEndDate": today.strftime("%Y-%m-%d"),
-                     "checkInStatus": "CHECK_IN_STATUS_YES", "keyword": dno}):
+                     "checkInStatus": "CHECK_IN_STATUS_ALREADY", "keyword": dno}):
                 return "已登记"
             # 制样/收样端点公共参数(按抓包：makeSampleMarkNames=A，keyword=报验编号)
             sp = {"_search": "false", "nd": int(time.time() * 1000), "pageSize": 30, "pageNo": 1,
@@ -1510,7 +1508,7 @@ class DetectionAPI:
         except Exception as e:
             if log_func:
                 log_func(f"[诊断异常] {type(e).__name__}: {str(e)[:200]}")
-        return "报验编号不存在或超过可查期限(>30天)"
+        return f"报验编号不存在或超过可查期限(>{days}天)"
 
     def get_all_configs(self, sample_project_ids, method_standard_no, result_checkin_ids=None, sample_id=None,
                         log_func=None, method_id=None, project_names=None):
