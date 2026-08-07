@@ -652,7 +652,9 @@ class _ParallelWMap(dict):
     """称量记录 dict：.get 按样品编号容错查找。
     称样记录的 A/B 平行常省略 3 位小号(写 报验编号+字母，如 TN26070729A/B)，合并后 key=报验编号
     (TN26070729)；而实验里样品编号是 报验编号+001(TN26070729001)，直接 get 会查不到。
-    故先精确查，miss 再用 _strip_parallel_suffix 去小号按报验编号查。仅覆盖 get——
+    另有种样记录用单字母后缀(如 TN26080226K，材质标记未配对、未合并为报验编号)，key 保留
+    TN26080226K，按 LIMS 全码 TN26080226001 查会 miss → desc/称样量/称样时间丢失。
+    故 get 依次：精确→去小号按报验编号→按报验编号 base 兜底匹配字母后缀键。仅覆盖 get——
     items/keys/迭代仍只含真实 key，不会冒出重复样品。"""
 
     def get(self, code, default=None):
@@ -660,7 +662,16 @@ class _ParallelWMap(dict):
         if v is not None:
             return v
         s = _strip_parallel_suffix(code)
-        return super().get(s, default) if s != code else default
+        if s != code:
+            v = super().get(s)
+            if v is not None:
+                return v
+        # 单字母后缀称样记录(如 TN…K)按报验编号 base 兜底匹配
+        for k, val in super().items():
+            b, letter = _base_and_letter(k)
+            if letter and b == s:
+                return val
+        return default
 
 
 _PARALLEL_LETTER_RE = re.compile(r'^(\D*\d+)([A-Za-z]+)$')
@@ -673,6 +684,21 @@ def _base_and_letter(code):
     if not m:
         return (code or ""), ""
     return m.group(1), m.group(2)
+
+
+def _code_belongs_sample(any_code, code, key):
+    """any_code(谱图文件名stem 或 PDF内容样品号) 是否归属样品 code(wmap合并后基编号)。
+    按小号匹配，避免 startswith(key) 把同报验号的其它小号全吃进：
+    - 精确: any_code == code
+    - 平行字母文件: any_code 去尾字母 == code (TN…001A.pdf ↔ 样品 TN…001)
+    - 简写报验编号(仅当 code 小号==001): any_code == key (TS26072277.pdf 代表 …001)"""
+    any_code = (any_code or "").strip()
+    if any_code == code:
+        return True
+    b, _ = _base_and_letter(any_code)
+    if b == code and b != any_code:
+        return True
+    return any_code == key and code == key + "001"
 
 
 def _merge_parallel_groups(wmap, non_parallel_suffixes=()):
@@ -2665,28 +2691,30 @@ class SequenceMaster:
         """称样设备 weighingEquipmentRaw 回填真实台账对象。
         selectByDetectionMethodId 返回的 raw 是「方法-设备配置行」(元数据=配置人/时间，如 李金玲/2026-03)；
         总和实验无称样列时 LIMS 仅在 weighingEquipment 为真实台账对象(元数据=台账创建人/时间)时绑定称样设备。
-        故用 ocChoicePage(网页端称样设备选择源) 取台账对象覆盖之；id/name 仍取自 weighingEquipmentId/BaseName。"""
+        故用 ocChoicePage(网页端称样设备选择源) 取台账对象覆盖之；id/name 仍取自 weighingEquipmentId/BaseName。
+        遍历批内全部样品项目查 ocChoicePage(设备可能只挂在批内某个样品项目下)，命中即止。"""
         wid = (equipment_config or {}).get("weighingEquipmentId")
         if not wid or not sp_ids_str:
             return equipment_config
-        first_sp = sp_ids_str.split(",")[0].strip()
-        if not first_sp:
+        sp_ids = [s.strip() for s in sp_ids_str.split(",") if s.strip()]
+        if not sp_ids:
             return equipment_config
-        try:
-            choices = self.api.get_weighing_equipment_choices(first_sp, log)
-        except Exception as e:
-            log(f"[设备] 取称样设备台账异常，沿用配置行: {e}")
-            return equipment_config
-        for it in choices:
-            raw = it.get("raw") or {}
-            _rids = {str(raw.get("id") or ""), str(raw.get("equipmentBillId") or "")}
-            if str(wid) in _rids:
-                cfg = dict(equipment_config)
-                cfg["weighingEquipmentRaw"] = raw
-                log(f"[设备] 称样设备台账回填: id={wid} creator={raw.get('creatorName')!r} "
-                    f"createDatetime={raw.get('createDatetime')!r}")
-                return cfg
-        log(f"[设备] ocChoicePage 未找到称样设备台账(id={wid})，沿用配置行")
+        for sp in sp_ids:
+            try:
+                choices = self.api.get_weighing_equipment_choices(sp, log)
+            except Exception as e:
+                log(f"[设备] 取称样设备台账异常(sp={sp})，跳过: {e}")
+                continue
+            for it in choices:
+                raw = it.get("raw") or {}
+                _rids = {str(raw.get("id") or ""), str(raw.get("equipmentBillId") or "")}
+                if str(wid) in _rids:
+                    cfg = dict(equipment_config)
+                    cfg["weighingEquipmentRaw"] = raw
+                    log(f"[设备] 称样设备台账回填: id={wid} sp={sp} creator={raw.get('creatorName')!r} "
+                        f"createDatetime={raw.get('createDatetime')!r}")
+                    return cfg
+        log(f"⚠ [设备] 称样设备台账未在批内任何样品项目找到(id={wid}, sp_ids={sp_ids_str})，本批将不绑定称样设备")
         return equipment_config
 
     def select_spectrum_path(self, row_index):
@@ -3354,7 +3382,8 @@ class SequenceMaster:
         method_names = self._method_query_names(mf)
         target_codes = [sc for sc, _ in samples]
         projects_by_sample = {}
-        if method_names and len(target_codes) > threshold:
+        if method_names and target_codes:
+            # ponytail: 服务器对同session请求串行，小批量也走池(按方法1次/标准号 < N次逐样品精确)；池漏的 missing 仍精确兜底
             pooled = self._query_projects_by_methods(method_names, log, days=pool_days)
             if pooled:
                 for _p in pooled:
@@ -3430,26 +3459,34 @@ class SequenceMaster:
                 log(f"[{it['sample_code']}] {it['project'].get('projectName','')}: "
                     f"谱图筛选 {before}→{after} 个")
 
-        # 上传谱图(清空后旧谱图已删，此时上传不重复)；按样品记录 spectrum_uploaded
+        # 上传谱图：同一文件只 POST 一次，fileId 跨样品/项目复用(提交阶段 fid_info 按 fileId 去重)
+        _upload_cache = {}  # pdf_path -> uploaded entry or None(失败)
+        _posted, _failed = [], []
         for it in all_items:
             if self._aborted(idx):
                 return "abort"
             uploaded = []
             for pdf in list(dict.fromkeys((it.get("pdf_paths") or []) + common_pdfs)):
-                up_ok, up_res = self.api.upload_spectrum_file(pdf, "", log)
-                if up_ok and isinstance(up_res, dict):
-                    uploaded.append({
+                if pdf not in _upload_cache:
+                    up_ok, up_res = self.api.upload_spectrum_file(pdf, "", log)
+                    rec = ({
                         "fileId": up_res.get("id"),
                         "fileName": up_res.get("orgName") or up_res.get("name"),
                         "url": up_res.get("url"),
-                    })
+                    } if up_ok and isinstance(up_res, dict) else None)
+                    _upload_cache[pdf] = rec
+                    if rec:
+                        _posted.append(rec["fileName"])
+                    else:
+                        _failed.append(os.path.basename(pdf))
+                rec = _upload_cache.get(pdf)
+                if rec:
+                    uploaded.append(rec)
             it["spectrum_uploaded"] = uploaded
-            if it.get("pdf_paths"):
-                if uploaded:
-                    log(f"[{it['sample_code']}] 谱图已上传 {len(uploaded)} 个: "
-                        f"{', '.join(f['fileName'] for f in uploaded)}")
-                else:
-                    log(f"警告[{it['sample_code']}]: 谱图上传失败({len(it['pdf_paths'])} 个)")
+        if _posted:
+            log(f"谱图上传 {len(_posted)} 个(去重): {', '.join(_posted)}")
+        if _failed:
+            log(f"警告: 谱图上传失败 {len(_failed)} 个: {', '.join(_failed)}")
 
         # 阶段B：按 query_rules 顺序 + input_method(方法=跨样品合并 / 样品=按样品) 规划并提交
         # 方法模式下，同一目标方法(default_rules/filename_rules.to_id)的不同样品项目并入一个实验编号
@@ -3837,8 +3874,9 @@ class SequenceMaster:
                 _npars = sorted(set(n_par_by_sample.values())) if n_par_by_sample else [1]
                 log(f"称样量({wmode}) {mass_col.get('columeName', '')} 规则[{rname}] 跨{len(pmasses_by_sample)}样品 按平行({'/'.join(map(str, _npars))})")
                 _fill_desc_column(records, desc_by_sample)
-                first_sc = batch_items[0]["sample_code"] if batch_items else ""
-                analysis_start = (ctx["wmap"].get(first_sc) or {}).get("time")
+            # ponytail: analysis_start 须在 else 外——总和项目无称样列(mass_col=None)时仍需称样时间作 startTime
+            first_sc = batch_items[0]["sample_code"] if batch_items else ""
+            analysis_start = (ctx["wmap"].get(first_sc) or {}).get("time")
         elif wmode == "pdf":
             # PDF报告 - 称样量取自报告(样品初始质量)，按 decimal_places 保留末尾0(0.31→0.3100)
             mass_col = _find_weighing_column(dynamic_columns)
@@ -3882,8 +3920,8 @@ class SequenceMaster:
                 _npars = sorted({len(v) for v in pmasses_by_sample.values() if v}) or [0]
                 log(f"称样量(pdf) {mass_col.get('columeName', '')} 字段[{field}] 跨{len(pmasses_by_sample)}样品 按报告段({'/'.join(map(str, _npars))})")
                 _fill_desc_column(records, desc_by_sample)
-                first_sc = batch_items[0]["sample_code"] if batch_items else ""
-                analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
+            first_sc = batch_items[0]["sample_code"] if batch_items else ""
+            analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
         elif wmode:
             log(f"称样量模式={wmode} 暂未接入(本轮支持 random/none/record/process/pdf)")
 
@@ -3981,11 +4019,24 @@ class SequenceMaster:
             except Exception as e:
                 log(f"读取真实实验编号失败: {e}")
 
+        # 称样设备随主检设备一起提交到 saveMainEqubment：网页端 detectionEquipmentList 里检测设备与
+        # 称样设备并列(如 MDI 电子天平 id=1537)，称样设备只有经 saveMainEqubment 才会进该列表；
+        # 仅放 saveOcExperiment 载荷的 weighingEquipment 字段不会显示在登记页设备列表。
+        weigh_item = None
+        _wid = (equipment_config or {}).get("weighingEquipmentId")
+        if _wid and experiment_id:
+            for eq in (equipment_config or {}).get("raw_data") or []:
+                if eq.get("usedCategory") == "称样设备" \
+                        and str(eq.get("equipmentBillId") or eq.get("id")) == str(_wid):
+                    weigh_item = {"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
+                    break
         # 主检设备保存（对照 detection_entry_main:1757-1766）：表格指定了设备则提交这些设备；
         # 未指定(默认模式)则提交方法全部默认检测设备(isDefault=1)，与手动界面「查询设备」默认勾选一致
         if matched_list and experiment_id:
             items = [{"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
                      for eq in matched_list]
+            if weigh_item:
+                items.append(weigh_item)
             eq_ok, _ = self.api.save_main_equipment(experiment_id, items, log)
             log(f"主检设备{'提交成功' if eq_ok else '提交失败'}: "
                 f"{','.join(str(i['id']) for i in items)}")
@@ -4010,6 +4061,8 @@ class SequenceMaster:
                     and (eq.get("equipmentBillId") or eq.get("id"))
                     and str(eq.get("equipmentBillId") or eq.get("id")) in main_ids
                 ]
+                if weigh_item:
+                    default_items.append(weigh_item)
                 if default_items:
                     eq_ok, _ = self.api.save_main_equipment(experiment_id, default_items, log)
                     log(f"主检设备{'提交成功' if eq_ok else '提交失败'}(默认{len(default_items)}台): "
@@ -4075,11 +4128,12 @@ class SequenceMaster:
         content_index = {p: extract_content_sample_ids(p) for p in pdfs}
         cands = []
         for code, entry in wmap.items():
-            key = _strip_parallel_suffix(code)  # 称样编号带平行小号(001)、谱图文件名不带：去小号后匹配
-            # 文件名前缀 或 PDF 内容 `样品 :` 号命中(支持文件名≠内容号的报告)
+            key = _strip_parallel_suffix(code)  # 报验编号(去小号)；简写文件名(无小号)代表001时用它
+            # 按小号匹配(精确/平行字母/简写)，避免 startswith(key) 吃进同报验号其它小号
             matched = [p for p in pdfs
-                       if os.path.basename(p).startswith(key)
-                       or any(cid == code or cid.startswith(key) for cid in content_index.get(p, ()))]
+                       if _code_belongs_sample(
+                           os.path.splitext(os.path.basename(p))[0].split("-", 1)[0], code, key)
+                       or any(_code_belongs_sample(cid, code, key) for cid in content_index.get(p, ()))]
             if matched:
                 cands.append((code, (entry or {}).get("desc") or "", matched))
         if not cands:
@@ -4328,9 +4382,13 @@ class SequenceMaster:
             return (d + s) if d and s else _fallback_sc
 
         # 逐样品取组分对比数据，索引 {sample: {norm_projectName: {serialNumber: rec}}}
+        # ponytail: 多样品并行查(单请求~6s，串行=N×6s)；session 并发同 _query_samples_parallel
         comp_by_sample = {}
-        for sc in batch_samples:
-            cr = self.api.get_oc_compare_show_data(sc, items, log)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(6, len(batch_samples) or 1)) as _ex:
+            _fetched = list(_ex.map(lambda sc: (sc, self.api.get_oc_compare_show_data(sc, items, log)),
+                                    batch_samples))
+        for sc, cr in _fetched:
             idx = {}
             for r in cr or []:
                 pn = _norm_cn(r.get("projectName"))  # NFKC 归一，兼容 @ 别名的全角/半角逗号等变体
@@ -4586,6 +4644,12 @@ class SequenceMaster:
         # 解析每条规则的方法 → (标准号, 子方法ID)。文本标准号名(如 'AfPS GS 2019:01 PAK 单组份')解析子方法ID。
         # 一个标准号下常有多个子方法(单组份/N项之和)，各为独立 methodId，须按子方法ID精确过滤，
         # 否则同标准号的项目混在一起会让 getOcExperiment 报 005"样品项目对应的方法不同"。
+        # ponytail: 多规则首次解析并行(串行=N×RTT，afps 6规则≈6倍延迟)，缓存命中后样品2+零开销
+        _need = [m for m in dict.fromkeys(str(q.get("method") or "").strip() for q in qr
+                                          if str(q.get("method") or "").strip())
+                 if m not in self.api._std_no_name_to_id]
+        if _need:
+            self.api._prefetch_std_no_name_ids(_need, log)  # 批量1次API(原逐规则串行N次≈N×3.5s)
         rule_stds = []  # [(规则序号, 标准号, 子方法ID或None)]，仅含有 method 的规则
         for _i, q in enumerate(qr):
             mv = str(q.get("method") or "").strip()
@@ -4948,7 +5012,7 @@ class SequenceMaster:
                 f.write(self.log_text.get("1.0", "end-1c"))
 
     def _log(self, msg):
-        self._ui_q.put(("log", msg))
+        self._ui_q.put(("log", f"[{time.strftime('%H:%M:%S')}] {msg}"))
 
     def _build_confirm_dialog(self, prompt):
         """主线程：构建确认面板（非 grab，不挡表格/日志）"""
@@ -5307,6 +5371,42 @@ def _selfcheck():
     assert _std_loose_match(_hg, "IEC 62321-3-1:2013+IEC 62321-7-2:2017 XRF") is False        # 汞≠六价铬
     assert _std_loose_match("IEC 62321-3-1:2013+IEC 62321-7-2:2017 XRF",
                            "IEC 62321-3-1:2013+IEC 62321-7-2:2017 XRF") is True
+
+    # _enrich_weighing_bill：批内首个样品项目 ocChoicePage 没有该台账时，应遍历后续样品项目命中
+    # (修复偶发「缺称样设备」：原实现只查 split(",")[0])
+    _wid = "777"
+    _raw_hit = {"id": 777, "creatorName": "系统管理员", "createDatetime": "2023-08-25 10:00:00"}
+    class _FakeAPI:
+        def __init__(self, table): self.t = table
+        def get_weighing_equipment_choices(self, sp, log): return self.t.get(sp, [])
+    _cfg = {"weighingEquipmentId": _wid, "weighingEquipmentRaw": None}
+    _sm = SequenceMaster.__new__(SequenceMaster)
+    _sm.api = _FakeAPI({"sp1": [{"raw": {"id": 111}}], "sp2": [{"raw": _raw_hit}]})
+    _out = SequenceMaster._enrich_weighing_bill(_sm, _cfg, "sp1,sp2", lambda *a: None)
+    assert _out["weighingEquipmentRaw"] is _raw_hit, _out          # sp1 未命中→遍历到 sp2 命中
+    _sm2 = SequenceMaster.__new__(SequenceMaster)
+    _sm2.api = _FakeAPI({"sp1": [{"raw": _raw_hit}]})
+    _out2 = SequenceMaster._enrich_weighing_bill(_sm2, _cfg, "sp1,sp2", lambda *a: None)
+    assert _out2["weighingEquipmentRaw"] is _raw_hit, _out2         # 回归：首个即命中
+
+    # _code_belongs_sample：按小号匹配，不把同报验号其它小号吃进
+    assert _code_belongs_sample("TS26072277087", "TS26072277087", "TS26072277")       # 精确
+    assert not _code_belongs_sample("TS26072277055", "TS26072277087", "TS26072277")   # 同报验号不同小号不归属
+    assert _code_belongs_sample("TN26070729001A", "TN26070729001", "TN26070729")     # 平行字母文件
+    assert _code_belongs_sample("TS26072277", "TS26072277001", "TS26072277")         # 简写报验编号代表001
+    assert not _code_belongs_sample("TS26072277", "TS26072277087", "TS26072277")     # 简写不代表087
+
+    # _ParallelWMap：单字母后缀称样记录(如 TN…K)按 LIMS 全码(…001)能查回 desc/称样量。
+    # 回归：K 样品子方法切换(desc 匹配)与称样量回填不再因 key≠全码而 miss。
+    _wm = _merge_parallel_groups(_ParallelWMap({
+        "TN26080226K": {"desc": "草颗粒", "masses": [0.5140], "time": "2026-08-06 10:00:00"},
+        "TN26080248001A": {"desc": "草", "masses": [0.5268], "time": "2026-08-06 10:00:00"},
+        "TN26080248001B": {"desc": "草", "masses": [0.5016], "time": "2026-08-06 10:00:00"},
+    }))
+    assert "TN26080226K" in _wm and "TN26080248001" in _wm, dict(_wm)   # K 保留原键；A/B 合并为全码
+    assert _wm.get("TN26080226001").get("desc") == "草颗粒", "K 后缀按 LIMS 全码查应命中"
+    assert _wm.get("TN26080248001").get("masses") == [0.5268, 0.5016]   # A/B 平行合并(原有行为)
+    assert _wm.get("TN26080226K").get("desc") == "草颗粒"               # 原键仍可直接查
     print("selfcheck OK")
 
 

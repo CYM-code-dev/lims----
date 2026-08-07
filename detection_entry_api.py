@@ -9,12 +9,21 @@ import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 import pandas as pd
 import os
+import re
 import unicodedata
 import paths
 from openpyxl import load_workbook
 
 # 禁用SSL警告
 urllib3.disable_warnings(InsecureRequestWarning)
+
+
+def _detection_no_of(code):
+    """从样品号提取报验编号(字母前缀+8位流水)，作为服务端 keyword 查询值。
+    输入可能带 3 位小号(001)、平行字母(A/B)或非标准后缀(如 _报告)，
+    统一截取开头的 字母+8位；不符该结构(如已是无小号的报验编号)原样返回。"""
+    m = re.match(r'[A-Za-z]+\d{8}', (code or '').strip())
+    return m.group(0) if m else (code or '')
 
 class DetectionAPI:
     def __init__(self, login_system):
@@ -26,7 +35,7 @@ class DetectionAPI:
         self.current_sample_id = None
         self.sub_method_map = {}
         self.method_id_to_standard_no = {}
-        self._std_no_name_to_id = {}  # standardNoName -> methodId（如 'AfPS GS 2019:01 PAK 单组份' -> 4489）
+        self._std_no_name_to_id = self._load_std_no_name_cache()  # standardNoName -> methodId，持久化跨进程复用
         self.cached_solution_types = None
 
         # 实验编号缓存
@@ -1371,9 +1380,10 @@ class DetectionAPI:
                     "loginId": self.get_user_login_id(),
                 }
 
-                # 精确匹配模式：使用样品编号作为关键字
+                # 精确匹配模式：用报验编号(字母+8位)作 keyword——服务端按 detectionNo 匹配，
+                # 输入若带小号/平行字母/后缀(如 TS26080731001_报告)需先归一到报验编号 TS26080731
                 if exact_match and sample_code:
-                    params["keyword"] = sample_code
+                    params["keyword"] = _detection_no_of(sample_code)
                 else:
                     # 模糊查询模式：使用各个字段分别查询
                     if sample_code:
@@ -1458,7 +1468,7 @@ class DetectionAPI:
     def diagnose_missing_sample(self, sample_code, log_func=None):
         """录入查询查不到样品时，按 收样→制样→登记 生命周期定位真实原因，返回具体中文理由。
         串行：项目已登记(录入端点 checkInStatus=YES 重查)→未制样(pageObjByMakeStatus)→未收样(pageObj)→兜底。
-        报验编号=样品号去末尾3位小号；已登记检查用全码(与录入端点 sampleCode 一致)。
+        报验编号=字母前缀+8位流水(_detection_no_of 提取)；各端点 keyword 统一用报验编号。
         异常仅记日志不抛、退回兜底文案，保证不阻断序列运行。"""
         base = self.login_system.base_url
         sess = self.login_system.session
@@ -1466,7 +1476,7 @@ class DetectionAPI:
                   "loginId": self.get_user_login_id()}
         headers = {'Accept': 'application/json, text/javascript, */*; q=0.01',
                    'Referer': f'{base}/web/detectionResultCheckInListMgt.html'}
-        dno = sample_code[:-3] if len(sample_code) > 3 else sample_code  # 报验编号=去末尾3位小号
+        dno = _detection_no_of(sample_code)  # 报验编号=字母+8位(原 [:-3] 遇 _报告 等后缀会误剥)
 
         def _hit(url, params):
             r = sess.get(url, params=params, headers=headers, verify=False, timeout=60)
@@ -1483,7 +1493,7 @@ class DetectionAPI:
                      "pageSize": 30, "pageNo": 1, "sampleStatus": "one", "decideProjectOrgId": "23",
                      "acceptStartDate": one_month_ago.strftime("%Y-%m-%d"),
                      "acceptEndDate": today.strftime("%Y-%m-%d"),
-                     "checkInStatus": "CHECK_IN_STATUS_YES", "keyword": sample_code}):
+                     "checkInStatus": "CHECK_IN_STATUS_YES", "keyword": dno}):
                 return "已登记"
             # 制样/收样端点公共参数(按抓包：makeSampleMarkNames=A，keyword=报验编号)
             sp = {"_search": "false", "nd": int(time.time() * 1000), "pageSize": 30, "pageNo": 1,
@@ -2029,6 +2039,29 @@ class DetectionAPI:
         except Exception as e:
             return None
 
+    def _std_no_name_cache_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".method_id_cache.json")
+
+    def _load_std_no_name_cache(self):
+        import os, json
+        try:
+            p = self._std_no_name_cache_path()
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_std_no_name_cache(self):
+        import json
+        try:
+            with open(self._std_no_name_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(self._std_no_name_to_id, f, ensure_ascii=False)
+        except Exception:
+            pass
+
     def get_method_id_by_standard_no_name(self, standard_no_name, log_func=None):
         """按 standardNoName（如 'AfPS GS 2019:01 PAK 单组份'）解析子方法 methodId。
         一个标准号下常有多个子方法（单组份/N项之和），各为独立 methodId；
@@ -2075,12 +2108,48 @@ class DetectionAPI:
                         if (m.get('standardNoName') or "").strip() == key:
                             mid = m.get('id')
                             self._std_no_name_to_id[key] = mid
+                            self._save_std_no_name_cache()
                             return mid
             return None
         except Exception as e:
             if log_func:
                 log_func(f"解析子方法ID异常({key}): {str(e)}")
             return None
+
+    def _prefetch_std_no_name_ids(self, names, log_func=None):
+        """批量预取子方法ID：一次查30天内全部 decideMethod 记录，按 standardNoName 填缓存。
+        替代逐方法名串行查(N方法名=N×RTT)；未命中的名字仍由 get_method_id_by_standard_no_name 单查兜底。"""
+        names = {n for n in names if n and n not in self._std_no_name_to_id}
+        if not names:
+            return
+        try:
+            today = datetime.now()
+            params = {
+                "_search": "false", "nd": str(int(time.time() * 1000)),
+                "pageSize": "9999", "pageNo": "1", "sidx": "", "sord": "asc",
+                "acceptStartDate": (today - timedelta(days=30)).strftime("%Y-%m-%d"),
+                "acceptEndDate": today.strftime("%Y-%m-%d"),
+                "checkInStatus": "CHECK_IN_STATUS_NO", "decideProjectOrgName": "23",
+                "subpackage": "NO", "pid": self.get_user_pid(), "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+            }
+            response = self.login_system.session.get(
+                f"{self.login_system.base_url}/detectionManager/manager/resultCheckIn/selectCheckInDecideMethodName",
+                params=params, headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInListMgt.html?state=state',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }, verify=False, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    for m in result.get('resultData', []) or []:
+                        sn = (m.get('standardNoName') or "").strip()
+                        if sn in names:
+                            self._std_no_name_to_id[sn] = m.get('id')
+        except Exception as e:
+            if log_func:
+                log_func(f"预取子方法ID异常: {e}")
 
     def check_and_switch_sub_method(self, method_id, log_func=None):
         """检查并切换子方法 - 修复返回格式问题"""
