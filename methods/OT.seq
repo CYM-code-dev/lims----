@@ -1,0 +1,17 @@
+sequence_data:
+- id: 1
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/OT/称量记录1.xlsx
+  method_file: D:/Agent/lims数据登记/methods/OT.mtd
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/OT
+  temperature: '26'
+  humidity: '53'
+column_widths:
+- 50
+- 260
+- 220
+- 140
+- 180
+- 260
+- 90
+- 90
+- 140

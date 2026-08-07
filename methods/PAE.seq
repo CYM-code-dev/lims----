@@ -1,32 +1,16 @@
 sequence_data:
 - id: 1
-  weighing_path: D:/下载文件/钉钉/20260804-PD-036-1/称样记录.xlsx
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/20260805-PD/称样记录.csv
   method_file: D:/Agent/lims数据登记/methods/跑道PAE固体.mtd
-  reference_material: ''
-  equipment: ''
-  spectrum_path: D:/下载文件/钉钉/20260804-PD-036-1
-  sample_code: ''
-  configure_order: D-9156
-  standard_type: fixed
-  instrument_setting: default
-  weighing_mode: record
-  temperature: '24'
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/20260805-PD
+  temperature: '25'
   humidity: '60'
-  experiment_code: ''
 - id: 2
-  weighing_path: D:/下载文件/钉钉/20260804-PD-036-1/称样记录.xlsx
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/20260805-PD/称样记录.csv
   method_file: D:/Agent/lims数据登记/methods/跑道PAE液体.mtd
-  reference_material: ''
-  equipment: ''
-  spectrum_path: D:/下载文件/钉钉/20260804-PD-036-1
-  sample_code: ''
-  configure_order: D-9156
-  standard_type: fixed
-  instrument_setting: default
-  weighing_mode: random
-  temperature: '24'
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/20260805-PD
+  temperature: '25'
   humidity: '60'
-  experiment_code: ''
 column_widths:
 - 50
 - 260

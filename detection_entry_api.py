@@ -1455,6 +1455,53 @@ class DetectionAPI:
                 log_func(f"[API异常] {type(e).__name__}: {str(e)[:200]}")
             return []
 
+    def diagnose_missing_sample(self, sample_code, log_func=None):
+        """录入查询查不到样品时，按 收样→制样→登记 生命周期定位真实原因，返回具体中文理由。
+        串行：项目已登记(录入端点 checkInStatus=YES 重查)→未制样(pageObjByMakeStatus)→未收样(pageObj)→兜底。
+        报验编号=样品号去末尾3位小号；已登记检查用全码(与录入端点 sampleCode 一致)。
+        异常仅记日志不抛、退回兜底文案，保证不阻断序列运行。"""
+        base = self.login_system.base_url
+        sess = self.login_system.session
+        common = {"pid": self.get_user_pid(), "pname": self.get_user_pname(),
+                  "loginId": self.get_user_login_id()}
+        headers = {'Accept': 'application/json, text/javascript, */*; q=0.01',
+                   'Referer': f'{base}/web/detectionResultCheckInListMgt.html'}
+        dno = sample_code[:-3] if len(sample_code) > 3 else sample_code  # 报验编号=去末尾3位小号
+
+        def _hit(url, params):
+            r = sess.get(url, params=params, headers=headers, verify=False, timeout=60)
+            if r.status_code != 200:
+                return False
+            return bool((r.json().get('resultData') or {}).get('voList'))
+
+        try:
+            # 1) 项目已登记：重查录入端点，checkInStatus 改 YES(含30天受理窗，keyword=全码)
+            today = datetime.now()
+            one_month_ago = today - timedelta(days=30)
+            if _hit(f"{base}/detectionManager/manager/resultCheckIn/pagePCObjAndSample",
+                    {**common, "_search": "false", "nd": int(time.time() * 1000),
+                     "pageSize": 30, "pageNo": 1, "sampleStatus": "one", "decideProjectOrgId": "23",
+                     "acceptStartDate": one_month_ago.strftime("%Y-%m-%d"),
+                     "acceptEndDate": today.strftime("%Y-%m-%d"),
+                     "checkInStatus": "CHECK_IN_STATUS_YES", "keyword": sample_code}):
+                return "已登记"
+            # 制样/收样端点公共参数(按抓包：makeSampleMarkNames=A，keyword=报验编号)
+            sp = {"_search": "false", "nd": int(time.time() * 1000), "pageSize": 30, "pageNo": 1,
+                  "sidx": "", "sord": "asc", "makeSampleMarkNames": "A", "advanced": "",
+                  **common, "keyword": dno}
+            # 2) 未制样
+            if _hit(f"{base}/detectionManager/manager/sample/pageObjByMakeStatus",
+                    {**sp, "sampleMakeStatus": "SAMPLE_MAKE_STATUS_NO"}):
+                return "未制样"
+            # 3) 未收样
+            if _hit(f"{base}/detectionManager/manager/sample/pageObj",
+                    {**sp, "sampleReceiveStatus": "SAMPLE_RECEIVE_STATUS_NO_INVENTORY_STATUS_ALREADY"}):
+                return "未收样"
+        except Exception as e:
+            if log_func:
+                log_func(f"[诊断异常] {type(e).__name__}: {str(e)[:200]}")
+        return "报验编号不存在或超过可查期限(>30天)"
+
     def get_all_configs(self, sample_project_ids, method_standard_no, result_checkin_ids=None, sample_id=None,
                         log_func=None, method_id=None, project_names=None):
         """获取所有配置信息 - 集成动态列处理"""
@@ -1701,6 +1748,7 @@ class DetectionAPI:
             'weighingEquipment': weighing_equipment_display_name,
             'weighingEquipmentBaseName': weighing_equipment_base_name,
             'weighingEquipmentId': weighing_equipment_id,
+            'weighingEquipmentRaw': weighing_equipments[0]['equipment'] if weighing_equipments else None,
             'titrationEquipment': '',
             'cultivationEquipment': '',
             'mainEquipmentNames': main_equipment_names,
@@ -2370,6 +2418,26 @@ def _match_fixed_params(fixed_params, project):
     return overrides
 
 
+def _we_datetime_str(v):
+    """称样设备台账日期 → LIMS 字符串 "YYYY-MM-DD HH:MM:SS"。
+    raw_data(selectByDetectionMethodId) 里 createDatetime/modifyDatetime 是 epoch-ms 整型；
+    总和无称样列时 LIMS 仅在 weighingEquipment 对象日期可解析时绑定称样设备，整型会致绑定失败。"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            return datetime.fromtimestamp(v / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError, OverflowError):
+            return str(v)
+    s = str(v).strip()
+    if s.isdigit():
+        try:
+            return datetime.fromtimestamp(int(s) / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError, OverflowError):
+            return s
+    return s  # 已是字符串日期，原样
+
+
 def build_grouped_experiment_data(host, projects, experiment_code, method_name, experiment_process_override=None):
     """构建分组实验数据 - 包含完整标准物质信息（共享实现，阶段0从 detection_entry_main 抽出）。
 
@@ -2437,11 +2505,24 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
     weighing_equipment_base_name = self.equipment_config.get('weighingEquipmentBaseName', '')
     weighing_equipment_id = self.equipment_config.get('weighingEquipmentId', '')
 
-    # 修复设备信息格式 - 与前端保持一致
-    weighing_equipment_obj = {
-        "name": weighing_equipment_base_name or weighing_equipment,
-        "id": weighing_equipment_id
-    } if weighing_equipment_id else ""
+    # 修复设备信息格式 - 与前端 saveOcExperiment 一致：发完整台账对象(id/name + 元数据)。
+    # 无称样列的实验(如总和) LIMS 仅在收到完整对象时绑定称样设备(单组份有称样列,{id,name} 即可)
+    _we_raw = self.equipment_config.get('weighingEquipmentRaw')
+    if weighing_equipment_id:
+        weighing_equipment_obj = {
+            "id": weighing_equipment_id,
+            "name": weighing_equipment_base_name or weighing_equipment,
+        }
+        if isinstance(_we_raw, dict):
+            for _k in ("creatorName", "creatorId", "modifierName", "createDatetime", "modifyDatetime"):
+                _v = _we_raw.get(_k)
+                if _v is None:
+                    continue
+                if _k in ("createDatetime", "modifyDatetime"):
+                    _v = _we_datetime_str(_v)
+                weighing_equipment_obj[_k] = _v
+    else:
+        weighing_equipment_obj = ""
 
     weighing_equipment_json = weighing_equipment
 
@@ -2584,6 +2665,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
             selectmap_data = {}
 
             # 使用用户输入的值覆盖默认值
+            _is_headless = getattr(self, "is_headless", False)
             for col in self.dynamic_columns:
                 col_id = col.get('id')
                 col_code = col.get('columeCode', f'dynamic{col_id}')
@@ -2613,12 +2695,13 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
                     else:
                         dynamic_fields[col_code] = default_val
 
-                # 固定参数：仅当该列无真实值(手填或报告解析填入)时补全默认值；有值则尊重不覆盖。
-                # 序列(无头)模式不再强覆盖——报告解析已把实测浓度填进 data_fields(如「样品浓度C」)，
-                # 固定参数(默认 <检出限)只应兜底无值列(如试剂空白C₀、校正系数e)，不应冲掉实测浓度
-                # (否则可溶性汞等由 样品浓度C 计算的结果会被钉死在 <0.004)。
+                # 固定参数：仅当该列无真实值(手填或报告解析填入)时补全；有真实值则尊重不覆盖。
+                # 序列(无头)模式 data_fields 预填的是列 defaultVal(占位)，并非真实输入——
+                # 占位值(==defaultVal)应被固定参数覆盖；但报告解析填入的实测浓度(如「样品浓度C」，≠defaultVal)
+                # 不被覆盖(否则可溶性汞等由 样品浓度C 计算的结果会被钉死在 <0.004)。
                 _cn = _norm_cn(col_name)
-                if _cn and _cn in fixed_overrides and not user_value:
+                _placeholder = _is_headless and user_value == str(default_val or "").strip()
+                if _cn and _cn in fixed_overrides and (not user_value or _placeholder):
                     dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
                 # 构建selectmap数据 - 与前端保持一致
@@ -2865,4 +2948,8 @@ if __name__ == "__main__":
     assert len(set(_codes)) == 4, _codes                       # 同秒4批各不相同
     assert all(c.startswith("lqy") and len(c) == 17 for c in _codes), _codes  # 格式不变
     assert _api.generate_experiment_code(method_name="m0") == _codes[0]       # 同方法非force_new 复用缓存
+    # 称样设备台账日期归一化自检：整型 epoch-ms → "YYYY-MM-DD HH:MM:SS" 字符串(总和绑定称样设备依赖此)
+    assert _we_datetime_str(1772507451000).startswith("20") and isinstance(_we_datetime_str(1772507451000), str)
+    assert _we_datetime_str("2026-05-07 09:00:44") == "2026-05-07 09:00:44"  # 已是字符串，原样
+    assert _we_datetime_str(None) is None                                     # None 不填该字段
     print("detection_entry_api selfcheck OK")

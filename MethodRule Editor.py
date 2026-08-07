@@ -9,9 +9,14 @@ import paths
 import random
 
 
+_BIG_CB_STYLE = {'name': None}  # 模块级缓存：幂等。重复构建会重建图像并覆盖持有引用，旧 PhotoImage 被 GC 后已建复选框的勾选标记消失
+
+
 def _make_large_cb_style(scale=1.3):
     """放大 ttk.Checkbutton 勾选框：复用 ttkbootstrap 内置位图按 scale 重建 indicator element。
-    ponytail: 与 detection_entry_main.py 同实现。"""
+    幂等：重复调用直接返回已建样式，不重建(否则旧勾选框图像被 GC)。ponytail: 与 detection_entry_main.py 同实现。"""
+    if _BIG_CB_STYLE['name']:
+        return _BIG_CB_STYLE['name']
     try:
         from ttkbootstrap.style.layout import image_element, layout, El
         from ttkbootstrap.style.assets import RecolorRenderer
@@ -33,6 +38,7 @@ def _make_large_cb_style(scale=1.3):
                children=[El('Checkbutton.label', sticky=tk.NSEW)])]))
         s.configure(sn, background=c.bg, foreground=c.fg, focuscolor=c.fg)
         s._big_cb_imgs = (chk, unk, dchk, dunk)  # 持有 PhotoImage 引用防 GC
+        _BIG_CB_STYLE['name'] = sn
         return sn
     except Exception:
         return None
@@ -155,10 +161,10 @@ class QueryTab:
         self.query_method_entry = ttk.Entry(row0, width=20)
         self.query_method_entry.grid(row=0, column=3, padx=(0, 5), pady=1, sticky='ew')
 
-        # 第二行：Retest / 最大选中数量 / Mode / 添加
+        # 第二行：Retest / 最大选中数量 / Mode / 是否总和 / 添加
         row1 = ttk.Frame(input_frame)
         row1.pack(fill='x', pady=1)
-        row1.columnconfigure(6, weight=1)  # 末尾空白撑开，把添加按钮推到右侧
+        row1.columnconfigure(8, weight=1)  # 末尾空白撑开，把添加按钮推到右侧
 
         ttk.Label(row1, text="Retest:").grid(row=0, column=0, padx=(0, 5), pady=1, sticky='w')
         self.query_cancel_test_var = tk.BooleanVar()
@@ -174,28 +180,36 @@ class QueryTab:
         self.query_mode_var = tk.StringVar(value="方法")
         self.query_mode_combo = ttk.Combobox(row1, textvariable=self.query_mode_var,
                                              values=["方法", "样品"], state="readonly", width=8)
-        self.query_mode_combo.grid(row=0, column=5, padx=(0, 5), pady=1, sticky='w')
+        self.query_mode_combo.grid(row=0, column=5, padx=(0, 10), pady=1, sticky='w')
+
+        # 是否总和：勾选才走「总和录入」(读各组分值求和)，否则按报告解析
+        ttk.Label(row1, text="是否总和:").grid(row=0, column=6, padx=(0, 5), pady=1, sticky='w')
+        self.query_sum_entry_var = tk.BooleanVar()
+        self.query_sum_entry_check = ttk.Checkbutton(
+            row1, variable=self.query_sum_entry_var, style=self.app.large_cb_style)
+        self.query_sum_entry_check.grid(row=0, column=7, padx=(0, 5), pady=1, sticky='w')
 
         self.add_query_rule_btn = ttkb.Button(row1, text="添加", command=self.add_query_rule, bootstyle="secondary")
-        self.add_query_rule_btn.grid(row=0, column=7, padx=(5, 0), pady=1, sticky='e')
+        self.add_query_rule_btn.grid(row=0, column=9, padx=(5, 0), pady=1, sticky='e')
 
         # 创建规则显示区域
         display_frame = ttk.Frame(rules_frame)
         display_frame.pack(fill='both', expand=True, pady=5)
 
         # 创建规则表格 - 列顺序与输入框一致：项目/检测方法/Retest/最大选中数量；Mode 为非输入项置末
-        columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode")
+        columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode", "是否总和")
         self.query_rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=10)
 
         # 设置列标题和宽度
-        # 短列(No/Retest/Max/Mode)固定窄列宽不随窗口拉伸；文本列(项目/检测方法)随窗口伸缩
+        # 短列(No/Retest/Max/Mode/是否总和)固定窄列宽不随窗口拉伸；文本列(项目/检测方法)随窗口伸缩
         column_configs = {
             "No": {"width": 50, "anchor": "center", "stretch": False},  # 序号列居中对齐
             "项目": {"width": 200, "anchor": "center"},  # 项目列居中对齐
             "检测方法": {"width": 200, "anchor": "center"},  # 检测方法列居中对齐
             "Retest": {"width": 90, "anchor": "center", "stretch": False},  # 注销复测列居中对齐
             "Max": {"width": 80, "anchor": "center", "stretch": False},  # 最大选中数量列居中对齐
-            "Mode": {"width": 90, "anchor": "center", "stretch": False}  # 录入方式列居中对齐
+            "Mode": {"width": 90, "anchor": "center", "stretch": False},  # 录入方式列居中对齐
+            "是否总和": {"width": 90, "anchor": "center", "stretch": False}  # 是否总和录入列居中对齐
         }
 
         for col in columns:
@@ -550,6 +564,8 @@ class QueryTab:
                         rule["cancel_test"] = (new_value == "是")
                     elif column_name == "Max":
                         rule["max_select"] = new_value
+                    elif column_name == "是否总和":
+                        rule["sum_entry"] = (new_value == "是")
 
                 # 标记已修改
                 self.app.mark_modified()
@@ -637,6 +653,7 @@ class QueryTab:
 
         # 录入方式（来自下拉框，默认"方法"）
         input_method = self.query_mode_var.get() or "方法"
+        sum_entry = self.query_sum_entry_var.get()  # 是否总和录入(勾选才走总和录入，否则按报告解析)
 
         # 验证输入 - 至少需要项目或检测方法中的一个
         if not project and not method:
@@ -654,7 +671,8 @@ class QueryTab:
             "method": method,
             "cancel_test": cancel_test,
             "input_method": input_method,
-            "max_select": max_select
+            "max_select": max_select,
+            "sum_entry": sum_entry
         }
         self.query_rules.append(rule)
 
@@ -667,6 +685,7 @@ class QueryTab:
         self.query_max_select_entry.delete(0, tk.END)
         self.query_cancel_test_var.set(False)
         self.query_mode_var.set("方法")
+        self.query_sum_entry_var.set(False)
 
         # 更新显示
         self.refresh_query_rules_tree()
@@ -712,7 +731,8 @@ class QueryTab:
                 rule.get("method", ""),
                 "是" if rule.get("cancel_test", False) else "否",
                 rule.get("max_select", ""),  # 最大选中数量
-                rule.get("input_method", "方法")  # 默认值为"方法"
+                rule.get("input_method", "方法"),  # 默认值为"方法"
+                "是" if rule.get("sum_entry", False) else "否"  # 是否总和
             ))
 
     def get_rules(self):
@@ -739,6 +759,8 @@ class QueryTab:
                 rule["input_method"] = "方法"
             if "max_select" not in rule:
                 rule["max_select"] = ""
+            if "sum_entry" not in rule:
+                rule["sum_entry"] = False
         self.query_rules = query_rules
 
         # 设置排除规则
@@ -1599,9 +1621,7 @@ class SpectrumUploadTab:
         }
         # 新增参数
         self.instrument_type = ""  # 仪器类型(GCMS/GC/LC/LCMSMS/XRF/ICP)
-        self.undetected_threshold = ""
-        self.marker = ""  # 新增：标记物参数
-        self.report_parse_enabled = False  # 报告解析启用开关（仪器类型/N.D/标记物）
+        self.report_parse_enabled = False  # 报告解析启用开关（仪器类型）
         self.clear_spectrum = False  # 新增：录入前是否清空谱图
         self.spectrum_filter_rules = []  # 按项目筛选谱图文件名 [{project, filter}]
         self.create_tab()
@@ -1856,20 +1876,6 @@ class SpectrumUploadTab:
         self.instrument_type_combo.grid(row=0, column=1, padx=(0, 10), pady=2, sticky='w')
         self.instrument_type_combo.bind('<<ComboboxSelected>>', self.on_instrument_type_change)
 
-        # 未检出判断值 - 第二行
-        ttk.Label(params_frame, text="N.D判断值:").grid(row=1, column=0, padx=(5, 5), pady=2, sticky='w')
-        self.threshold_var = tk.StringVar(value=self.undetected_threshold)
-        self.threshold_entry = ttk.Entry(params_frame, textvariable=self.threshold_var)
-        self.threshold_entry.grid(row=1, column=1, padx=(0, 10), pady=2, sticky='ew')
-        self.threshold_entry.bind('<KeyRelease>', self.on_threshold_change)
-
-        # 标记物 - 第三行
-        ttk.Label(params_frame, text="标记物:").grid(row=2, column=0, padx=(5, 5), pady=2, sticky='w')
-        self.marker_var = tk.StringVar(value=self.marker)
-        self.marker_entry = ttk.Entry(params_frame, textvariable=self.marker_var)
-        self.marker_entry.grid(row=2, column=1, padx=(0, 10), pady=2, sticky='ew')
-        self.marker_entry.bind('<KeyRelease>', self.on_marker_change)
-
     def _make_spec_row(self, parent, param_type, label):
         """单行谱图检查：复选框 + 数+数量框 + 键+关键字框（水平排列）"""
         row = ttk.Frame(parent)
@@ -1921,21 +1927,9 @@ class SpectrumUploadTab:
         self.app.mark_modified()
 
     def _update_report_parse_inputs_state(self):
-        """仪器类型/N.D判断值/标记物 仅在「非无需谱图 且 勾选启用」时可编辑。"""
+        """仪器类型 仅在「非无需谱图 且 勾选启用」时可编辑。"""
         active = (self.mode_var.get() != "no_spectrum") and self.report_parse_enabled_var.get()
         self.instrument_type_combo.config(state="readonly" if active else "disabled")
-        self.threshold_entry.config(state="normal" if active else "disabled")
-        self.marker_entry.config(state="normal" if active else "disabled")
-
-    def on_threshold_change(self, event=None):
-        """未检出判断值改变"""
-        self.undetected_threshold = self.threshold_var.get()
-        self.app.mark_modified()
-
-    def on_marker_change(self, event=None):
-        """标记物改变"""
-        self.marker = self.marker_var.get()
-        self.app.mark_modified()
 
     def on_clear_spectrum_change(self):
         """录入前清空谱图复选框状态改变"""
@@ -1967,7 +1961,7 @@ class SpectrumUploadTab:
             self.set_local_upload_frame_state("disabled")
             self.local_upload_frame.configure(text="本地参数设置(禁用)")
         else:
-            # 本地上传：启用全部参数（含报告解析：仪器类型/N.D判断值/标记物）
+            # 本地上传：启用全部参数（含报告解析：仪器类型）
             self.set_local_upload_frame_state("normal")
             self.local_upload_frame.configure(text="本地参数设置")
 
@@ -1998,8 +1992,6 @@ class SpectrumUploadTab:
             "upload_mode": self.mode_var.get(),
             "spectrum_check_params": self.spectrum_check_params,
             "instrument_type": self.instrument_type,  # 仪器类型(GCMS/GC/LC/LCMSMS/XRF/ICP)
-            "undetected_threshold": self.undetected_threshold,
-            "marker": self.marker,  # 新增标记物参数
             "clear_spectrum": self.clear_spectrum,  # 新增：录入前是否清空谱图
             "spectrum_filter_rules": self.spectrum_filter_rules,  # 按项目筛选谱图
             "report_parse_enabled": self.report_parse_enabled  # 报告解析启用开关
@@ -2050,15 +2042,6 @@ class SpectrumUploadTab:
         if "report_parse_enabled" in settings:
             self.report_parse_enabled = bool(settings["report_parse_enabled"])
             self.report_parse_enabled_var.set(self.report_parse_enabled)
-
-        if "undetected_threshold" in settings:
-            self.undetected_threshold = settings["undetected_threshold"]
-            self.threshold_var.set(self.undetected_threshold)
-
-        # 新增：设置标记物参数
-        if "marker" in settings:
-            self.marker = settings["marker"]
-            self.marker_var.set(self.marker)
 
         # 新增：设置录入前清空谱图
         if "clear_spectrum" in settings:
@@ -2478,6 +2461,7 @@ class QueryAppFixed:
     def save_as_rules(self):
         """另存所有规则到新的配置文件（.mtd 二进制格式）"""
         file_path = filedialog.asksaveasfilename(
+            parent=self.root,
             title="另存配置文件",
             defaultextension=".mtd",
             filetypes=[("方法文件", "*.mtd"), ("All files", "*.*")]
@@ -2493,6 +2477,7 @@ class QueryAppFixed:
     def load_rules(self):
         """从文件加载规则（.mtd 二进制格式）"""
         file_path = filedialog.askopenfilename(
+            parent=self.root,
             title="选择配置文件",
             defaultextension=".mtd",
             filetypes=[("方法文件", "*.mtd"), ("All files", "*.*")]

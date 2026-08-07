@@ -20,6 +20,13 @@ try:
 except ImportError:
     HAS_PYPDF2 = False
 
+try:
+    from fontTools.ttLib import TTCollection
+
+    HAS_FONTTOOLS = True
+except ImportError:
+    HAS_FONTTOOLS = False
+
 
 class TaggedConcentration(float):
     """带状态的浓度值：对 GUI 的阈值比较/格式化零影响（float 子类），同时携带 status 供无GUI调用读取。
@@ -388,6 +395,7 @@ class ChemicalReportAnalyzer:
                 self.parse_compact_format,  # 先尝试紧凑格式（PAE报告）
                 self.parse_standard_quant_report,  # 再尝试标准定量报告格式
                 self.parse_table_format,  # 再尝试表格格式
+                self.parse_gcfid_format,  # GC-FID(cid 乱码)简短定量报告
                 self.parse_standard_format,  # 最后尝试标准格式
             ]
 
@@ -431,6 +439,58 @@ class ChemicalReportAnalyzer:
                     else:
                         compounds[compound_name] = TaggedConcentration(0.0, '未检出')
 
+        return compounds, debug_info
+
+    def parse_gcfid_format(self, lines, filename, file_path):
+        """解析 GC-FID 简短定量报告(BXW 苯系物 / TDI 等)。
+        列固定：名称/保留时间/峰面积/响应因子/含量[mg/L]。SimSun 未嵌入→pdfplumber 返回 (cid:NNNN)，
+        用 _decode_cid_text(系统 simsun.ttc cmap)动态解出中文化合物名，零硬编码。
+        内标行响应因子恒=1.000(定义)，据此动态剔除。浓度取末列「含量」；含量0→未检出。
+        不依赖表头解码——部分重导出报告表头 cid 被重编为乱码，故按列结构(名称+≥3数值)定位。"""
+        compounds = {}
+        debug_info = "  尝试 GC-FID 格式解析...\n"
+        content = '\n'.join(lines) if isinstance(lines, list) else (lines or '')
+        # ponytail: 仅 cid 乱码报告触发(正常报告中文可直抽，避免无谓跑表格)
+        if content.count('(cid:') < 3:
+            return {}, debug_info + "    非 cid 乱码，跳过\n"
+
+        def _is_num(s):
+            try:
+                float(s)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        tables = self.pdf_extractor.extract_tables_from_pdf(file_path)
+        for table in tables:
+            for row in (table or []):
+                cells = [_decode_cid_text(str(c)) if c else '' for c in row]
+                if len(cells) < 4:
+                    continue
+                name = cells[0].strip()
+                if not name or name == '名称' or not self.is_valid_compound(name):
+                    continue
+                # 数据行：名称后跟 ≥3 个数值(RT/峰面积/响应因子/含量)
+                if len([c for c in cells[1:] if _is_num(c)]) < 3:
+                    continue
+                resp, conc = cells[-2], cells[-1]   # 响应因子(倒数第二)/含量(末列)
+                # 内标：响应因子==1.000(内标相对自身的定义)；动态剔除，不靠写死名单
+                try:
+                    if abs(float(resp) - 1.0) < 1e-6:
+                        debug_info += f"    跳过内标: {name}\n"
+                        continue
+                except ValueError:
+                    pass
+                try:
+                    val = float(conc)
+                except ValueError:
+                    continue
+                if val > 0:
+                    compounds[name] = TaggedConcentration(val, '检出', conc)
+                else:
+                    compounds[name] = TaggedConcentration(0.0, '未检出')
+        if compounds:
+            debug_info += f"  GC-FID 格式解析成功: {len(compounds)} 个化合物\n"
         return compounds, debug_info
 
     def extract_compounds_and_concentrations(self, content: str, file_path: str) -> Tuple[Dict[str, str], Dict]:
@@ -561,17 +621,19 @@ class ChemicalReportAnalyzer:
                 compound = parts[0]
 
                 # 查找浓度值（通常在最后一列或倒数第二列）
-                concentration = "N.D."
+                concentration = None
                 for part in parts[-3:]:  # 检查最后三列
                     if 'N.D.' in part:
                         concentration = "N.D."
                         break
-                    else:
-                        conc_match = re.search(r'(\d+\.\d+)\s*(mg/L|μg/mL|ng/ml)', part, re.IGNORECASE)
-                        if conc_match:
-                            concentration = f"{conc_match.group(1)} {conc_match.group(2)}"
-                            break
-
+                    conc_match = re.search(r'(\d+\.\d+)\s*(mg/L|μg/mL|ng/ml)', part, re.IGNORECASE)
+                    if conc_match:
+                        concentration = f"{conc_match.group(1)} {conc_match.group(2)}"
+                        break
+                # ponytail: 必须真正命中浓度(N.D.或单位)，否则跳过——避免把数据表后的色谱图
+                # 坐标轴行(stnuoC/223.0,/100/x104)误当化合物(它们没有浓度标记)。
+                if concentration is None:
+                    continue
                 if self.is_valid_compound(compound):
                     compounds[compound] = concentration
 
@@ -649,7 +711,7 @@ class ChemicalReportAnalyzer:
             'ISTD', 'RT', '响应', '离子对', '面积', 'Counts', 'min',
             '样品', '分析', '报告', '名称', '浓度', '最终浓度', '数据', '文件',
             '采集方法', '样品瓶', '其他', '稀释', '体积', '类型', '批处理',
-            'stnuoC', 'niM', 'x10', 'x10^', 'TIC', 'EIC', 'Scan', 'BB',
+            'stnuoC', 'niM', 'x10', 'x10^', 'TIC', 'EIC', 'Scan',
             '比值', '生成时间', '样品色谱图', 'Selected', 'Ion', 'SIM'
         ]
 
@@ -1154,7 +1216,10 @@ class ChemicalReportAnalyzer:
 
     def is_valid_compound(self, compound_name: str) -> bool:
         """检查是否为有效的化合物名称"""
-        if not compound_name or len(compound_name) < 2:
+        if not compound_name:
+            return False
+        # 单个中文字符也是合法化合物名(如 苯/酚/蒽)；仅拒绝单字节杂质
+        if len(compound_name) < 2 and not re.match(r'^[一-鿿]$', compound_name):
             return False
 
         # 检查是否符合化合物名称模式（包括希腊字母）
@@ -1279,6 +1344,47 @@ class _HeadlessReportAnalyzer(ChemicalReportAnalyzer):
         self._init_parser()  # 仅初始化解析器，不创建 tk.Tk、不 setup_ui
 
 
+# GC-FID 简短定量报告的 SimSun 字体未嵌入 PDF，pdfplumber 抽出 (cid:NNNN) 乱码。
+# CID=GID(CIDFontType2 Identity)，用系统 simsun.ttc 的 cmap 反查 GID→Unicode 动态解出中文——
+# 化合物名取自报告本身，零硬编码。需 Windows + 系统装 SimSun；否则解码为空(回退原 cid 串)。
+_SIMSUN_CIDS_RE = re.compile(r'\(cid:(\d+)\)')
+_SIMSUN_GID2UNI = None  # 懒加载缓存 {gid: unicode}
+
+
+def _simsun_gid2uni():
+    """惰性加载系统 simsun.ttc 的 GID→Unicode 映射(首次读字体文件，之后复用)。失败返回 {}。"""
+    global _SIMSUN_GID2UNI
+    if _SIMSUN_GID2UNI is not None:
+        return _SIMSUN_GID2UNI
+    _SIMSUN_GID2UNI = {}
+    if not HAS_FONTTOOLS:
+        return _SIMSUN_GID2UNI
+    try:
+        font = TTCollection(r"C:\Windows\Fonts\simsun.ttc").fonts[0]
+        cmap = font.getBestCmap()               # {unicode: glyphname}
+        glyph_order = font.getGlyphOrder()      # index=GID -> glyphname
+        name2uni = {}
+        for uni, gname in cmap.items():
+            name2uni.setdefault(gname, uni)
+        _SIMSUN_GID2UNI = {gid: name2uni.get(gn) for gid, gn in enumerate(glyph_order)}
+    except Exception:
+        _SIMSUN_GID2UNI = {}
+    return _SIMSUN_GID2UNI
+
+
+def _decode_cid_text(s):
+    """把 pdfplumber 的 (cid:NNNN) 用系统 SimSun cmap 解成中文；非 cid 串原样返回。"""
+    if not s or '(cid:' not in s:
+        return s
+    g2u = _simsun_gid2uni()
+
+    def _repl(m):
+        uni = g2u.get(int(m.group(1)))
+        return chr(uni) if uni else ''
+
+    return _SIMSUN_CIDS_RE.sub(_repl, s)
+
+
 def _extract_column_headers(text):
     """识别报告表头行（含'化合物'+'保留时间'，如 MassHunter QT 报告），按空白拆成表头列表。
     用于「数据采集」按 equipRelativeTitle 匹配 PDF 表头定位填充列。"""
@@ -1298,6 +1404,20 @@ def _dilution_factor(filename):
     stem = os.path.splitext(os.path.basename(filename))[0]
     nums = _DILUTION_RE.findall(stem)
     return float(nums[-1]) if nums else 1.0
+
+
+def _split_content_dilution(sid):
+    """样品段 id 的 -NNX 后缀(如 TS...001-10X) -> (base='TS...001', factor=10.0)。
+    无后缀 -> (sid, 1.0)。复用 _DILUTION_RE，与文件名 -NNX 同语义（内容稀释段，供作稀释源）。"""
+    m = _DILUTION_RE.search(sid or '')
+    if not m:
+        return sid, 1.0
+    return sid[:m.start()], float(m.group(1))
+
+
+# 非ICP多样品报告(如PAHS A/B)按 `样品 :` 切段——镜像 ICP 的 `样品识别码：` 切分。
+# `样品瓶/样品名称/样品乘积因子` 中间有非空白字符，不匹配(\s* 只吃空白)。
+_SAMPLE_MARKER_RE = re.compile(r'样品\s*[:：]\s*')
 
 
 # ICP-OES 报告（建立者（原始）：ICP）：表头为 分析物/波长/强度/校准浓度(mg/L)/样品浓度(mg/kg)，
@@ -1390,6 +1510,67 @@ def parse_pdf_report_meta(file_path, field='样品初始质量'):
     return out
 
 
+_content_id_cache = {}   # ponytail: (path, mtime) -> [base_id]；避免每次关联重抽PDF文本
+
+
+def extract_content_sample_ids(file_path):
+    """扫描 PDF 内容的 `样品 :` 字段 -> [base_sample_id, ...]（去 -NNX 稀释后缀，保留末尾字母 A/B）。
+    供按内容(而非文件名)关联 PDF 与样品编号。失败/无标记返回 []。"""
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        return []
+    key = (file_path, mtime)
+    cached = _content_id_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        content = PDFTextExtractor().extract_text_from_pdf(file_path)
+    except Exception:
+        _content_id_cache[key] = []
+        return []
+    ids = []
+    for part in _SAMPLE_MARKER_RE.split(content)[1:]:
+        m = re.match(r'(\S+)', part)
+        if not m:
+            continue
+        base, _f = _split_content_dilution(m.group(1))
+        if base and base not in ids:
+            ids.append(base)
+    _content_id_cache[key] = ids
+    return ids
+
+
+def _wrap_compounds(raw):
+    """{名: TaggedConcentration} -> {名: {'value','status','raw'}} (parse_pdf_report 同形)。"""
+    return {name: {'value': float(c), 'status': getattr(c, 'status', '检出'),
+                   'raw': getattr(c, 'raw', None)}
+            for name, c in raw.items()}
+
+
+def _split_non_icp_sections(content, analyzer, file_path):
+    """按 `样品 :` 切非ICP报告 -> [(sample_id, compounds), ...]。镜像 parse_icp_report 的 `样品识别码：` 切分。
+    无该标记(PAE/氯苯/单样品) -> 回退 [('A', 全content化合物)] 保留旧行为。"""
+    parts = _SAMPLE_MARKER_RE.split(content)[1:]
+    basename = os.path.basename(file_path)
+    if not parts:
+        raw, _ = analyzer.parse_report_content(content, basename, file_path)
+        return [('A', _wrap_compounds(raw))]
+    out = []
+    for part in parts:
+        m = re.match(r'(\S+)', part)
+        sid = m.group(1) if m else '?'
+        # ponytail: 复用整个 strategy cascade；每段独立解析，A/B 各自只看本段。
+        # TSCA 多样品种PDF(仓库无)此处会看整PDF表格——若出现按页范围限制。
+        raw, _ = analyzer.parse_report_content(part, basename, file_path)
+        if raw:
+            out.append((sid, _wrap_compounds(raw)))
+    if out:
+        return out
+    raw, _ = analyzer.parse_report_content(content, basename, file_path)   # 全段解析失败→回退全content
+    return [('A', _wrap_compounds(raw))]
+
+
 def parse_pdf_report_multi(file_path):
     """无GUI解析谱图PDF -> (samples, headers)。
     samples = [(样品标识码|'A', compounds), ...]：ICP 多样品(A/B)，其它报告单样品 ('A', compounds)。
@@ -1399,11 +1580,7 @@ def parse_pdf_report_multi(file_path):
     content = analyzer.pdf_extractor.extract_text_from_pdf(file_path)
     if _detect_icp(content):
         return parse_icp_report(content), list(_ICP_HEADERS)
-    raw, _ = analyzer.parse_report_content(content, os.path.basename(file_path), file_path)
-    compounds = {name: {'value': float(c), 'status': getattr(c, 'status', '检出'),
-                        'raw': getattr(c, 'raw', None)}
-                 for name, c in raw.items()}
-    return [('A', compounds)], _extract_column_headers(content)
+    return _split_non_icp_sections(content, analyzer, file_path), _extract_column_headers(content)
 
 
 def filter_samples_by_code(samples, sample_code):
@@ -1419,7 +1596,8 @@ def filter_samples_by_code(samples, sample_code):
     无任何段匹配时原样返回：兼容非 ICP 报告(parse_pdf_report_multi 对单样品报告返回 [('A', ...)])，
     避免回归。对 parse_pdf_report_meta 的 [(sid, 值), ...] 同样适用。"""
     def _base(sid):
-        return re.sub(r'[A-Za-z]+$', '', (sid or '').strip())
+        s = _DILUTION_RE.sub('', (sid or '').strip())   # 去 -NNX(内容稀释段 TS...001-10X)
+        return re.sub(r'[A-Za-z]+$', '', s)
     target = (sample_code or '').strip()
     if not target:
         return samples
@@ -1453,6 +1631,10 @@ if __name__ == "__main__":
     assert len(_fs2) == 2 and _fs2[0][0] == 'TN26070722001A', _fs2
     assert filter_samples_by_code([('A', {})], 'TN26070722001') == [('A', {})]  # 非 ICP 回退
     assert filter_samples_by_code([('Blank', {})], 'TN26070722001') == [('Blank', {})]  # 空基不误匹配
+    # ponytail: 自检——内容稀释段 -NNX 不再被 _base 误剥成 ...-10；A/B 末字母仍剥
+    assert filter_samples_by_code([('TS26072901001-10X', {})], 'TS26072901001') == [('TS26072901001-10X', {})]
+    assert _split_content_dilution('TS26072901001-10X') == ('TS26072901001', 10.0)
+    assert _split_content_dilution('TS26080100001A') == ('TS26080100001A', 1.0)
     # ponytail: 自检——ICP 样品初始质量提取(三份报告存在时；不存在则跳过)
     import glob as _glob, os as _os
 
@@ -1466,6 +1648,17 @@ if __name__ == "__main__":
         _vals = [v for _s, v in _meta if v]
         assert len(_meta) >= 2 and all(map(_is_num, _vals)), (_icp, _meta)
         print(f"[meta 样品初始质量] {_os.path.basename(_icp)}: {_meta}")
+    # ponytail: 自检——GC-FID(cid 乱码)动态解码：化合物名无 cid 残留(字体解码成功) + status 合法。
+    # 不写死面板名单——只校验「解码出可读中文 + 产出化合物」，面板随报告动态变化。
+    for _gc in sorted(set(_glob.glob('谱图/GC/*.pdf') + _glob.glob('谱图/GC/*.PDF'))):
+        _s, _ = parse_pdf_report_multi(_gc)
+        assert _s, f"GC-FID 未解析到化合物: {_gc}"
+        for _sid, _c in _s:
+            assert _c, f"GC-FID 样品无化合物: {_gc}"
+            for _n, _v in _c.items():
+                assert '(cid:' not in _n, (_gc, _n)          # 系统字体解码成功，无 cid 残留
+                assert _v['status'] in ('检出', '未检出'), (_gc, _n, _v)
+        print(f"[GC-FID] {_os.path.basename(_gc)}: {sum(len(c) for _, c in _s)} 个化合物")
     # ponytail: 自检——带参数则解析该PDF并打印各样品化合物+status(断言至少1个)；无参数启动GUI。
     if len(sys.argv) > 1:
         _samples, _h = parse_pdf_report_multi(sys.argv[1])

@@ -287,7 +287,7 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
     """在谱图目录中挑该样品的报告 PDF，返回 (normal_pdf, diluted_pdf)：
     文件名以 sample_code 开头(大小写不敏感)的 .pdf，按是否含 -NNX 稀释后缀分为正常/稀释；
     各自按方法/项目类别关键词挑(1个直取/仍歧义取首个)。对应无则该位为 None。"""
-    from report_parser import _dilution_factor
+    from report_parser import _dilution_factor, extract_content_sample_ids
     sc = (sample_code or '').lower()
     if not sc or not spectrum_path or not os.path.isdir(spectrum_path):
         return None, None
@@ -304,6 +304,18 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
                         if fn.lower().endswith('.pdf') and fn.lower().startswith(stripped)]
             except Exception:
                 pdfs = []
+    if not pdfs:  # 文件名前缀全 miss -> 按 PDF 内容 `样品 :` 字段关联(支持 文件名≠内容id 的 PAHS 报告)
+        sc_stripped = _strip_parallel_suffix(sample_code).strip()
+        try:
+            _all = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
+                    if fn.lower().endswith('.pdf')]
+        except Exception:
+            _all = []
+        for p in _all:
+            for cid in extract_content_sample_ids(p):
+                if cid == sample_code or cid.startswith(sc_stripped) or sc_stripped.startswith(cid):
+                    pdfs.append(p)
+                    break
     if not pdfs:
         return None, None
     normal_pdfs = [p for p in pdfs if _dilution_factor(p) == 1.0]
@@ -787,6 +799,22 @@ def _pdf_parallel_count(sample_code, pdf_paths, known_suffixes):
     return max(1, len(letters))
 
 
+def _parse_weigh_time(v):
+    """称样时间单元格 → datetime：兼容 datetime / 'YYYY/M/D' / 'YYYY-M-D'(可带时分)。解析不了返回 None。"""
+    if v is None or isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _read_weighing_records(path):
     """读取称量记录(xlsx 或 csv)：返回 ({样品编号: {masses:[float...], time, desc}}, err)。
     行序即平行序；time/desc 取该样品首行(称样时间/试样描述)。表头按列名定位，缺失按 A/B/C/D 兜底。"""
@@ -820,6 +848,7 @@ def _read_weighing_records(path):
 
     code_col, mass_col = find("样品编号", 1), find("称样量", 2)
     time_col, desc_col = find("称样时间", 0), find("试样描述", 3)
+    parse_col = find("解析", 4)  # E列：强制解析标记
     m = {}
     for r in rows[1:]:
         if not r:
@@ -836,10 +865,14 @@ def _read_weighing_records(path):
             except (TypeError, ValueError):
                 pass
         if entry["time"] is None:
-            entry["time"] = r[time_col] if time_col < len(r) else None
+            entry["time"] = _parse_weigh_time(r[time_col] if time_col < len(r) else None)
         if not entry["desc"]:
             d = r[desc_col] if desc_col < len(r) else None
             entry["desc"] = str(d).strip() if d is not None else ""
+        if parse_col < len(r):
+            pv = r[parse_col]
+            if pv is not None and str(pv).strip():
+                entry["force_parse"] = True
     return m, None
 
 
@@ -935,31 +968,6 @@ def _resolve_env(equip_to_room, room_env, candidates, date_str):
         if rm == room:
             return v
     return None, None
-
-
-def _write_env_records(path, entries, date_str):
-    """把 entries={房间名称:(温度,湿度)} 按 date_str 写入 path 的「温湿度」sheet：
-    (房间,日期)已存在则更新温度/湿度，否则追加。保留其它日期数据。失败抛异常。"""
-    wb = openpyxl.load_workbook(path)
-    if "温湿度" not in wb.sheetnames:
-        ws = wb.create_sheet("温湿度")
-        ws.append(["房间名称", "日期", "温度", "湿度"])
-    else:
-        ws = wb["温湿度"]
-    idx = {}  # (房间,日期) -> 行号
-    for r in range(2, ws.max_row + 1):
-        room = ws.cell(r, 1).value
-        if room is not None:
-            idx[(str(room).strip(), _date_str(ws.cell(r, 2).value))] = r
-    for room, (t, h) in (entries or {}).items():
-        key = (room, date_str)
-        if key in idx:
-            r = idx[key]
-            ws.cell(r, 3).value = t
-            ws.cell(r, 4).value = h
-        else:
-            ws.append([room, date_str, t, h])
-    wb.save(path)
 
 
 def _equipment_env_candidates(row, equipment_config, matched_list):
@@ -1745,7 +1753,6 @@ class SequenceMaster:
         self.login_system = MultiUserLoginSystem()
         self.api = DetectionAPI(self.login_system)
         self.logged_in = False
-        self._env_eq_cache = {}  # sample_code -> 默认设备编号(温湿度按房间匹配用，跨行去重)
         self._env_eq_cfg_cache = {}  # sample_code -> 完整 equipment_config(设备选择器用，跨行去重)
         self._method_projects_cache = {}  # 方法查询键->该方法待登记项目列表(运行期跨行复用)
 
@@ -1910,6 +1917,7 @@ class SequenceMaster:
         seq_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
         seq_menu.add_command(label="加载序列", command=self.load_sequence)
         seq_menu.add_command(label="保存序列", command=self.save_sequence)
+        seq_menu.add_command(label="序列另存为", command=self.save_sequence_as)
         seq_menu.add_separator()
         seq_menu.add_command(label="从选中行运行", command=self.run_from_selected)
         menubar.add_cascade(label="序列", menu=seq_menu)
@@ -1923,10 +1931,9 @@ class SequenceMaster:
         edit_menu.add_command(label="清空", command=self.clear_all)
         menubar.add_cascade(label="编辑", menu=edit_menu)
 
-        # 工具菜单：编辑方法 / 保存温湿度 / 导出日志
+        # 工具菜单：编辑方法 / 导出日志
         tool_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
         tool_menu.add_command(label="编辑方法", command=self.edit_method)
-        tool_menu.add_command(label="保存温湿度", command=self.save_env_to_excel)
         tool_menu.add_separator()
         tool_menu.add_command(label="导出日志", command=self._export_log)
         tool_menu.add_command(label="清空日志", command=self.clear_log)
@@ -2347,9 +2354,13 @@ class SequenceMaster:
             self.status_var.set("就绪")
 
     def select_weighing_path(self, row_index):
-        """选择称样记录文件"""
+        """选择称样记录文件（已有路径时，对话框定位到原路径所在目录）"""
+        cur = ""
+        if 0 <= row_index < len(self.sequence_data):
+            cur = (self.sequence_data[row_index].get("weighing_path") or "").strip()
         file_path = filedialog.askopenfilename(
             title="选择称样记录文件",
+            initialdir=os.path.dirname(cur) if cur and os.path.dirname(cur) else None,
             filetypes=[("Excel files", "*.xlsx;*.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
         )
         if file_path and 0 <= row_index < len(self.sequence_data):
@@ -2358,9 +2369,13 @@ class SequenceMaster:
             self.status_var.set(f"第 {row_index + 1} 行称样记录路径已设置")
 
     def select_method_file(self, row_index):
-        """选择录入方法文件"""
+        """选择录入方法文件（已有路径时，对话框定位到原路径所在目录）"""
+        cur = ""
+        if 0 <= row_index < len(self.sequence_data):
+            cur = (self.sequence_data[row_index].get("method_file") or "").strip()
         file_path = filedialog.askopenfilename(
             title="选择录入方法文件",
+            initialdir=os.path.dirname(cur) if cur and os.path.dirname(cur) else None,
             filetypes=[("方法文件", "*.mtd"), ("All files", "*.*")]
         )
         if file_path and 0 <= row_index < len(self.sequence_data):
@@ -2454,42 +2469,6 @@ class SequenceMaster:
                                      ops.get("device_number", ""), ops.get("equipment_rules"))
         wp = self._read_weighing_params(method_file)
         row["weighing_mode"] = (wp.get("weighing_mode") or "").strip() if wp else ""
-        self._autofill_env(row)
-
-    def _autofill_env(self, row):
-        """按 设备→房间→(房间,今天) 自动填温湿度(空列才填，已填保留)。
-        指定设备直接匹配；默认设备(无编号)在已登录时查 LIMS 默认主检设备编号再匹配。
-        每个未填充的原因都写日志，便于排查。"""
-        if (row.get("temperature") or "").strip() and (row.get("humidity") or "").strip():
-            return
-        rid = row.get("id")
-        equip_to_room, room_env, err = _read_env_records(_ENV_RECORD_PATH)
-        if equip_to_room is None:
-            self._log(f"行{rid}: 温湿度未自动填充(读不到温湿度记录文件: {err})")
-            return
-        eq = (row.get("equipment") or "").strip()
-        cands = [eq] if eq else []
-        src = "指定设备"
-        if not cands:
-            if not self._ensure_session_silent():
-                self._log(f"行{rid}: 默认设备温湿度未填充(未登录且无可复用会话；登录后重选方法/谱图即可)")
-                return
-            code = self._resolve_default_equipment_code(row, self._log, self._env_eq_cache)
-            if not code:
-                self._log(f"行{rid}: 默认设备温湿度未填充(查不到默认设备；需该行先有谱图路径/样品编号且样品可查)")
-                return
-            cands = [code]
-            src = "默认设备"
-        today = datetime.now().strftime("%Y-%m-%d")
-        temp, hum = _resolve_env(equip_to_room, room_env, cands, today)
-        room = next((equip_to_room.get(c) or
-                     next((v for k, v in equip_to_room.items() if c in k or k in c), None)
-                     for c in cands), None)
-        if temp and hum:
-            row["temperature"], row["humidity"] = temp, hum
-            self._log(f"行{rid}: 温湿度已自动填充({src}→{room} 当天) T={temp}℃ H={hum}%RH")
-        else:
-            self._log(f"行{rid}: 温湿度未填充({src}→房间「{room or '未匹配'}」在温湿度记录中无当天({today})数据)")
 
     def _ensure_session_silent(self):
         """确保有可用 LIMS 会话(已登录或可复用存档)；无会话返回 False，不弹登录框。"""
@@ -2503,70 +2482,6 @@ class SequenceMaster:
         except Exception:
             pass
         return False
-
-    def save_env_to_excel(self):
-        """把各行录入的温湿度按 设备编号→房间 聚合，回写当天值到 温湿度记录.xlsx 的「温湿度」sheet。
-        指定设备直接匹配；默认设备(无表格编号)先查 LIMS 取默认主检设备编号再匹配。
-        (房间,当天)已存在则更新，否则追加；保留其它日期。未录温湿度或设备无法匹配房间的行跳过。"""
-        if not self.sequence_data:
-            self.status_var.set("提示: 没有可保存的序列数据")
-            return
-        equip_to_room, _, err = _read_env_records(_ENV_RECORD_PATH)
-        if equip_to_room is None:
-            messagebox.showerror("错误", err or "无法读取温湿度记录文件")
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        # 需查默认设备的行(已录温湿度但无表格设备编号)
-        default_rows = [r for r in self.sequence_data
-                        if (r.get("temperature") or "").strip() and (r.get("humidity") or "").strip()
-                        and not (r.get("equipment") or "").strip()]
-        can_query = bool(default_rows) and self._ensure_session_silent()
-        if default_rows:
-            if can_query:
-                self._log(f"查询 {len(default_rows)} 行的默认设备(用于温湿度按房间匹配)...")
-            else:
-                self._log("未登录且无可复用会话：默认设备的行跳过设备查询(仅保存指定设备行)")
-
-        entries, skipped = {}, 0
-        for row in self.sequence_data:
-            t = (row.get("temperature") or "").strip()
-            h = (row.get("humidity") or "").strip()
-            if not t or not h:
-                continue
-            eq = (row.get("equipment") or "").strip()
-            if not eq and can_query:
-                eq = self._resolve_default_equipment_code(row, self._log, self._env_eq_cache) or ""
-                if eq:
-                    self._log(f"行{row.get('id')}: 默认设备编号={eq}")
-                self.root.update_idletasks()  # 同步查 LIMS 期间刷新日志，避免界面假死
-            room = None
-            if eq:
-                room = equip_to_room.get(eq)
-                if not room:
-                    for k, v in equip_to_room.items():
-                        if eq in k or k in eq:
-                            room = v
-                            break
-            if not room:
-                skipped += 1
-                continue
-            entries[room] = (t, h)  # 同房间多行：后者覆盖(以最后一次录入为准)
-        if not entries:
-            self.status_var.set("提示: 没有可保存的温湿度(需录入温度+湿度，且设备能匹配到房间)")
-            return
-        try:
-            _write_env_records(_ENV_RECORD_PATH, entries, today)
-        except PermissionError:
-            messagebox.showerror("错误", "温湿度记录.xlsx 被占用(可能正用 Excel 打开)，请关闭后重试")
-            return
-        except Exception as e:
-            messagebox.showerror("错误", f"写入温湿度记录失败: {e}")
-            return
-        msg = f"已保存 {len(entries)} 个房间的温湿度({today})到 温湿度记录.xlsx"
-        if skipped:
-            msg += f"\n跳过 {skipped} 行(未录温湿度或设备无法匹配房间)"
-        self._log(msg)
-        self.status_var.set(msg)
 
     def _row_sample_codes(self, row, log):
         """本行全部样品编号(去重保序)。单样品走 _resolve_spectrum_pdf；
@@ -2679,23 +2594,6 @@ class SequenceMaster:
         cache[sample_code] = eq_cfg
         return eq_cfg
 
-    def _resolve_default_equipment_code(self, row, log, cache):
-        """查询 LIMS 取默认主检设备编号(供温湿度按房间匹配)。
-        复用 _resolve_equipment_config；cache(_env_eq_cache) 按 sample_code 去重。
-        失败/无法确定返回 None。"""
-        sample_code = self._row_first_sample_code(row, log)
-        if not sample_code:
-            return None
-        if sample_code in cache:
-            return cache[sample_code]
-        code = None
-        eq_cfg = self._resolve_equipment_config(row, log)
-        if eq_cfg:
-            cands = _equipment_env_candidates(row, eq_cfg, None)
-            code = cands[0] if cands else None
-        cache[sample_code] = code
-        return code
-
     def _override_equipment(self, equipment_config, device_field):
         """表格/设备规则指定的设备编号覆盖默认主检设备与称样设备（设备以序列表格为准；支持 ';' 分隔多个）。
         检测设备→主检设备(可多台)；称样设备→称样设备(单台，取首个)。
@@ -2760,21 +2658,55 @@ class SequenceMaster:
             cfg["weighingEquipmentId"] = str(wid) if wid else ""
             cfg["weighingEquipmentBaseName"] = wname
             cfg["weighingEquipment"] = f"{wno},{wname},{wdate}" if wno else wname
+            cfg["weighingEquipmentRaw"] = weigh_eq
         return cfg, matched, None
 
+    def _enrich_weighing_bill(self, equipment_config, sp_ids_str, log):
+        """称样设备 weighingEquipmentRaw 回填真实台账对象。
+        selectByDetectionMethodId 返回的 raw 是「方法-设备配置行」(元数据=配置人/时间，如 李金玲/2026-03)；
+        总和实验无称样列时 LIMS 仅在 weighingEquipment 为真实台账对象(元数据=台账创建人/时间)时绑定称样设备。
+        故用 ocChoicePage(网页端称样设备选择源) 取台账对象覆盖之；id/name 仍取自 weighingEquipmentId/BaseName。"""
+        wid = (equipment_config or {}).get("weighingEquipmentId")
+        if not wid or not sp_ids_str:
+            return equipment_config
+        first_sp = sp_ids_str.split(",")[0].strip()
+        if not first_sp:
+            return equipment_config
+        try:
+            choices = self.api.get_weighing_equipment_choices(first_sp, log)
+        except Exception as e:
+            log(f"[设备] 取称样设备台账异常，沿用配置行: {e}")
+            return equipment_config
+        for it in choices:
+            raw = it.get("raw") or {}
+            _rids = {str(raw.get("id") or ""), str(raw.get("equipmentBillId") or "")}
+            if str(wid) in _rids:
+                cfg = dict(equipment_config)
+                cfg["weighingEquipmentRaw"] = raw
+                log(f"[设备] 称样设备台账回填: id={wid} creator={raw.get('creatorName')!r} "
+                    f"createDatetime={raw.get('createDatetime')!r}")
+                return cfg
+        log(f"[设备] ocChoicePage 未找到称样设备台账(id={wid})，沿用配置行")
+        return equipment_config
+
     def select_spectrum_path(self, row_index):
-        """选择谱图文件路径"""
-        path = filedialog.askdirectory(title="选择谱图文件夹路径")
+        """选择谱图文件路径（已有路径时，对话框定位到原路径）"""
+        cur = ""
+        if 0 <= row_index < len(self.sequence_data):
+            cur = (self.sequence_data[row_index].get("spectrum_path") or "").strip()
+        path = filedialog.askdirectory(
+            title="选择谱图文件夹路径",
+            initialdir=cur if cur and os.path.isdir(cur) else None
+        )
         if path and 0 <= row_index < len(self.sequence_data):
             row = self.sequence_data[row_index]
             row["spectrum_path"] = path
-            self._autofill_env(row)  # 谱图定了样品可查，默认设备温湿度此时再尝试自动填充(与选方法互不依赖先后)
             self.refresh_table()
             self.status_var.set(f"第 {row_index + 1} 行谱图文件路径已设置")
 
     def select_equipment(self, row_index):
         """打开设备选择：能取到方法设备列表则勾选(只显示编号)；取不到(如样品方法未切换/不可查)
-        则回退手动输入(; 分隔)。结果写回行 equipment；设备变了重算温湿度。"""
+        则回退手动输入(; 分隔)。结果写回行 equipment。"""
         if not (0 <= row_index < len(self.sequence_data)):
             return
         row = self.sequence_data[row_index]
@@ -2800,7 +2732,6 @@ class SequenceMaster:
         if selected is None:
             return  # 用户取消
         row["equipment"] = ";".join(selected)
-        self._autofill_env(row)  # 设备变了重算温湿度房间
         self.refresh_table()
         self.status_var.set(f"第 {row_index + 1} 行设备已设置: {row['equipment'] or '(默认)'}")
 
@@ -3026,6 +2957,35 @@ class SequenceMaster:
         else:
             self.root.title("序列编辑器")
 
+    def _write_sequence(self, file_path):
+        """实际写序列到文件，并更新 current_file/标题。失败弹错。"""
+        try:
+            save_data = {
+                "sequence_data": [],
+                "column_widths": self.column_widths
+            }
+
+            for row in self.sequence_data:
+                # 只持久化用户手填/路径/环境；equipment/configure_order/标液模式/仪器设置/称样模式
+                # 运行时从方法派生(_apply_method_params)，sample_code 等隐藏字段不存(避免残留坑)
+                save_data["sequence_data"].append({
+                    "id": row["id"],
+                    "weighing_path": row["weighing_path"],
+                    "method_file": row["method_file"],
+                    "spectrum_path": row["spectrum_path"],
+                    "temperature": row.get("temperature", ""),
+                    "humidity": row.get("humidity", ""),
+                })
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(save_data, f, allow_unicode=True, indent=2, sort_keys=False)
+
+            self.current_file = file_path
+            self._update_title()
+            self.status_var.set(f"序列已保存到: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {str(e)}")
+
     def save_sequence(self):
         """保存序列到文件（已打开文件则原地覆盖保存，否则弹窗选择）"""
         if not self.sequence_data:
@@ -3041,44 +3001,31 @@ class SequenceMaster:
             )
             if not file_path:
                 return
+        self._write_sequence(file_path)
 
-        try:
-            save_data = {
-                "sequence_data": [],
-                "column_widths": self.column_widths
-            }
-
-            for row in self.sequence_data:
-                save_data["sequence_data"].append({
-                    "id": row["id"],
-                    "weighing_path": row["weighing_path"],
-                    "method_file": row["method_file"],
-                    "reference_material": row["reference_material"],
-                    "equipment": row["equipment"],
-                    "spectrum_path": row["spectrum_path"],
-                    "sample_code": row.get("sample_code", ""),
-                    "configure_order": row.get("configure_order", ""),
-                    "standard_type": row.get("standard_type", ""),
-                    "instrument_setting": row.get("instrument_setting", ""),
-                    "weighing_mode": row.get("weighing_mode", ""),
-                    "temperature": row.get("temperature", ""),
-                    "humidity": row.get("humidity", ""),
-                    "experiment_code": row.get("experiment_code", "")
-                })
-
-            with open(file_path, 'w', encoding='utf-8') as f:
-                yaml.dump(save_data, f, allow_unicode=True, indent=2, sort_keys=False)
-
-            self.current_file = file_path
-            self._update_title()
-            self.status_var.set(f"序列已保存到: {file_path}")
-        except Exception as e:
-            messagebox.showerror("错误", f"保存失败: {str(e)}")
+    def save_sequence_as(self):
+        """序列另存为：始终弹窗选新路径(默认定位到当前文件)，保存后切换到新文件"""
+        if not self.sequence_data:
+            self.status_var.set("提示: 没有数据可保存")
+            return
+        initdir = os.path.dirname(self.current_file) if self.current_file and os.path.dirname(self.current_file) else None
+        initialfile = os.path.basename(self.current_file) if self.current_file else None
+        file_path = filedialog.asksaveasfilename(
+            title="序列另存为",
+            initialdir=initdir,
+            initialfile=initialfile,
+            defaultextension=".seq",
+            filetypes=[("序列文件", "*.seq"), ("YAML files", "*.yaml;*.yml"), ("All files", "*.*")]
+        )
+        if not file_path:
+            return
+        self._write_sequence(file_path)
 
     def load_sequence(self):
         """从文件加载序列"""
         file_path = filedialog.askopenfilename(
             title="加载序列文件",
+            initialdir=os.path.dirname(self.current_file) if self.current_file and os.path.dirname(self.current_file) else None,
             filetypes=[("序列文件", "*.seq"), ("YAML files", "*.yaml;*.yml"), ("JSON files", "*.json"), ("All files", "*.*")]
         )
 
@@ -3098,24 +3045,33 @@ class SequenceMaster:
 
             sequence_data = loaded_data.get("sequence_data", loaded_data)
             for item in sequence_data:
+                mf = item["method_file"]
                 new_row = {
                     "id": item["id"],
                     "weighing_path": item["weighing_path"],
-                    "method_file": item["method_file"],
-                    "reference_material": item.get("reference_material", ""),
-                    "equipment": item.get("equipment", ""),
+                    "method_file": mf,
                     "spectrum_path": item["spectrum_path"],
-                    "sample_code": item.get("sample_code", ""),
-                    "configure_order": item.get("configure_order", ""),
-                    "standard_type": item.get("standard_type", ""),
-                    "instrument_setting": item.get("instrument_setting", ""),
-                    "weighing_mode": item.get("weighing_mode", ""),
                     "temperature": item.get("temperature", ""),
                     "humidity": item.get("humidity", ""),
+                    # 以下不持久化：equipment/configure_order/standard_type/instrument_setting/
+                    # weighing_mode 运行时从方法派生；sample_code 等隐藏字段不恢复(避免残留)
+                    "reference_material": "",
+                    "equipment": "",
+                    "sample_code": "",
+                    "configure_order": "",
+                    "standard_type": "",
+                    "instrument_setting": "",
+                    "weighing_mode": "",
+                    "experiment_code": "",
                     "status": item.get("status", "待运行"),
                     "error_msg": item.get("error_msg", ""),
-                    "experiment_code": item.get("experiment_code", "")
                 }
+                # equipment/configure_order/标液模式/仪器设置/称样模式 从方法重派生(同选方法时一致)
+                if mf:
+                    try:
+                        self._apply_method_params(new_row, mf)
+                    except Exception:
+                        pass
                 self.sequence_data.append(new_row)
 
             self.refresh_table()
@@ -3127,22 +3083,16 @@ class SequenceMaster:
             messagebox.showerror("错误", f"加载失败: {str(e)}")
 
     def edit_method(self):
-        """方法编辑入口：取选中行的方法文件并打开方法编辑器"""
+        """方法编辑入口：取序列里最上面的有方法的行，打开方法编辑器"""
         target = None
-        target_idx = None
-        sel = sorted(self.selection_manager.selected_rows) or sorted({r for r, _ in self.selection_manager.selected_cells})
-        if sel:
-            idx = sel[0]
-            if 0 <= idx < len(self.sequence_data):
-                mf = self.sequence_data[idx].get("method_file")
-                if mf:
-                    target = mf
-                    target_idx = idx
-        if not target:
-            self._log("未选中含方法文件的行，将打开编辑器(可在编辑器内点'加载')")
-        self._open_method_editor(target, target_idx)
+        for row in self.sequence_data:
+            mf = row.get("method_file")
+            if mf:
+                target = mf
+                break
+        self._open_method_editor(target)
 
-    def _open_method_editor(self, file_path=None, target_idx=None):
+    def _open_method_editor(self, file_path=None):
         """用 Toplevel 打开 MethodRule Editor(带空格文件名，用 importlib 导入)，可选加载指定方法文件"""
         if hasattr(self, "_method_editor_top") and self._method_editor_top is not None and self._method_editor_top.winfo_exists():
             self._method_editor_top.lift()
@@ -3158,27 +3108,25 @@ class SequenceMaster:
         spec.loader.exec_module(mre)
         top = tk.Toplevel(self.root)
         top.title("录入方法编辑器")
+        top.transient(self.root)  # 置于序列编辑器之上(owned)：加载方法时序列窗口不再抢占到最前端
         app = mre.QueryAppFixed(top)
         if file_path:
             app.load_config_file(file_path)
         self._method_editor_top = top
-        top.protocol("WM_DELETE_WINDOW", lambda: self._on_method_editor_closed(top, file_path, target_idx))
-        self._log(f"打开方法编辑器{': ' + os.path.basename(file_path) if file_path else ''}")
+        top.protocol("WM_DELETE_WINDOW", lambda: self._on_method_editor_closed(top, file_path))
 
-    def _on_method_editor_closed(self, top, file_path, target_idx):
-        """编辑器关闭：若针对某行打开且该行未换文件，重读标液配置回填该行"""
+    def _on_method_editor_closed(self, top, file_path):
+        """编辑器关闭：把方法里的标液+设备配置回填到所有使用该方法文件的行"""
         setattr(self, "_method_editor_top", None)
         top.destroy()
-        if not file_path or target_idx is None:
+        if not file_path:
             return
-        if not (0 <= target_idx < len(self.sequence_data)):
-            return
-        row = self.sequence_data[target_idx]
-        if row.get("method_file") != file_path:
-            return  # 用户在编辑器内加载/另存了别的文件，不回填
-        self._apply_method_params(row, file_path)
-        self.refresh_table()
-        self._log(f"已从方法同步标液+设备配置到第 {target_idx + 1} 行")
+        affected = [row for row in self.sequence_data if row.get("method_file") == file_path]
+        for row in affected:
+            self._apply_method_params(row, file_path)
+        if affected:
+            self.refresh_table()
+            self._log(f"已从方法同步标液+设备配置到 {len(affected)} 行")
 
     def run_from_selected(self):
         """从当前选中行开始运行序列（未选中则提示）。"""
@@ -3277,15 +3225,17 @@ class SequenceMaster:
         self.status_var.set("运行中..." if running else "就绪")
 
     def _run_worker(self, start_idx=0):
-        """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q"""
+        """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q。
+        循环按当前行数动态推进：运行期间新增的行(append 到末尾)会在当行结束后自动纳入运行。"""
         self._method_projects_cache.clear()  # 每次运行重建方法查询缓存(运行中样品已登记会使旧池过期)
-        n = len(self.sequence_data)
-        for idx in range(start_idx, n):
+        idx = start_idx
+        while idx < len(self.sequence_data):
             if self._stop.is_set():
                 break
             self._pause.wait()
             if self._stop.is_set():
                 break
+            n = len(self.sequence_data)
             self._ui_q.put(("status", (idx, "运行中", "")))
             self._log(f"--- 第 {idx + 1}/{n} 行 ---")
             try:
@@ -3297,6 +3247,7 @@ class SequenceMaster:
             if outcome == "abort":
                 self._log("用户中止序列")
                 break
+            idx += 1
         self._ui_q.put(("done", None))
 
     def _aborted(self, idx):
@@ -3390,7 +3341,7 @@ class SequenceMaster:
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
             "fixed_params": fixed_params, "method_file": row.get("method_file") or "",
             "defaults_no_record": defaults_no_record,
-            "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(苯)生成后供依赖项目(总和)复用
+            "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
         }
 
         # 阶段A：逐样品查询+过滤(此阶段不上传谱图)，收集所有样品的项目
@@ -3566,7 +3517,12 @@ class SequenceMaster:
 
         real_code = " / ".join(codes)
         self._ui_q.put(("status", (idx, "成功", "")))
-        self._ui_q.put(("rowdata", (idx, {"experiment_code": real_code})))
+        self._ui_q.put(("rowdata", (idx, {
+            "experiment_code": real_code,
+            "samples_total": len(samples),
+            "samples_merged": len(samples) - n_skip,
+            "skipped_list": list(skipped_samples),  # [(code, reason), ...] 供 _on_run_done 跨行汇总
+        })))
         extra = f"，跳过 {n_skip} 个样品" if n_skip else ""
         log(f"成功，{len(samples) - n_skip}/{len(samples)} 个样品参与合并，实验编号 {real_code}{extra}")
         if skipped_samples:
@@ -3591,15 +3547,18 @@ class SequenceMaster:
             projects = self.api.query_samples_by_conditions(
                 sample_code=sample_code, exact_match=True, log_func=log)
         if not projects:
-            return [], "LIMS 未查到该样品(可能未登记或超30天)"
+            return [], self.api.diagnose_missing_sample(sample_code, log)
         projects, ferr = self._filter_projects_by_method(projects, row, log)
         if ferr:
             return [], ferr
         if not projects:
             return [], "该样品下没有匹配方法文件的项目"
         sample_id = projects[0].get("sampleId")
-        items = [{"project": p, "sample_code": sample_code, "sample_id": sample_id,
-                  "pdf_paths": pdf_paths} for p in projects]
+        # 样品号统一用 LIMS 全码(project.sampleCode = detectionNo+smallNo)，不用传入的报验编号
+        # (可能截断，如手填/旧序列残留的 TS26072901)，否则后续 wmap/n_par 按全码键查会 miss
+        # (误报"称量记录平行不足")。与 4275 _full_code 同源。
+        items = [{"project": p, "sample_code": p.get("sampleCode") or sample_code,
+                  "sample_id": sample_id, "pdf_paths": pdf_paths} for p in projects]
         return items, None
 
     def _submit_batch(self, idx, row, batch_items, ctx, log, force_new, switch_mid="", lab_proc=""):
@@ -3706,6 +3665,7 @@ class SequenceMaster:
             self._ui_q.put(("status", (idx, "失败", eq_err)))
             log(f"失败: {eq_err}")
             return False, ""
+        equipment_config = self._enrich_weighing_bill(equipment_config, sp_ids_str, log)
         dynamic_columns = all_cfg.get("dynamic_columns") or []
         actual_method_name = all_cfg.get("actual_method_name", actual_method_name)
         actual_method_id = all_cfg.get("actual_method_id", actual_method_id)
@@ -3762,8 +3722,8 @@ class SequenceMaster:
             _filled = sum(1 for b in host.data_fields[info_code] if b.get())
             log(f"试样描述({info_col.get('columeName', '')}) 已按样品填充 {_filled}/{len(records or [])} 条")
 
-        # 跨项目复用(苯→总和)：首项目生成的试样描述/称样量缓存后，后续项目直接复用，保证同样品一致
-        # 免去 getOcCompareShowData 网络往返；query_rules 顺序保证苯先于总和生成
+        # 跨项目复用(组分→总和)：首项目生成的试样描述/称样量缓存后，后续项目直接复用，保证同样品一致
+        # 免去 getOcCompareShowData 网络往返；query_rules 顺序保证组分先于总和生成
         primary_cache = ctx["primary_cache"]
         cached_before = set(primary_cache)  # 本批开始前已缓存的样品 → 这些样品将复用缓存
 
@@ -3783,8 +3743,18 @@ class SequenceMaster:
                         pmasses_by_sample[sc] = list(rv["masses"])
                         desc_by_sample[sc] = rv["desc"]
                     else:
-                        pmasses_by_sample[sc] = [_gen_random_mass(wp) for _ in range(n_par)]
-                        desc_by_sample[sc] = ((ctx["wmap"] or {}).get(sc) or {}).get("desc") or ""
+                        # random 模式：若称样记录已含该样品称样量，以记录为准；否则随机生成
+                        samp = (ctx["wmap"] or {}).get(sc) or {}
+                        recorded = samp.get("masses") or []
+                        if recorded and len(recorded) >= n_par:
+                            try:
+                                _mdp = int((wp or {}).get("decimal_places") or 4)
+                            except (TypeError, ValueError):
+                                _mdp = 4
+                            pmasses_by_sample[sc] = [f"{float(recorded[i]):.{_mdp}f}" for i in range(n_par)]
+                        else:
+                            pmasses_by_sample[sc] = [_gen_random_mass(wp) for _ in range(n_par)]
+                        desc_by_sample[sc] = samp.get("desc") or ""
                         primary_cache[sc] = {"masses": list(pmasses_by_sample[sc]), "desc": desc_by_sample[sc]}
                 host.data_fields[mass_code] = _mass_field_by_project(records, pid_to_sample, pmasses_by_sample)
                 log(f"称样量(random) {mass_col.get('columeName', '')} 跨{len(pmasses_by_sample)}样品 按平行({n_par})")
@@ -3919,12 +3889,18 @@ class SequenceMaster:
 
         _reused = [sc for sc in batch_samples if sc in cached_before]
         if _reused:
-            log(f"复用首项目(苯)试样描述/称样量: {len(_reused)}/{len(batch_samples)} 样品")
+            log(f"复用首项目(组分)试样描述/称样量: {len(_reused)}/{len(batch_samples)} 样品")
 
-        # 结果值回填：总和项目读各组分已录入值(getOcCompareShowData)填组分列、服务端求和；
-        # 其余项目按「启用报告解析」解析谱图报告 PDF 浓度写入结果列
-        _pnames = {str(p.get("projectName") or "") for p in batch_projects}
-        if any(_is_sum_project(n) for n in _pnames):
+        # 结果值回填：是否总和由匹配到的 query rule 的 sum_entry 标记决定(方法编辑器勾选)。
+        # 勾选=是 → 读各组分已录入值(getOcCompareShowData)填组分列、服务端求和；否 → 按报告解析 PDF 浓度写入结果列
+        _qr = self._read_query_rules(ctx.get("method_file") or "")
+        _sum_on = False
+        for _p in batch_projects:
+            _qi = _p.get("_qr_idx")
+            if isinstance(_qi, int) and 0 <= _qi < len(_qr) and bool(_qr[_qi].get("sum_entry")):
+                _sum_on = True
+                break
+        if _sum_on:
             self._fill_result_from_sum(host, dynamic_columns, experiment_config,
                                        batch_items, row, actual_method_name, ctx, log)
         else:
@@ -3934,6 +3910,7 @@ class SequenceMaster:
         # 构造载荷 + 注入谱图 + 提交
         log("构建并提交 ...")
         experiment_data = build_grouped_experiment_data(host, batch_projects, experiment_code, actual_method_name, experiment_process_override=lab_proc or None)
+        log(f"[设备] 提交称样设备对象: {experiment_data.get('weighingEquipment')}")
         if lab_proc:
             log(f"实验过程(experimentProcess) <- 条件规则: {lab_proc}")
         # 称量记录「称样时间」→ 覆盖实验分析开始时间 startTime；无有效称样时间则开始时间=结束时间
@@ -4063,17 +4040,23 @@ class SequenceMaster:
         sp = (row.get("spectrum_path") or "").strip()
         sc = (row.get("sample_code") or "").strip()
         if os.path.isfile(sp):
-            code = sc or os.path.splitext(os.path.basename(sp))[0].split("-", 1)[0]
+            if sc:
+                code = sc
+            else:
+                # 行无样品编号时优先用 PDF 内容 `样品 :` 字段(文件名号可能与内容不一致)
+                from report_parser import extract_content_sample_ids
+                cids = extract_content_sample_ids(sp)
+                code = cids[0] if cids else os.path.splitext(os.path.basename(sp))[0].split("-", 1)[0]
             return [(code, [sp])], None
         pdfs = sorted(glob.glob(os.path.join(sp, "*.pdf"))) if os.path.isdir(sp) else []
         if not pdfs:
             return [], "谱图路径无效或目录内无PDF"
+        # 目录=多样品意图。sample_code 是隐藏的自动回填字段(前端无单元格、不可编辑)，
+        # 常为旧序列残留，不应在目录模式强制单样品。清空它，统一走下方 单PDF / 称样记录∩谱图 展开。
         if sc:
-            key = _strip_parallel_suffix(sc)  # 称样编号带平行小号(001)、谱图文件名不带：用去小号后的前缀匹配
-            matched = [p for p in pdfs if os.path.basename(p).startswith(key)]
-            if not matched:
-                log(f"警告: 目录内无文件名以 {key} 开头的PDF")
-            return [(sc, matched)], None
+            log(f"忽略样品编号残留 '{sc}'，按谱图目录({len(pdfs)}个PDF)展开全部样品")
+            row["sample_code"] = ""
+            sc = ""
         if len(pdfs) == 1:
             code = os.path.splitext(os.path.basename(pdfs[0]))[0].split("-", 1)[0]
             return [(code, [pdfs[0]])], None
@@ -4088,10 +4071,15 @@ class SequenceMaster:
                 return [(_c, _ps) for _c, _ps in _by_code.items()], None
             return [], "目录有多个PDF且未填样品编号，请在「称样记录路径」填称样记录excel(按 excel∩谱图 展开)"
         # 先收集有谱图的候选 (编号, 试样描述, 匹配PDF)
+        from report_parser import extract_content_sample_ids
+        content_index = {p: extract_content_sample_ids(p) for p in pdfs}
         cands = []
         for code, entry in wmap.items():
             key = _strip_parallel_suffix(code)  # 称样编号带平行小号(001)、谱图文件名不带：去小号后匹配
-            matched = [p for p in pdfs if os.path.basename(p).startswith(key)]
+            # 文件名前缀 或 PDF 内容 `样品 :` 号命中(支持文件名≠内容号的报告)
+            matched = [p for p in pdfs
+                       if os.path.basename(p).startswith(key)
+                       or any(cid == code or cid.startswith(key) for cid in content_index.get(p, ()))]
             if matched:
                 cands.append((code, (entry or {}).get("desc") or "", matched))
         if not cands:
@@ -4287,7 +4275,7 @@ class SequenceMaster:
 
     def _read_report_parse_settings(self, method_file):
         """读方法文件 spectrum_upload_settings 的报告解析设置。
-        返回 {enabled, undetected_threshold, instrument_type, marker}；空/异常返回 {}。"""
+        返回 {enabled, instrument_type, marker}；空/异常返回 {}。"""
         if not method_file:
             return {}
         try:
@@ -4297,7 +4285,6 @@ class SequenceMaster:
         su = y.get("spectrum_upload_settings") or {}
         return {
             "enabled": bool(su.get("report_parse_enabled")),
-            "undetected_threshold": su.get("undetected_threshold"),
             "instrument_type": su.get("instrument_type"),
             "marker": su.get("marker"),
         }
@@ -4390,12 +4377,13 @@ class SequenceMaster:
         主支持无组分列场景(PAHs：每记录一化合物/项目，evaluate_alias 单段取值)；
         多组分列场景按记录组分名匹配段，best-effort(报告格式未全面验证)。"""
         settings = self._read_report_parse_settings(ctx.get("method_file"))
-        if not settings or not settings.get("enabled"):
-            return  # 方法未启用报告解析：保持现状(结果列留默认)
-        try:
-            nd_thr = float(settings.get("undetected_threshold") or 0.05)
-        except (TypeError, ValueError):
-            nd_thr = 0.05
+        method_enabled = settings and settings.get("enabled")
+        wmap = ctx.get("wmap") or {}
+        if not method_enabled and not any(
+            (wmap.get(it.get("sample_code") or "") or {}).get("force_parse")
+            for it in batch_items
+        ):
+            return  # 方法未启用报告解析且无样品强制解析：保持现状(结果列留默认)
         spectrum_path = (row.get("spectrum_path") or "").strip()
         if not spectrum_path:
             log("报告解析: 本行未设置谱图文件路径，跳过浓度回填")
@@ -4403,13 +4391,17 @@ class SequenceMaster:
 
         # 1) 按样品解析报告 PDF（正常 + 可选稀释）；同一样品多项目共用
         # ICP 一 PDF 多样品(A/B 平行样)：samples = [(标识码, compounds), ...]，按平行槽分取
-        from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor, filter_samples_by_code
+        from report_parser import (parse_pdf_report, parse_pdf_report_multi, _dilution_factor,
+                                   filter_samples_by_code, _split_content_dilution)
         parsed_by_sample = {}   # {sample_code: (samples, diluted_compounds, headers)}
         factor_by_sample = {}   # {sample_code: 稀释倍数}
         missing_samples = []
         for it in batch_items:
             sc = it.get("sample_code")
             if sc in parsed_by_sample or sc in missing_samples:
+                continue
+            # ponytail: 方法未启用时，仅解析称量记录中标记了"解析"的样品
+            if not method_enabled and not (wmap.get(sc) or {}).get("force_parse"):
                 continue
             pdf, dil_pdf = _pick_sample_report_pdf(spectrum_path, sc, actual_method_name)
             if not pdf:
@@ -4427,13 +4419,27 @@ class SequenceMaster:
                 missing_samples.append(sc)
                 continue
             samples = filter_samples_by_code(samples, sc)  # ICP 多报验批共一份 PDF：只取当前样品段
+            # 内容稀释: 段 id 形如 TS...001-10X -> 视作该样品的稀释源(镜像文件名 -NNX 稀释 PDF 流)
+            normal_samples = []
             diluted = None
+            content_factor = None
+            for sid, cmp in samples:
+                _base, f = _split_content_dilution(sid)
+                if f != 1.0:
+                    diluted = cmp              # 段即稀释源(原值不乘;LIMS 据稀释列自算)
+                    content_factor = f
+                else:
+                    normal_samples.append((sid, cmp))
+            samples = normal_samples or samples   # 全为稀释段时退回原样,保留旧行为
+            # 文件名稀释 PDF 仍优先(两者互斥:单样品PDF文件名 vs 多样品PDF内容)
             if dil_pdf:
                 try:
                     diluted, _ = parse_pdf_report(dil_pdf)
                 except Exception as e:
                     log(f"报告解析: 样品 {sc} 稀释报告解析失败({e})，按正常报告处理")
                 factor_by_sample[sc] = _dilution_factor(dil_pdf)
+            elif content_factor is not None:
+                factor_by_sample[sc] = content_factor
             parsed_by_sample[sc] = (samples, diluted, headers)
             n_cmp = len(samples[0][1]) if samples else 0
             log(f"报告解析: 样品 {sc} 解析到 {len(samples)} 个样品×{n_cmp} 化合物 ({os.path.basename(pdf)})"
@@ -4466,6 +4472,21 @@ class SequenceMaster:
 
         parallel_of, _n_par = _parallel_indices(records)  # 每条记录的平行槽(用 serialNumber)
 
+        # 告警：报告样品段数 > 该样品平行槽(=称样量数) → 多余段(如 B)被静默丢弃
+        # 平行数取自称样量个数(见 _submit_batch _par_by)，称样量不足时扩不出对应平行槽，
+        # _value_for_record 槽超界回落 samples[0] → 报告里 A/B 的 B 被丢。这里让它可见。
+        _slots_by_sc = {}
+        for _g, r in enumerate(records):
+            _item = pid_to_item.get(str(r.get("projectId")))
+            if _item:
+                _sc = _item.get("sample_code")
+                _slots_by_sc[_sc] = max(_slots_by_sc.get(_sc, 0), parallel_of.get(_g, 0) + 1)
+        for _sc, (_smp, _dil, _h) in parsed_by_sample.items():
+            _slots = _slots_by_sc.get(_sc, 1)
+            if len(_smp) > _slots:
+                log(f"报告解析警告: 样品 {_sc} 报告含 {len(_smp)} 个样品段，但称样量仅扩出 {_slots} 个平行槽——"
+                    f"多余 {len(_smp) - _slots} 个(如 B)将被丢弃，请在称样记录补全平行称样量")
+
         def _value_for_record(rec, slot):
             item = pid_to_item.get(str(rec.get("projectId")))
             if not item:
@@ -4486,7 +4507,7 @@ class SequenceMaster:
             if not alias:
                 return "", False
             try:
-                results = evaluate_alias(alias, compounds, nd_thr, diluted_compounds=diluted_compounds)
+                results = evaluate_alias(alias, compounds, diluted_compounds=diluted_compounds)
             except Exception:
                 return "", False
             if not results:
@@ -4582,7 +4603,7 @@ class SequenceMaster:
                 _pname = (p.get("projectName") or "").strip()
                 _pstd = p.get("standardNo", "")
                 # 同时按 method+project 命中首条规则：方法匹配且(规则无 project 或项目名命中)。
-                # 这样多方法各自独立分批(XRF 汞/六价铬/镉铅 各一实验)，单方法多项目(苯/总和)也各归其规则
+                # 这样多方法各自独立分批(XRF 汞/六价铬/镉铅 各一实验)，单方法多项目(组分/总和)也各归其规则
                 _matched = None
                 for _i, ts, _sub_id in rule_stds:
                     if not _std_loose_match(_pstd, ts):
@@ -4878,9 +4899,29 @@ class SequenceMaster:
     def _on_run_done(self):
         self._set_running(False)
         self._confirm_done.set()
-        self._append_log("==== 序列运行结束 ====")
         ok = sum(1 for r in self.sequence_data if r.get("status") == "成功")
         fail = sum(1 for r in self.sequence_data if r.get("status") == "失败")
+        abort = sum(1 for r in self.sequence_data if r.get("status") == "中止")
+        total = ok + fail + abort
+        self._append_log("==== 序列运行结束 ====")
+        self._append_log(f"运行报告：共 {total} 行 — 成功 {ok} / 失败 {fail} / 中止 {abort}")
+        # 汇总：各成功行样品合并情况(跨行合计)，格式对齐单行「成功，… 个样品参与合并」
+        rows_ok = [r for r in self.sequence_data if r.get("status") == "成功"]
+        tot = sum(r.get("samples_total", 0) for r in rows_ok)
+        merged = sum(r.get("samples_merged", 0) for r in rows_ok)
+        if tot:
+            codes_all = [r.get("experiment_code") for r in rows_ok if r.get("experiment_code")]
+            skipped = [(sc, reason) for r in rows_ok for (sc, reason) in r.get("skipped_list", [])]
+            extra = f"，跳过 {len(skipped)} 个样品" if skipped else ""
+            self._append_log(f"汇总：{merged}/{tot} 个样品参与合并，实验编号 {' / '.join(codes_all)}{extra}")
+            if skipped:
+                self._append_log(f"未录入样品（{len(skipped)} 个）：")
+                for sc, reason in skipped:
+                    self._append_log(f"  - {sc}：{reason}")
+        if fail:
+            lines = [f"  · 第{i + 1}行 [{r.get('sample_code') or '?'}] {r.get('error_msg') or ''}"
+                     for i, r in enumerate(self.sequence_data) if r.get("status") == "失败"]
+            self._append_log("失败明细：\n" + "\n".join(lines))
         self.status_var.set(f"完成: 成功 {ok} / 失败 {fail}")
 
     def _append_log(self, msg):

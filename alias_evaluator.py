@@ -18,6 +18,10 @@ import re
 # ponytail: 线性范围 /[lo-hi]，可选前置斜杠；ICP 用分号分隔(';[lo-hi]')，故前导符 [/;] 均吃掉避免尾分号
 _RANGE_RE = re.compile(r'[;/]?\[([0-9]+(?:\.[0-9]+)?)-([0-9]+(?:\.[0-9]+)?)\]')
 
+# 全角标点(U+FF01..FF5E)→半角；LIMS 中文前端常录成 ；＝｜／＃，规范化后才按分隔符切。
+# ponytail: 一次性映射整个全角 ASCII 区，比逐个替换分隔符更省且覆盖所有分隔符。
+_FW_MAP = {c: chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)}
+
 
 def parse_alias(alias_str):
     """解析项目别名字符串 -> 段列表。
@@ -28,6 +32,7 @@ def parse_alias(alias_str):
     alias_str = (alias_str or '').strip()
     if not alias_str:
         return []
+    alias_str = alias_str.translate(_FW_MAP)  # 全角；＝｜／＃ → 半角
     segments = []
     for raw_seg in alias_str.split('|'):
         seg = raw_seg.strip()
@@ -68,8 +73,12 @@ def parse_alias(alias_str):
 
 
 def _norm(name):
-    """化合物名归一：去空白/连字符、小写，覆盖 Agilent 报告常见大小写/连字差异。"""
-    return re.sub(r'[\s\-]+', '', str(name or '')).lower()
+    """化合物名归一：去定量离子后缀(DBP-149→DBP)、去空白/连字符、小写。
+    覆盖 MassHunter「名+定量离子」报告变体与大小写/连字差异。"""
+    # ponytail: MassHunter 化合物名常带 -NN 定量离子且随批次/配置有无；剥末尾 -数字 后按基名匹配，
+    # 使别名(带离子)与报告(带/不带离子、离子号不同)互通。仅作用于末尾 -纯数字，不伤 2,6-TDI/Pb 220.353 等。
+    s = re.sub(r'-\d+$', '', str(name or ''))
+    return re.sub(r'[\s\-]+', '', s).lower()
 
 
 def _lookup(compounds, compound):
@@ -103,7 +112,8 @@ def evaluate_alias(alias_str, compounds, nd_threshold=0.05, diluted_compounds=No
     返回 [{'lims_component': str|None, 'value': str, 'raw': {...}}]。
       - value: 最终填报字符串（数值，或 blank 字面值如 '<0.005'）
       - compounds: {化合物名: {'value': float, 'status': str}}（来自 report_parser.parse_pdf_report）
-      - nd_threshold: 视为未检出的数值上限（文档为 0.05；疑为方法 N.D判断值/undetected_threshold）
+      - nd_threshold: 固定兜底值(0.05)，仅当别名未给 `<X` 检出限时用作 ND 字面值/阈值；
+        正常情况 ND 判断一律以别名 `<X` 为准（方法编辑器已移除 N.D判断值字段）。
       - diluted_compounds: 稀释报告(-NNX)的化合物表；某段正常值 > 线性范围上限时改用其中读数(原值不乘)，
         并在该段 raw 标记 'diluted'=True 供消费者填稀释列。None 则不切换。
     """
@@ -195,4 +205,14 @@ if __name__ == '__main__':
     r = evaluate_alias('Pb 220.353;<0.020;[0.01-0.50]',
                        {'Pb 220.353': {'value': 0.5, 'status': '检出', 'raw': '0.500'}})
     assert r[0]['value'] == '0.500', r
+    # 全角标点（中文前端常录成 ；＝）应按半角分隔符解析：blank_value 不丢、化合物名不粘连
+    segs = parse_alias('苯=苯；<2.00/[1.00-50]')
+    assert segs[0]['compound'] == '苯' and segs[0]['blank_value'] == '<2.00', segs
+    r = evaluate_alias('苯=苯；<2.00/[1.00-50]', {'苯': {'value': 0.0, 'status': '未检出'}})
+    assert r[0]['value'] == '<2.00', r  # 用别名的 <2.00，而非默认 <0.05
+    # 定量离子后缀归一：别名化合物带 -NN 离子，报告带/不带离子、离子号不同都应按基名命中
+    r = evaluate_alias('BBP=BBP-206;<0.50', {'BBP-149': {'value': 1.29, 'status': '检出', 'raw': '1.29'}})
+    assert r[0]['value'] == '1.29', r  # BBP-206 别名命中 BBP-149 报告
+    r = evaluate_alias('DBP=DBP-149;<0.50', {'DBP': {'value': 1.05, 'status': '检出', 'raw': '1.05'}})
+    assert r[0]['value'] == '1.05', r  # 带离子别名命中不带离子报告
     print('alias_evaluator 自检通过')
