@@ -3380,12 +3380,14 @@ class SequenceMaster:
                     log(f"失败: 标准溶液校验未过 - {emsg}")
                     return "fail"
 
-        fixed_params = (self._read_other_params(row.get("method_file")) or {}).get("fixed_params") or []
+        _ops = self._read_other_params(row.get("method_file")) or {}
         ctx = {
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
-            "fixed_params": fixed_params, "method_file": row.get("method_file") or "",
+            "fixed_params": _ops.get("fixed_params") or [], "method_file": row.get("method_file") or "",
             "defaults_no_record": defaults_no_record,
             "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
+            "dilution_remark_enabled": bool(_ops.get("dilution_remark_enabled")),
+            "dilution_volume_column": (_ops.get("dilution_volume_column") or "").strip(),
         }
 
         # 阶段A：逐样品查询+过滤(此阶段不上传谱图)，收集所有样品的项目
@@ -3749,7 +3751,9 @@ class SequenceMaster:
         values = {col.get("columeCode", ""): str(col.get("defaultVal") or "") for col in dynamic_columns}
         host = self._build_headless_host(
             values, experiment_config, equipment_config, dynamic_columns,
-            actual_method_name, actual_method_id, ctx["configure_order"], ctx["fixed_params"])
+            actual_method_name, actual_method_id, ctx["configure_order"], ctx["fixed_params"],
+            dilution_remark_enabled=ctx.get("dilution_remark_enabled", False),
+            dilution_volume_column=ctx.get("dilution_volume_column", ""))
 
         # 温湿度：表格手填优先 → 设备房间·当天自动(温湿度记录.xlsx) → 默认 22/55
         temp_val = (row.get("temperature") or "").strip()
@@ -3974,6 +3978,10 @@ class SequenceMaster:
         else:
             self._fill_result_from_report(host, dynamic_columns, experiment_config,
                                           batch_items, row, actual_method_name, ctx, log)
+        # 启用稀释备注但未启用报告解析：扫稀释 PDF 文件名(-NNX)填稀释列(报告解析启用时不扫，已更精确填过)
+        if ctx.get("dilution_remark_enabled"):
+            self._fill_dilution_from_filename(host, dynamic_columns, experiment_config,
+                                              batch_items, row, actual_method_name, ctx, log)
 
         # 构造载荷 + 注入谱图 + 提交
         log("构建并提交 ...")
@@ -4588,6 +4596,49 @@ class SequenceMaster:
         log(f"报告解析: 结果列 {res_col} 浓度回填 {filled}/{len(values)} 条"
             + (f"，{len(missing_samples)} 个样品缺报告PDF" if missing_samples else ""))
 
+    def _fill_dilution_from_filename(self, host, dynamic_columns, experiment_config,
+                                     batch_items, row, actual_method_name, ctx, log):
+        """启用稀释备注 + 未启用报告解析时：扫各样品谱图目录的稀释 PDF(文件名-NNX)取额外倍数，
+        填稀释列(整样品稀释→该样品全部记录)。报告解析启用或含强制解析样品时不运行(报告解析已填、更精确)。"""
+        settings = self._read_report_parse_settings(ctx.get("method_file"))
+        if settings and settings.get("enabled"):
+            return  # 报告解析已填稀释列(文件名+内容两路)，不重复
+        wmap = ctx.get("wmap") or {}
+        if any((wmap.get(it.get("sample_code") or "") or {}).get("force_parse") for it in batch_items):
+            return  # 含强制解析样品：报告解析已处理，避免整样品覆盖其逐组分结果
+        spectrum_path = (row.get("spectrum_path") or "").strip()
+        if not spectrum_path:
+            return
+        dil_col = next((c.get("columeCode") for c in (dynamic_columns or [])
+                        if isinstance(c, dict) and (c.get('equipRelativeTitle') or '').strip() == '稀释'), None)
+        if not dil_col:
+            return
+        from report_parser import _dilution_factor
+        factor_by_sample = {}
+        for it in batch_items:
+            sc = it.get("sample_code")
+            if not sc or sc in factor_by_sample:
+                continue
+            _pdf, dil_pdf = _pick_sample_report_pdf(spectrum_path, sc, actual_method_name)
+            if dil_pdf:
+                f = _dilution_factor(dil_pdf)
+                if f and f != 1.0:
+                    factor_by_sample[sc] = f
+        if not factor_by_sample:
+            return
+        records = (experiment_config or {}).get("ocAnalysisRecordList") or []
+        pid_to_item = {str(it["project"].get("projectId")): it for it in batch_items
+                       if it.get("project", {}).get("projectId") is not None}
+
+        def _dil_val(rec):
+            _item = pid_to_item.get(str(rec.get("projectId")))
+            _f = factor_by_sample.get(_item.get("sample_code")) if _item else None
+            return f"{_f:g}" if _f and _f != 1.0 else "1"
+
+        host.data_fields[dil_col] = [_Box(_dil_val(rec)) for rec in records]
+        log(f"稀释备注(文件名): 稀释列 {dil_col} 按 -NNX 填 {len(factor_by_sample)} 个稀释样品 "
+            f"({', '.join(f'{sc}×{f:g}' for sc, f in factor_by_sample.items())})")
+
     def _filter_projects_by_method(self, projects, row, log):
         """按方法文件 query_rules 指定的方法过滤 projects。
         返回 (projects, error_msg)。error_msg 非空表示无法确定单一方法——
@@ -4865,7 +4916,7 @@ class SequenceMaster:
 
     def _build_headless_host(self, values, experiment_config, equipment_config,
                              dynamic_columns, actual_method_name, actual_method_id, configure_order,
-                             fixed_params=None):
+                             fixed_params=None, dilution_remark_enabled=False, dilution_volume_column=""):
         """构造无头 host 供 build_grouped_experiment_data 使用"""
         data_fields = {code: _Box(val) for code, val in values.items()}
         today = datetime.now().strftime("%Y-%m-%d")
@@ -4887,6 +4938,8 @@ class SequenceMaster:
             humidity_var=_Box(""),
             start_date_var=_Box(today),
             end_date_var=_Box(today),
+            dilution_remark_enabled=dilution_remark_enabled,
+            dilution_volume_column=dilution_volume_column,
         )
 
     def _prompt_confirm(self, prompt):

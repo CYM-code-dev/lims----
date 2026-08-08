@@ -2507,6 +2507,54 @@ def _match_fixed_params(fixed_params, project):
     return overrides
 
 
+# ---- 稀释备注 ----
+# 稀释.doc：总倍数 F = Π(C/移取量)，C=定容体积；每步因子∈{2,5,10,20}(C=10 时移取 5/2/1/0.5 ml)。
+# 13 个标准倍数逐字固化(含 400=[20,20]、2000=[10,10,20] 等非贪婪特例)；表外走贪心分解。
+_DILUTION_STEPS = {
+    2: [2], 5: [5], 10: [10], 20: [10, 2], 50: [10, 5], 100: [10, 10],
+    200: [10, 10, 2], 250: [10, 5, 5], 400: [20, 20], 500: [10, 10, 5],
+    1000: [10, 10, 10], 2000: [10, 10, 20], 2500: [10, 10, 5, 5],
+}
+
+
+def _decompose_dilution(f):
+    """贪心分解倍数 f 为 [10,5,2] 因子列表(乘积=f)；非 2^a·5^b 返回 None。"""
+    if f < 2 or f != int(f):
+        return None
+    f = int(f)
+    steps = []
+    for factor in (10, 5, 2):
+        while f % factor == 0:
+            steps.append(factor)
+            f //= factor
+    return steps if f == 1 else None
+
+
+def build_dilution_remark(f, c):
+    """按稀释.doc 生成稀释操作备注：移取…样液定容至…,再/最后移取…稀释液定容至….
+    f=额外稀释倍数(>1)，c=定容体积。查表优先→贪心分解→单步兜底；无法生成返回 None。
+    措辞：步0=样液；末步(n≥3)用「最后移取」、(n==2)用「再移取」；中间步「再移取」，均为稀释液。"""
+    try:
+        f = float(f); c = float(c)
+    except (TypeError, ValueError):
+        return None
+    if f <= 1 or c <= 0:
+        return None
+    fi = int(round(f))
+    steps = _DILUTION_STEPS.get(fi) or _decompose_dilution(fi) or [fi]  # [fi]=非标准倍数单步兜底
+    parts, n = [], len(steps)
+    for i, factor in enumerate(steps):
+        take = c / factor
+        if i == 0:
+            parts.append(f"移取{take:.2f}ml样液定容至{c:.2f}ml")
+        elif i == n - 1:
+            verb = "再移取" if n == 2 else "最后移取"
+            parts.append(f"{verb}{take:.2f}ml稀释液定容至{c:.2f}ml")
+        else:
+            parts.append(f"再移取{take:.2f}ml稀释液定容至{c:.2f}ml")
+    return ",".join(parts) + "."
+
+
 def _we_datetime_str(v):
     """称样设备台账日期 → LIMS 字符串 "YYYY-MM-DD HH:MM:SS"。
     raw_data(selectByDetectionMethodId) 里 createDatetime/modifyDatetime 是 epoch-ms 整型；
@@ -2712,6 +2760,26 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
     if hasattr(self, 'remark_text'):
         remark_content = self.remark_text.get('1.0', 'end-1c').strip()
 
+    # 稀释备注：解析稀释列与定容体积列码（启用稀释备注时；列名无关，按 equipRelativeTitle 找稀释列）
+    _dil_remark_on = getattr(self, "dilution_remark_enabled", False)
+    _dil_col_code = next((c.get('columeCode') for c in self.dynamic_columns
+                          if isinstance(c, dict) and (c.get('equipRelativeTitle') or '').strip() == '稀释'), None)
+    _vol_col_code = None
+    if _dil_remark_on and _dil_col_code:
+        _vol_want = _norm_cn(getattr(self, "dilution_volume_column", "") or "")
+        if _vol_want:
+            for c in self.dynamic_columns:
+                if isinstance(c, dict) and _norm_cn(c.get('columeName', '')) == _vol_want:
+                    _vol_col_code = c.get('columeCode'); break
+            if not _vol_col_code:  # 兜底双向子串
+                for c in self.dynamic_columns:
+                    _cn_v = _norm_cn(c.get('columeName', '')) if isinstance(c, dict) else ''
+                    if _cn_v and (_vol_want in _cn_v or _cn_v in _vol_want):
+                        _vol_col_code = c.get('columeCode'); break
+            if not _vol_col_code:
+                self.log(f"稀释备注: 找不到定容体积列「{getattr(self, 'dilution_volume_column', '')}」，实际列: "
+                         f"{[c.get('columeName') for c in self.dynamic_columns if isinstance(c, dict)]}")
+
     for i, project in enumerate(projects):
         sample_id = project.get('sampleId')
         project_id = project.get('projectId')
@@ -2769,6 +2837,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
             # 动态构建字段数据
             dynamic_fields = {}
             selectmap_data = {}
+            dil_extra = 1.0  # 额外稀释倍数(报告解析/文件名扫描)；启用稀释备注时用于生成备注
 
             # 使用用户输入的值覆盖默认值
             _is_headless = getattr(self, "is_headless", False)
@@ -2810,6 +2879,22 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
                 if _cn and _cn in fixed_overrides and (not user_value or _placeholder):
                     dynamic_fields[col_code] = str(fixed_overrides[_cn])
 
+                # 稀释列(启用稀释备注时)：最终值=基准(固定参数稀释因子F)×额外(报告解析/文件名扫描)，
+                # 额外倍数留给备注。基准不在固定参数时 _b=1(列值即额外，与现状一致)。
+                if _dil_remark_on and _dil_col_code and col_code == _dil_col_code:
+                    try:
+                        _e = float(user_value or default_val or 1)
+                    except (ValueError, TypeError):
+                        _e = 1.0
+                    _b = 1.0
+                    if _cn in fixed_overrides:
+                        try:
+                            _b = float(fixed_overrides[_cn] or 1)
+                        except (ValueError, TypeError):
+                            _b = 1.0
+                    dil_extra = _e
+                    dynamic_fields[col_code] = f"{_b * _e:g}"
+
                 # 构建selectmap数据 - 与前端保持一致
                 if edit_type == 'EDIT_TYPE_SELECT' and dynamic_fields[col_code]:
                     selectmap_data[col_code] = [{
@@ -2832,7 +2917,16 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
             standard_and_warning_val = record_config.get('standardAndWarningVal', '≤1.0')
             detection_limit_type = record_config.get('detectionLimitType', '检出限')
             accuracy = record_config.get('accuracy', 'STANDARD_DEVIATION')
-            sample_remark_content = remark_content
+            # 稀释备注(按额外倍数+定容体积)：仅额外>1 的稀释样品生成，否则沿用固定备注
+            row_remark = remark_content
+            if _dil_remark_on and _vol_col_code and dil_extra > 1:
+                try:
+                    _c = float(dynamic_fields.get(_vol_col_code) or 0)
+                except (ValueError, TypeError):
+                    _c = 0.0
+                if _c > 0:
+                    row_remark = build_dilution_remark(dil_extra, _c) or remark_content
+            sample_remark_content = row_remark
             report_unit_name = record_config.get('reportUnitName', 'mg/kg')
             calculated_unit = record_config.get('calculatedUnit', 'mg/kg')
 
@@ -2860,7 +2954,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
                 "calculatedValue": None,
                 "calculatedUnit": calculated_unit,
                 "accuracy": accuracy,
-                "remark": remark_content,
+                "remark": row_remark,
                 "precisionCalcEnumMap": "{\"PROCESS_STATUS_NEEDLESS\":\"不需要\",\"STANDARD_DEVIATION\":\"标准偏差\",\"RELATIVE_LABEL_DEVIATION\":\"相对标准偏差(>2)\",\"RELATIVE_LABEL_DEVIATION_TWO\":\"相对标准偏差(≥2)\",\"RELATIVE_DIFFERENCE\":\"相对相差(误差)\",\"ABSOLUTE_DEVIATION\":\"绝对偏差\",\"RELATIVE_DEVIATION\":\"相对偏差\",\"ABSOLUTE_DIFFERENCE\":\"绝对差值\"}",
                 "ocAnalysisExperimentList": None,
                 "ocCurve": None,
@@ -3074,4 +3168,11 @@ if __name__ == "__main__":
     _fp3 = [{"trigger": "检测项目=可溶性六价铬（CrVI）；标准值=≤0.005",
              "params": [{"name": "稀释因子F", "value": "2.5"}]}]
     assert _match_fixed_params(_fp3, {"projectName": "可溶性六价铬（CrVI）", "standardValue": "≤0.005"})[_nk] == "2.5"
+    # build_dilution_remark 自检：稀释.doc 写法(总倍数 F=Π(C/移取量))
+    assert build_dilution_remark(20, 10) == "移取1.00ml样液定容至10.00ml,再移取5.00ml稀释液定容至10.00ml."
+    assert build_dilution_remark(10, 25) == "移取2.50ml样液定容至25.00ml."        # C 缩放
+    assert build_dilution_remark(400, 10) == "移取0.50ml样液定容至10.00ml,再移取0.50ml稀释液定容至10.00ml."
+    assert build_dilution_remark(1000, 10).count("最后移取") == 1                  # 3 步末步「最后移取」
+    assert build_dilution_remark(25, 10) == "移取2.00ml样液定容至10.00ml,再移取2.00ml稀释液定容至10.00ml."  # 非标准→分解[5,5]
+    assert build_dilution_remark(1, 10) is None and build_dilution_remark(5, 0) is None  # 不稀释/无体积→None
     print("detection_entry_api selfcheck OK")

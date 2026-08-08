@@ -2576,6 +2576,17 @@ class OtherParamsTab:
         self.create_lab_proc_section(submit_frame)
         self.lab_proc_frame.pack_forget()
 
+        # 启用稀释备注（默认隐藏，通过复选框控制）
+        self.dilution_remark_enable_var = tk.BooleanVar(value=False)
+        self.dil_remark_toggle_frame = ttk.Frame(submit_frame)
+        self.dil_remark_toggle_frame.pack(fill='x', padx=5, pady=(2, 0))
+        ttk.Checkbutton(self.dil_remark_toggle_frame, text=" 启用稀释备注（按稀释倍数+定容体积自动生成）",
+                        variable=self.dilution_remark_enable_var,
+                        style=self.app.large_cb_style,
+                        command=self.toggle_dilution_remark).pack(side='left')
+        self.create_dilution_remark_section(submit_frame)
+        self.dil_remark_frame.pack_forget()
+
         # 提交签名：勾选后序列录入完数据改调 submitOcExperiment（提交签名/推进工作流），否则 saveOcExperiment（仅保存）。
         self.require_signature_var = tk.BooleanVar(value=False)
         self.sign_frame = ttk.Frame(submit_frame)
@@ -2993,6 +3004,14 @@ class OtherParamsTab:
         else:
             self.lab_proc_frame.pack_forget()
 
+    def toggle_dilution_remark(self):
+        """复选框控制稀释备注设置的显示/隐藏"""
+        if self.dilution_remark_enable_var.get():
+            self.dil_remark_frame.pack(fill='x', padx=5, pady=2, before=self.sign_frame)
+        else:
+            self.dil_remark_frame.pack_forget()
+        self.app.mark_modified()
+
     def on_device_number_change(self, *args):
         """设备编号改变时的处理"""
         # 标记已修改
@@ -3009,7 +3028,9 @@ class OtherParamsTab:
             "fixed_params": self.fixed_params,
             "lab_proc_enabled": self.lab_proc_enable_var.get(),
             "lab_proc_rules": self.lab_proc_rules,
-            "require_signature": self.require_signature_var.get()
+            "require_signature": self.require_signature_var.get(),
+            "dilution_remark_enabled": self.dilution_remark_enable_var.get(),
+            "dilution_volume_column": self.dilution_volume_col_var.get().strip()
         }
 
     def set_settings(self, settings):
@@ -3058,6 +3079,14 @@ class OtherParamsTab:
             self.refresh_lab_proc_rules_tree()
         if self.lab_proc_enable_var.get() and self.lab_proc_rules:
             self.lab_proc_frame.pack(fill='x', padx=5, pady=2, before=self.sign_frame)
+
+        # 设置稀释备注
+        if "dilution_remark_enabled" in settings:
+            self.dilution_remark_enable_var.set(bool(settings["dilution_remark_enabled"]))
+        if "dilution_volume_column" in settings:
+            self.dilution_volume_col_var.set(settings["dilution_volume_column"])
+        if self.dilution_remark_enable_var.get():
+            self.dil_remark_frame.pack(fill='x', padx=5, pady=2, before=self.sign_frame)
 
         # 更新显示
         self.on_standard_type_change()
@@ -3173,6 +3202,19 @@ class OtherParamsTab:
 
     # ---------- 条件实验过程(labProc)规则 ----------
     # 镜像条件设备规则：文件名/项目名/试样描述 关键词 AND 匹配 → 命中取首条，用其 lab_proc 覆盖该样品 experimentProcess。
+
+    def create_dilution_remark_section(self, parent):
+        """创建稀释备注设置区域(初始会被 create_submit_tab pack_forget)。"""
+        self.dil_remark_frame = ttk.LabelFrame(parent, text="稀释备注设置", padding=5)
+        self.dil_remark_frame.pack(fill='x', padx=5, pady=2)
+        dr = ttk.Frame(self.dil_remark_frame)
+        dr.pack(fill='x', pady=2)
+        ttk.Label(dr, text="定容体积列名:").pack(side='left', padx=(0, 3))
+        self.dilution_volume_col_var = tk.StringVar()
+        ttk.Entry(dr, textvariable=self.dilution_volume_col_var, width=24).pack(side='left', padx=(0, 6))
+        self.dilution_volume_col_var.trace('w', lambda *a: self.app.mark_modified())
+        ttk.Label(dr, text="（如 体积V(mL)；基准稀释倍数走「固定参数 稀释因子F」）",
+                  foreground="gray").pack(side='left')
 
     def create_lab_proc_section(self, parent):
         """创建条件实验过程规则区域(初始会被 create_submit_tab pack_forget)。"""
