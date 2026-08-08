@@ -1857,13 +1857,22 @@ class DetectionAPI:
                 # 有效日期：取 raw.checkOutDate（前端字段），兼容 "YYYY-MM-DD HH:MM:SS"
                 cod = raw.get('checkOutDate')
                 check_out = cod[:10] if isinstance(cod, str) else (str(cod)[:10] if cod else '')
+                # 仪器条件：selectByDetectionMethodId 的 instrumentConditionArr(JSON 串)→数组，对齐前端 condition
+                _icarr = raw.get('instrumentConditionArr')
+                try:
+                    _cond = json.loads(_icarr) if _icarr else None
+                except (ValueError, TypeError):
+                    _cond = None
                 entries.append({
                     'id': int(eq_id) if str(eq_id).isdigit() else eq_id,
                     'name': name,
                     'checkOutDate': check_out,
-                    'condition': raw.get('condition'),
+                    'condition': _cond,
                 })
-                name_parts.append(','.join((code, name, check_out)))
+                _np = ','.join((code, name))
+                if check_out:
+                    _np += ',' + check_out
+                name_parts.append(_np)
                 ids.append(str(eq_id))
             request_data = {
                 'id': int(experiment_id) if str(experiment_id).isdigit() else 0,
@@ -1909,7 +1918,6 @@ class DetectionAPI:
                 "sidx": "",
                 "sord": "asc",
                 "usedCategory": used_category,
-                "keyword": "",
                 "SampleProjectId": str(sample_project_id),
                 "pid": self.get_user_pid(),
                 "pname": self.get_user_pname(),
@@ -2608,6 +2616,18 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
     weighing_equipment_json = weighing_equipment
 
     # 构建主检设备数组格式 - 与前端保持一致
+    # 仪器条件 condition：selectByDetectionMethodId 的 instrumentConditionArr(JSON 串)按 id 回填，对齐前端
+    _cond_by_id = {}
+    for _eq in (self.equipment_config.get("raw_data") or []):
+        _icarr = _eq.get("instrumentConditionArr")
+        if not _icarr:
+            continue
+        for _kid in (_eq.get("equipmentBillId"), _eq.get("id")):
+            if _kid is not None:
+                try:
+                    _cond_by_id[str(_kid)] = json.loads(_icarr)
+                except (ValueError, TypeError):
+                    pass
     main_equipment_array = []
     if main_equipment_ids:
         equipment_ids = main_equipment_ids.split(',')
@@ -2634,7 +2654,7 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
                     "id": equipment_id,
                     "name": equipment_name,
                     "checkOutDate": equipment_checkout_date,
-                    "condition": None,
+                    "condition": _cond_by_id.get(str(equipment_id)),
                     "instrumentAttachId": None
                 }
                 main_equipment_array.append(equipment_info)

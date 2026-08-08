@@ -4049,43 +4049,13 @@ class SequenceMaster:
             except Exception as e:
                 log(f"读取真实实验编号失败: {e}")
 
-        # 称样设备只随 saveOcExperiment 的 weighingEquipment 字段提交(经 _enrich_weighing_bill 回填台账)，
-        # 不进 saveMainEqubment 主检设备列表——对齐网页端，否则登记页会把它误判为主检设备。
-        # 主检设备保存（对照 detection_entry_main:1757-1766）：表格指定了设备则提交这些设备；
-        # 未指定(默认模式)则提交方法全部默认检测设备(isDefault=1)，与手动界面「查询设备」默认勾选一致
-        if matched_list and experiment_id:
-            items = [{"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
-                     for eq in matched_list]
-            eq_ok, _ = self.api.save_main_equipment(experiment_id, items, log)
-            log(f"主检设备{'提交成功' if eq_ok else '提交失败'}: "
-                f"{','.join(str(i['id']) for i in items)}")
-        elif not matched_list:
-            if not experiment_id:
-                log("主检设备未单独提交：experimentId=0（实验编号未生成）")
-            else:
-                # 默认主检设备 = 方法检测设备中 isDefault=1 的（即 mainEquipmentIds 列出的）
-                main_ids = set((equipment_config or {}).get("mainEquipmentIds", "").split(","))
-                log(f"[设备] mainEquipmentIds={sorted(x for x in main_ids if x)}; raw_data: " + "; ".join(
-                    f"{e.get('name')}({e.get('usedCategory')}/billId={e.get('equipmentBillId')!r},id={e.get('id')!r})"
-                    for e in (equipment_config or {}).get("raw_data") or []))
-                _we = equipment_config or {}
-                if _we.get("weighingEquipmentId"):
-                    log(f"[设备] 称样设备: {_we.get('weighingEquipment')} (id={_we.get('weighingEquipmentId')})")
-                else:
-                    log("[设备] 称样设备: (方法未配置默认称样设备)")
-                default_items = [
-                    {"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
-                    for eq in (equipment_config or {}).get("raw_data") or []
-                    if eq.get("usedCategory") == "检测设备"
-                    and (eq.get("equipmentBillId") or eq.get("id"))
-                    and str(eq.get("equipmentBillId") or eq.get("id")) in main_ids
-                ]
-                if default_items:
-                    eq_ok, _ = self.api.save_main_equipment(experiment_id, default_items, log)
-                    log(f"主检设备{'提交成功' if eq_ok else '提交失败'}(默认{len(default_items)}台): "
-                        f"{','.join(str(i['id']) for i in default_items)}")
-                else:
-                    log("主检设备未单独提交：方法未配置默认检测设备(已随实验载荷提交)")
+        # 主检设备 + 称样设备均随 saveOcExperiment 载荷提交（mainEquipment / weighingEquipment 字段），
+        # 对齐网页端——网页端不单独调 saveMainEqubment。称样设备经 _enrich_weighing_bill 回填真实台账。
+        _we = equipment_config or {}
+        if _we.get("weighingEquipmentId"):
+            log(f"[设备] 称样设备随实验载荷提交: {_we.get('weighingEquipment')} (id={_we.get('weighingEquipmentId')})")
+        if (_we.get("mainEquipmentIds") or "").strip():
+            log(f"[设备] 主检设备随实验载荷提交: ids={_we.get('mainEquipmentIds')}")
 
         # 标液关联——用真实编号（对照 detection_entry_main:1768-1776）
         if ctx["configure_order"]:
