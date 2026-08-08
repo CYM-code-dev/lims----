@@ -287,10 +287,20 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
     """在谱图目录中挑该样品的报告 PDF，返回 (normal_pdf, diluted_pdf)：
     文件名以 sample_code 开头(大小写不敏感)的 .pdf，按是否含 -NNX 稀释后缀分为正常/稀释；
     各自按方法/项目类别关键词挑(1个直取/仍歧义取首个)。对应无则该位为 None。"""
-    from report_parser import _dilution_factor, extract_content_sample_ids
+    from report_parser import _dilution_factor, extract_content_sample_ids, extract_icp_ms_sample_name
     sc = (sample_code or '').lower()
     if not sc or not spectrum_path or not os.path.isdir(spectrum_path):
         return None, None
+    # ICP-MS：按报告内 Sample Name 认领(优先于文件名——文件名可能与报告样品号不一致)
+    try:
+        _all_pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
+                     if fn.lower().endswith('.pdf')]
+    except Exception:
+        _all_pdfs = []
+    for p in _all_pdfs:
+        _sn = extract_icp_ms_sample_name(p)
+        if _sn and (_sn == sample_code or sample_code.startswith(_sn) or _sn.startswith(sample_code)):
+            return p, None  # ICP-MS 单样品、无稀释 PDF 概念
     try:
         pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
                 if fn.lower().endswith('.pdf') and fn.lower().startswith(sc)]
@@ -1847,6 +1857,8 @@ class SequenceMaster:
         tb_del.pack(side='left', padx=2)
         tb_fill = ttkb.Button(quick_bar, text="↓", command=self.fill_down, width=3, padding=(2, 0), bootstyle="secondary")
         tb_fill.pack(side='left', padx=2)
+        tb_method = ttkb.Button(quick_bar, text="⚙", command=self.edit_method, width=3, padding=(2, 0), bootstyle="secondary")
+        tb_method.pack(side='left', padx=2)
         _c = ttkb.Style().colors  # 主题配色，使 tk.Label 背景与界面一致
         self.login_status_label = tk.Label(quick_bar, text="👤 未登录", fg="#dc2626", bg=_c.bg,
                                           font=("Segoe UI", 9, "bold"))
@@ -1869,6 +1881,7 @@ class SequenceMaster:
             ttkb.ToolTip(tb_add, text="添加行"),
             ttkb.ToolTip(tb_del, text="删除选中行"),
             ttkb.ToolTip(tb_fill, text="向下填充"),
+            ttkb.ToolTip(tb_method, text="编辑方法"),
             ttkb.ToolTip(self.tb_run, text="运行序列"),
             ttkb.ToolTip(self.tb_load, text="加载序列"),
             ttkb.ToolTip(self.tb_pause, text="暂停 / 继续"),

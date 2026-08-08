@@ -1,8 +1,8 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-ck.com/轻工公盘/无机/称量记录.xlsx
-  method_file: D:/Agent/lims数据登记/methods/4大.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/0803-RC
+  weighing_path: D:/Agent/lims数据登记/谱图/报告解析/ICP/称量记录0730.xlsx
+  method_file: D:/Agent/lims数据登记/methods/19大.mtd
+  spectrum_path: D:/Agent/lims数据登记/谱图/报告解析/ICP
   temperature: '24'
   humidity: '64'
 column_widths:

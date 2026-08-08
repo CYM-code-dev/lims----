@@ -1,18 +1,10 @@
 sequence_data:
 - id: 1
   weighing_path: D:/Agent/lims数据登记/谱图/报告解析/ICP/称量记录0730.xlsx
-  method_file: D:/Agent/lims数据登记/methods/4大.mtd
-  reference_material: ''
-  equipment: ''
+  method_file: D:/Agent/lims数据登记/methods/19大MS.mtd
   spectrum_path: D:/Agent/lims数据登记/谱图/报告解析/ICP
-  sample_code: TN26070643
-  configure_order: ''
-  standard_type: fresh
-  instrument_setting: default
-  weighing_mode: pdf
   temperature: '24'
   humidity: '64'
-  experiment_code: sjr20260804163929
 column_widths:
 - 50
 - 260

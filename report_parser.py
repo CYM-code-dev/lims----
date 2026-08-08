@@ -1429,7 +1429,8 @@ _ICP_ELEM_RE = re.compile(r'^[A-Z][a-z]?$')
 
 
 def _detect_icp(content):
-    return ('建立者（原始）：ICP' in content) or ('分析物' in content and '校准浓度' in content)
+    return ('建立者（原始）：ICP' in content) or ('分析物' in content and '校准浓度' in content) \
+        or ('分析物' in content and ('平均值数据' in content or '重复测定数据' in content))
 
 
 def _slice_icp_section(part, marker):
@@ -1448,8 +1449,11 @@ def _slice_icp_section(part, marker):
 def _parse_icp_element_line(line):
     """解析 ICP 元素行 -> (分析物, value, status, raw) 或 None。
     行形如 'Pb 220.353 1596.9 0.394 mg/L 19.42 mg/kg'：定位 mg/L，取其前一个 token 为校准浓度(mg/L)。
+    部分模板行首带重复序号(如 '1 Pb 220.353 ...')，先剔除纯数字前缀再解析。
     分析物名 = 元素符号+波长(如 'Pb 220.353')，与报告单元格/项目别名一致；负值(低于检出限) -> 未检出。"""
     toks = line.split()
+    while toks and toks[0].isdigit():  # 剔除行首重复序号(1/2/3...)
+        toks = toks[1:]
     idx = next((i for i, t in enumerate(toks) if t.lower() == 'mg/l'), -1)
     if idx <= 0 or not _ICP_ELEM_RE.match(toks[0]):
         return None
@@ -1494,6 +1498,51 @@ def parse_icp_report(content):
     return samples
 
 
+# ICP-MS 定量报告(外标法)：英文 Quantitation Report，表头 Element/质量数/.../浓度/单位(ug/L)/...，
+# 一个 PDF 一个样品(Sample Name)。固定表头超集：确保 LIMS 结果列 equipRelativeTitle=浓度 能命中。
+_ICP_MS_HEADERS = ['Element', '质量数', '内标', '调谐模式', '浓度', '单位', 'RSD(%)', 'CPS', '比率', '检测器模式', 'Time(sec)', 'Rep']
+
+
+def _detect_icp_ms(content):
+    return ('Operator Name ICPMS' in content) or \
+        ('FullQuant Table' in content and '质量数' in content and 'ug/L' in content)
+
+
+def parse_icp_ms_report(content):
+    """解析 ICP-MS 定量报告 -> [(样品标识码, compounds), ...]。
+    单样品(按 'Sample Name' 取标识码)；元素行 '元素 质量数 调谐 浓度 ug/L ...'，
+    浓度取 ug/L 前一个 token；分析物名 = 元素+质量数(如 'Cu 63')。"""
+    sid = 'A'
+    m = re.search(r'Sample Name\s+(\S+)', content)
+    if m:
+        sid = m.group(1)
+    compounds = {}
+    for line in content.split('\n'):
+        toks = line.split()
+        if len(toks) < 4 or not _ICP_ELEM_RE.match(toks[0]):
+            continue
+        try:
+            int(toks[1])  # 质量数(同位素)
+        except ValueError:
+            continue
+        idx = next((i for i, t in enumerate(toks) if t.lower() == 'ug/l'), -1)
+        if idx <= 0:
+            continue
+        raw = toks[idx - 1]
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        analyte = f"{toks[0]} {toks[1]}"
+        if analyte in compounds:
+            continue
+        if val <= 0:
+            compounds[analyte] = {'value': 0.0, 'status': '未检出', 'raw': None}
+        else:
+            compounds[analyte] = {'value': val, 'status': '检出', 'raw': raw}
+    return [(sid, compounds)] if compounds else []
+
+
 def parse_pdf_report_meta(file_path, field='样品初始质量'):
     """从报告 PDF 提取每样品段的指定数值元数据字段(默认样品初始质量)。
     返回 [(样品标识码, 值字符串|None), ...]，按文档出现顺序(对应平行槽 0/1/...)。
@@ -1511,6 +1560,33 @@ def parse_pdf_report_meta(file_path, field='样品初始质量'):
 
 
 _content_id_cache = {}   # ponytail: (path, mtime) -> [base_id]；避免每次关联重抽PDF文本
+_icp_ms_name_cache = {}  # ponytail: (path, mtime) -> Sample Name('' 表示非ICP-MS或无)；同上
+
+
+def extract_icp_ms_sample_name(file_path):
+    """ICP-MS 定量报告的 Sample Name(单样品标识码)。非 ICP-MS / 无 Sample Name 返回 None。
+    供按报告内容(而非文件名)关联样品——ICP-MS 文件名可能与报告 Sample Name 不一致。
+    带 (path, mtime) 缓存，避免每次重抽 PDF 文本。"""
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        return None
+    key = (file_path, mtime)
+    cached = _icp_ms_name_cache.get(key)
+    if cached is not None:
+        return cached or None
+    try:
+        content = PDFTextExtractor().extract_text_from_pdf(file_path)
+    except Exception:
+        _icp_ms_name_cache[key] = ''
+        return None
+    name = None
+    if _detect_icp_ms(content):
+        m = re.search(r'Sample Name\s+(\S+)', content)
+        if m:
+            name = m.group(1)
+    _icp_ms_name_cache[key] = name or ''
+    return name
 
 
 def extract_content_sample_ids(file_path):
@@ -1578,6 +1654,8 @@ def parse_pdf_report_multi(file_path):
     headers = 报告表头 token 列表（ICP 固定含「校准浓度」等），供按 equipRelativeTitle 匹配选列。"""
     analyzer = _HeadlessReportAnalyzer()
     content = analyzer.pdf_extractor.extract_text_from_pdf(file_path)
+    if _detect_icp_ms(content):
+        return parse_icp_ms_report(content), list(_ICP_MS_HEADERS)
     if _detect_icp(content):
         return parse_icp_report(content), list(_ICP_HEADERS)
     return _split_non_icp_sections(content, analyzer, file_path), _extract_column_headers(content)
@@ -1659,6 +1737,14 @@ if __name__ == "__main__":
                 assert '(cid:' not in _n, (_gc, _n)          # 系统字体解码成功，无 cid 残留
                 assert _v['status'] in ('检出', '未检出'), (_gc, _n, _v)
         print(f"[GC-FID] {_os.path.basename(_gc)}: {sum(len(c) for _, c in _s)} 个化合物")
+    # ponytail: 自检——ICP-MS 定量报告(ug/L)：含 'Cu 63' 等元素+质量数，浓度>0，status 合法
+    for _ms in sorted(_glob.glob('谱图/报告解析/ICP/TS*-定量报告-内标.pdf')):
+        _s, _h = parse_pdf_report_multi(_ms)
+        assert _s and _s[0][1], f"ICP-MS 未解析到化合物: {_ms}"
+        for _n, _v in _s[0][1].items():
+            assert ' ' in _n and _v['status'] in ('检出', '未检出'), (_ms, _n, _v)
+        assert '浓度' in _h, (_ms, _h)
+        print(f"[ICP-MS] {_os.path.basename(_ms)}: {len(_s[0][1])} 个化合物，样品 {_s[0][0]}")
     # ponytail: 自检——带参数则解析该PDF并打印各样品化合物+status(断言至少1个)；无参数启动GUI。
     if len(sys.argv) > 1:
         _samples, _h = parse_pdf_report_multi(sys.argv[1])

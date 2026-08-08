@@ -2455,8 +2455,12 @@ def _norm_cn(s):
 
 def _match_fixed_params(fixed_params, project):
     """按触发条件筛选适用于该项目的固定参数，返回 {规范化参数名(去空白): 值}。
-    触发格式「检测项目=值」/「检测方法=值」/「默认」(无条件，优先级最低，可被具体条件覆盖)；
-    条件值与项目对应字段做包含匹配。参数名经 _norm_cn 归一(全角/大小写/下标容错)后作为键。"""
+    触发格式：
+      「默认」(无条件，优先级最低，可被具体条件覆盖)；
+      「字段=值」单条件；多条件用 ';' 分隔(AND，均需命中)，如「检测项目=可溶性六价铬（CrVI）;标准值=≤0.005」。
+    字段：检测项目(projectName)/检测方法(standardNo)/标准值(standardValue)。
+    值支持多值(中/英文逗号分隔，任一子串命中即该条件成立)。
+    参数名经 _norm_cn 归一(全角/大小写/下标容错)后作为键。"""
     overrides = {}
 
     def _apply(rule):
@@ -2465,22 +2469,32 @@ def _match_fixed_params(fixed_params, project):
             if name:
                 overrides[name] = p.get("value", "")
 
+    def _cond_match(cond):
+        """单条件 字段=值。值多值逗号 OR；空值=不限(命中)。"""
+        field, _, value = cond.partition("=")
+        field, value = field.strip(), value.strip()
+        if not value:
+            return True
+        if field == "检测方法":
+            target = (project.get("standardNo") or "").strip()
+        elif field == "标准值":
+            target = (project.get("standardValue") or "").strip()
+        else:  # 检测项目(默认)
+            target = (project.get("projectName") or "").strip()
+        _vals = [v.strip() for v in value.replace("，", ",").split(",") if v.strip()]
+        return any(v in target for v in _vals)
+
     # 先应用默认规则（优先级最低）
     for rule in fixed_params or []:
         if (rule.get("trigger") or "").strip() in ("默认", "默认触发"):
             _apply(rule)
-    # 再按 检测项目/检测方法 条件匹配（覆盖默认）
+    # 再按条件匹配（覆盖默认）；多条件 ';' AND
     for rule in fixed_params or []:
         trig = (rule.get("trigger") or "").strip()
         if not trig or trig in ("默认", "默认触发"):
             continue
-        field, _, value = trig.partition("=")
-        field, value = field.strip(), value.strip()
-        if not value:
-            continue
-        target = (project.get("standardNo") or "").strip() if field == "检测方法" \
-            else (project.get("projectName") or "").strip()
-        if value in target:
+        conditions = [c.strip() for c in trig.replace("；", ";").split(";") if c.strip()]
+        if conditions and all(_cond_match(c) for c in conditions):
             _apply(rule)
     return overrides
 
@@ -2686,7 +2700,12 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
         sample_name = project.get('sampleName', '未知样品')
 
         # 固定参数覆盖（序列模式：方法 other_params_settings.fixed_params，按触发条件匹配当前项目）
-        fixed_overrides = _match_fixed_params(getattr(self, "fixed_params", None), project)
+        # 附上 standardValue(从分析记录配置)，供触发条件「标准值=...」匹配
+        _rec_sv = next((r.get('standardValue') for r in (self.experiment_config.get('ocAnalysisRecordList') or [])
+                        if str(r.get('projectId')) == str(project_id)), None)
+        _p_for_match = dict(project)
+        _p_for_match['standardValue'] = _rec_sv or ''
+        fixed_overrides = _match_fixed_params(getattr(self, "fixed_params", None), _p_for_match)
         if fixed_overrides:
             self.log(f"[固定参数] 项目={project.get('projectName')!r} 命中触发条件，待填: {list(fixed_overrides)}")
             _col_norm = {_norm_cn(c.get('columeName')) for c in self.dynamic_columns if isinstance(c, dict)}
@@ -3019,4 +3038,20 @@ if __name__ == "__main__":
     assert _we_datetime_str(1772507451000).startswith("20") and isinstance(_we_datetime_str(1772507451000), str)
     assert _we_datetime_str("2026-05-07 09:00:44") == "2026-05-07 09:00:44"  # 已是字符串，原样
     assert _we_datetime_str(None) is None                                     # None 不填该字段
+    # _match_fixed_params 多值触发自检：中/英文逗号分隔，任一子串命中即应用
+    _fp = [{"trigger": "检测项目=可溶性铅（Pb），可溶性镉（Cd），可溶性汞（Hg）",
+            "params": [{"name": "称样量m(g)", "value": "0.5000"}]}]
+    assert _match_fixed_params(_fp, {"projectName": "可溶性铅（Pb）"}) == {"称样量m(g)": "0.5000"}
+    assert _match_fixed_params(_fp, {"projectName": "可溶性汞（Hg）"}) == {"称样量m(g)": "0.5000"}
+    assert _match_fixed_params(_fp, {"projectName": "苯"}) == {}                 # 不在列表→不命中
+    # 多条件 ';' AND + 标准值：同名项目按标准值区分
+    _fp2 = [{"trigger": "检测项目=可溶性六价铬（CrVI）;标准值=≤0.005",
+             "params": [{"name": "稀释因子F", "value": "2.5"}]}]
+    _nk = _norm_cn("稀释因子F")
+    assert _match_fixed_params(_fp2, {"projectName": "可溶性六价铬（CrVI）", "standardValue": "≤0.005"})[_nk] == "2.5"
+    assert _match_fixed_params(_fp2, {"projectName": "可溶性六价铬（CrVI）", "standardValue": "≤0.01"}) == {}  # 标准值不符
+    # 全角分号；与半角;等价(用户易输入全角)
+    _fp3 = [{"trigger": "检测项目=可溶性六价铬（CrVI）；标准值=≤0.005",
+             "params": [{"name": "稀释因子F", "value": "2.5"}]}]
+    assert _match_fixed_params(_fp3, {"projectName": "可溶性六价铬（CrVI）", "standardValue": "≤0.005"})[_nk] == "2.5"
     print("detection_entry_api selfcheck OK")

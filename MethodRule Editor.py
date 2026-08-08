@@ -2326,6 +2326,7 @@ class QueryAppFixed:
         self.other_params_tab.set_settings(rules_data.get("other_params_settings", {}))
         self.update_window_title()
         self.modified = False
+        self.update_window_title()  # 重置标记后刷新标题(填充控件时 trace 触发 mark_modified 会先显示*)
         return True
 
     def create_menubar(self):
@@ -2754,10 +2755,11 @@ class OtherParamsTab:
         ttk.Label(input_frame, text="触发条件:").pack(side='left', padx=(0, 5))
         self.fp_trigger_field_var = tk.StringVar(value="检测项目")
         ttk.Combobox(input_frame, textvariable=self.fp_trigger_field_var,
-                     values=["检测项目", "检测方法", "默认"], state="readonly", width=10).pack(side='left', padx=(0, 2))
+                     values=["检测项目", "检测方法", "标准值", "默认"], state="readonly", width=10).pack(side='left', padx=(0, 2))
         ttk.Label(input_frame, text="=").pack(side='left', padx=(0, 2))
         self.fp_trigger_value_entry = ttk.Entry(input_frame, width=14)
         self.fp_trigger_value_entry.pack(side='left', padx=(0, 12))
+        _bind_entry_tooltip(self.fp_trigger_value_entry)  # 多值触发较长，悬停显示完整内容
 
         ttk.Label(input_frame, text="参数名:").pack(side='left', padx=(0, 5))
         self.fp_param_name_entry = ttk.Entry(input_frame, width=18)
@@ -2790,6 +2792,13 @@ class OtherParamsTab:
         hsb.grid(row=1, column=0, sticky='ew')
 
         self.fp_tree.bind("<Double-1>", self.on_fixed_param_double_click)
+        # 触发条件/参数设置 列悬停显示全部内容(多值触发如「检测项目=可溶性铅（Pb），...」较长，窄列被截断)
+        _setup_cell_tooltip(self.fp_tree, ("触发条件", "参数设置"))
+
+        # 说明
+        ttk.Label(frame, foreground="gray", wraplength=700, justify='left',
+                  text="触发：检测项目=/检测方法=/标准值= 单条件；多条件用 ';' 连接(均需命中)，"
+                       "如「检测项目=可溶性六价铬（CrVI）;标准值=≤0.005」。值支持逗号多值(任一命中)。").pack(fill='x', pady=(2, 0))
 
         # 操作按钮
         btn_frame = ttk.Frame(frame)
