@@ -566,15 +566,28 @@ def _plan_submission_batches(query_rules, items):
     return plan
 
 
+def _kw_match(keywords, target):
+    """关键字匹配（desc/filename 等）：逗号=OR(任一)，分号=AND(均需命中)。
+    如 '纸,布;涂层' = (纸 OR 布) AND 涂层。keywords 空=不限(命中)。大小写不敏感，子串包含。"""
+    kk = (keywords or "").strip()
+    if not kk:
+        return True
+    t = (target or "").lower()
+    for g in [x for x in kk.replace("；", ";").split(";") if x.strip()]:
+        kws = [k for k in g.replace("，", ",").split(",") if k.strip()]
+        if kws and not any(k.lower() in t for k in kws):
+            return False
+    return True
+
+
 def _match_switch_rule(switch_rules, project_name, pdf_paths, desc=""):
     """统一规则匹配（纯函数，可单测）。
     规则各非空条件均需满足(AND): project_name 精确/wildcard匹配(空=任意项目)、
-    filename 关键字出现在某谱图PDF文件名(空=任意文件)、desc 关键字(逗号分隔多个、任一)
+    filename 关键字出现在某谱图PDF文件名(空=任意文件)、desc 关键字(逗号OR/分号AND)
     出现在样品"试样描述"(空=任意描述)。多规则命中取首条，均不命中返回 ''。
     三项匹配均大小写不敏感。"""
     bases = [os.path.basename(p).lower() for p in (pdf_paths or []) if p]
     pn = (project_name or "").strip()
-    d = (desc or "").strip().lower()
     for r in switch_rules or []:
         rp = str(r.get("project_name") or "").strip()
         if rp and not _project_match(pn, rp):
@@ -582,24 +595,18 @@ def _match_switch_rule(switch_rules, project_name, pdf_paths, desc=""):
         fk = str(r.get("filename") or "").strip().lower()
         if fk and not any(fk in b for b in bases):
             continue
-        dk = str(r.get("desc") or "")
-        if dk.strip():
-            tmp = dk
-            for sep in (",", "，", ";", "；"):
-                tmp = tmp.replace(sep, " ")
-            dks = [k for k in tmp.lower().split() if k]
-            if not any(k in d for k in dks):
-                continue
+        if not _kw_match(r.get("desc"), desc):
+            continue
         return str(r.get("to_id") or "").strip()
     return ""
 
 
 def _match_conditional_rule(rules, project_name, pdf_paths, desc=""):
     """条件规则匹配（纯函数）：project_name/filename/desc 三条件 AND，空=不限；多规则命中取首条。
-    返回命中的规则 dict，均不命中返回 None。供条件设备/条件实验过程等共用。"""
+    desc 关键字：逗号=OR(任一)，分号=AND(均需命中)。返回命中的规则 dict，均不命中返回 None。
+    供条件设备/条件实验过程等共用。"""
     bases = [os.path.basename(p).lower() for p in (pdf_paths or []) if p]
     pn = (project_name or "").strip()
-    d = (desc or "").strip().lower()
     for r in rules or []:
         rp = str(r.get("project_name") or "").strip()
         if rp and rp.lower() not in pn.lower():
@@ -607,14 +614,8 @@ def _match_conditional_rule(rules, project_name, pdf_paths, desc=""):
         fk = str(r.get("filename") or "").strip().lower()
         if fk and not any(fk in b for b in bases):
             continue
-        dk = str(r.get("desc") or "")
-        if dk.strip():
-            tmp = dk
-            for sep in (",", "，", ";", "；"):
-                tmp = tmp.replace(sep, " ")
-            dks = [k for k in tmp.lower().split() if k]
-            if not any(k in d for k in dks):
-                continue
+        if not _kw_match(r.get("desc"), desc):
+            continue
         return r
     return None
 
@@ -2765,7 +2766,7 @@ class SequenceMaster:
             self._log("设备查询：未登录或会话失效，回退手动输入")
         current = row.get("equipment") or ""
         if items:
-            checked = {c.strip() for c in current.split(";") if c.strip()}
+            checked = {c.strip() for c in current.replace("；", ";").split(";") if c.strip()}
             selected = self._open_equipment_picker(row_index, items, checked)
         else:
             # 未取到方法设备列表：不再弹出手动输入框，仅记日志/状态栏提示
@@ -4048,24 +4049,13 @@ class SequenceMaster:
             except Exception as e:
                 log(f"读取真实实验编号失败: {e}")
 
-        # 称样设备随主检设备一起提交到 saveMainEqubment：网页端 detectionEquipmentList 里检测设备与
-        # 称样设备并列(如 MDI 电子天平 id=1537)，称样设备只有经 saveMainEqubment 才会进该列表；
-        # 仅放 saveOcExperiment 载荷的 weighingEquipment 字段不会显示在登记页设备列表。
-        weigh_item = None
-        _wid = (equipment_config or {}).get("weighingEquipmentId")
-        if _wid and experiment_id:
-            for eq in (equipment_config or {}).get("raw_data") or []:
-                if eq.get("usedCategory") == "称样设备" \
-                        and str(eq.get("equipmentBillId") or eq.get("id")) == str(_wid):
-                    weigh_item = {"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
-                    break
+        # 称样设备只随 saveOcExperiment 的 weighingEquipment 字段提交(经 _enrich_weighing_bill 回填台账)，
+        # 不进 saveMainEqubment 主检设备列表——对齐网页端，否则登记页会把它误判为主检设备。
         # 主检设备保存（对照 detection_entry_main:1757-1766）：表格指定了设备则提交这些设备；
         # 未指定(默认模式)则提交方法全部默认检测设备(isDefault=1)，与手动界面「查询设备」默认勾选一致
         if matched_list and experiment_id:
             items = [{"id": (eq.get("equipmentBillId") or eq.get("id")), "label": "", "raw": eq}
                      for eq in matched_list]
-            if weigh_item:
-                items.append(weigh_item)
             eq_ok, _ = self.api.save_main_equipment(experiment_id, items, log)
             log(f"主检设备{'提交成功' if eq_ok else '提交失败'}: "
                 f"{','.join(str(i['id']) for i in items)}")
@@ -4090,8 +4080,6 @@ class SequenceMaster:
                     and (eq.get("equipmentBillId") or eq.get("id"))
                     and str(eq.get("equipmentBillId") or eq.get("id")) in main_ids
                 ]
-                if weigh_item:
-                    default_items.append(weigh_item)
                 if default_items:
                     eq_ok, _ = self.api.save_main_equipment(experiment_id, default_items, log)
                     log(f"主检设备{'提交成功' if eq_ok else '提交失败'}(默认{len(default_items)}台): "
@@ -5318,6 +5306,12 @@ def _selfcheck():
     assert _match_switch_rule([{"to_id": "5502", "desc": "固体"}], "", [], "") == ""
     # 大小写不敏感
     assert _match_switch_rule([{"to_id": "9", "desc": "Solid"}], "", [], "SOLID sample") == "9"
+    # desc 逗号=OR(任一)，分号=AND(均需命中)；中英文标点等价
+    assert _match_switch_rule([{"to_id": "1", "desc": "纸,木头"}], "", [], "木头样品") == "1"   # OR 命中其一
+    assert _match_switch_rule([{"to_id": "1", "desc": "纸,木头"}], "", [], "塑料") == ""        # OR 都不中
+    assert _match_switch_rule([{"to_id": "2", "desc": "纸;涂层"}], "", [], "纸基涂层") == "2"   # AND 都中
+    assert _match_switch_rule([{"to_id": "2", "desc": "纸;涂层"}], "", [], "纸") == ""          # AND 缺一
+    assert _match_switch_rule([{"to_id": "3", "desc": "纸，布；涂层"}], "", [], "布涂层") == "3" # (纸OR布)AND涂层，全角标点
 
     # _override_equipment 多设备：固定设备 + 替换可变设备；不依赖 self（用裸实例避免建 Tk）
     _eq_inst = object.__new__(SequenceMaster)

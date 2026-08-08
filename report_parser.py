@@ -241,7 +241,7 @@ class ChemicalReportAnalyzer:
         """更新标记物列表"""
         marker_text = self.marker_entry.get().strip()
         if marker_text:
-            self.markers = {marker.strip() for marker in marker_text.split(",")}
+            self.markers = {marker.strip() for marker in marker_text.replace("，", ",").split(",")}
             self.status_var.set(f"已设置 {len(self.markers)} 个标记物")
         else:
             self.markers.clear()

@@ -2518,6 +2518,7 @@ class QueryAppFixed:
 
             # 重置修改标记
             self.modified = False
+            self.update_window_title()  # 重置后刷新标题(填充控件时 trace 触发 mark_modified 会先显示*)
 
             # 保存最后打开的配置文件路径
             self.save_last_config_path()
@@ -2900,9 +2901,9 @@ class OtherParamsTab:
                 if column_name == "触发条件":
                     rule["trigger"] = new_value
                 elif column_name == "参数设置":
-                    # 解析「名=值; 名=值」回 params 列表
+                    # 解析「名=值; 名=值」回 params 列表（分号中英文皆可）
                     params = []
-                    for part in new_value.split(";"):
+                    for part in new_value.replace("；", ";").split(";"):
                         part = part.strip()
                         if not part:
                             continue
