@@ -303,14 +303,15 @@ def _find_result_column(dynamic_columns, pdf_headers=()):
     return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
 
 
-def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
-    """在谱图目录中挑该样品的报告 PDF，返回 (normal_pdf, diluted_pdf)：
-    文件名以 sample_code 开头(大小写不敏感)的 .pdf，按是否含 -NNX 稀释后缀分为正常/稀释；
-    各自按方法/项目类别关键词挑(1个直取/仍歧义取首个)。对应无则该位为 None。"""
+def _match_sample_report_pdfs(spectrum_path, sample_code, method_hint=""):
+    """在谱图目录中匹配该样品的报告 PDF，返回 (normal_pdfs, dil_pdfs)：按是否含 -NNX 稀释后缀
+    分为正常/稀释；各自按方法/项目类别关键词过滤后按文件名序保留全部——同类多份即 A/B 平行
+    (GCMS 每平行一份 PDF)，由调用方逐份解析按平行槽回填。ICP-MS 按报告内 Sample Name 认领时
+    normal 为单元素。对应无则空列表。"""
     from report_parser import _dilution_factor, extract_content_sample_ids, extract_icp_ms_sample_name
     sc = (sample_code or '').lower()
     if not sc or not spectrum_path or not os.path.isdir(spectrum_path):
-        return None, None
+        return [], []
     # ICP-MS：按报告内 Sample Name 认领(优先于文件名——文件名可能与报告样品号不一致)
     try:
         _all_pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
@@ -320,12 +321,12 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
     for p in _all_pdfs:
         _sn = extract_icp_ms_sample_name(p)
         if _sn and (_sn == sample_code or sample_code.startswith(_sn) or _sn.startswith(sample_code)):
-            return p, None  # ICP-MS 单样品、无稀释 PDF 概念
+            return [p], []  # ICP-MS 单样品、无稀释 PDF 概念
     try:
         pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
                 if fn.lower().endswith('.pdf') and fn.lower().startswith(sc)]
     except Exception:
-        return None, None
+        return [], []
     if not pdfs:  # 兜底：文件名无小号(ICP 等只用 8 位流水)时按去小号前缀匹配
         stripped = _strip_parallel_suffix(sample_code).lower()
         if stripped and stripped != sc:
@@ -336,20 +337,19 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
                 pdfs = []
     if not pdfs:  # 文件名前缀全 miss -> 按 PDF 内容 `样品 :` 字段关联(支持 文件名≠内容id 的 PAHS 报告)
         sc_stripped = _strip_parallel_suffix(sample_code).strip()
-        try:
-            _all = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
-                    if fn.lower().endswith('.pdf')]
-        except Exception:
-            _all = []
-        for p in _all:
+        for p in _all_pdfs:
             for cid in extract_content_sample_ids(p):
                 if cid == sample_code or cid.startswith(sc_stripped) or sc_stripped.startswith(cid):
                     pdfs.append(p)
                     break
     if not pdfs:
-        return None, None
+        return [], []
+    pdfs = sorted(set(pdfs))   # 文件名序：A 平行在 B 前(同基编号仅平行字母不同)
     normal_pdfs = [p for p in pdfs if _dilution_factor(p) == 1.0]
     dil_pdfs = [p for p in pdfs if _dilution_factor(p) != 1.0]
+    if not normal_pdfs:   # 全部带 -NNX(GCMS 平行稀释: TN...KA-10X/TN...KB-10X)：报告即稀释源，无独立稀释 PDF，
+        normal_pdfs = pdfs   # 各段按报告「名称」字段的 -NNX 自带稀释倍数；清空 dil 避免误把首份当稀释源
+        dil_pdfs = []
     text = (method_hint or '').upper()
     hint = ''
     for cat, keys in _REPORT_CATEGORY_HINTS:
@@ -357,18 +357,21 @@ def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
             hint = cat
             break
 
-    def _pick(cands):
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0]
-        if hint:
+    def _by_hint(cands):
+        if hint and len(cands) > 1:
             matched = [p for p in cands if hint.lower() in os.path.basename(p).lower()]
             if matched:
-                return matched[0]
-        return cands[0]
+                return matched
+        return cands
 
-    return _pick(normal_pdfs or pdfs), _pick(dil_pdfs)
+    return _by_hint(normal_pdfs), _by_hint(dil_pdfs)
+
+
+def _pick_sample_report_pdf(spectrum_path, sample_code, method_hint=""):
+    """在谱图目录中挑该样品的报告 PDF，返回 (normal_pdf, diluted_pdf)：取 _match_sample_report_pdfs
+    的首个正常/稀释 PDF(单份用法，如称样量 PDF 路径)。对应无则该位为 None。"""
+    normal_pdfs, dil_pdfs = _match_sample_report_pdfs(spectrum_path, sample_code, method_hint)
+    return (normal_pdfs[0] if normal_pdfs else None), (dil_pdfs[0] if dil_pdfs else None)
 
 
 def _gen_random_mass(wp):
@@ -609,6 +612,14 @@ def _kw_match(keywords, target):
     return True
 
 
+_EQUIP_SEP_RE = re.compile(r"[;,，；]")
+
+
+def _split_device_codes(field):
+    """设备编号按 ; ; ， ， 任一分隔拆成多台(去空白/空串，保序)。条件/指定设备多台编号通用。"""
+    return [c.strip() for c in _EQUIP_SEP_RE.split(field or "") if c.strip()]
+
+
 def _match_switch_rule(switch_rules, project_name, pdf_paths, desc=""):
     """统一规则匹配（纯函数，可单测）。
     规则各非空条件均需满足(AND): project_name 精确/wildcard匹配(空=任意项目)、
@@ -781,6 +792,8 @@ def _merge_parallel_groups(wmap, non_parallel_suffixes=()):
         for c in par_codes:
             masses.extend((wmap[c] or {}).get("masses") or [])
         entry = {"masses": masses, "time": g["time"], "desc": g["desc"]}
+        if any((wmap[c] or {}).get("force_parse") for c in par_codes):
+            entry["force_parse"] = True  # E列「解析」标记随平行合并保留(任一平行行标即生效)
         if g["marker"]:
             entry["marker_masses"] = {}
             for mk, codes in g["marker"].items():
@@ -2670,7 +2683,7 @@ class SequenceMaster:
         检测设备→主检设备(可多台)；称样设备→称样设备(单台，取首个)。
         返回 (equipment_config, matched_list, error_msg)。表格空则用方法默认(matched_list=None)。
         matched_list 为匹配到的【检测设备】条目，供 save_main_equipment 构造 items。"""
-        codes = [c.strip() for c in (device_field or "").replace("；", ";").split(";") if c.strip()]
+        codes = _split_device_codes(device_field)
         if not codes or not equipment_config:
             return equipment_config, None, None
         raw = equipment_config.get("raw_data") or []
@@ -2705,15 +2718,26 @@ class SequenceMaster:
             elif id(eq) not in {id(m) for m in matched}:  # 检测设备去重
                 matched.append(eq)
         # 主检设备(检测设备)：连接方式对齐 process_equipment_list(名称 "; "、id ",")
+        # 每条按"编号,名称,有效期"构造：mainEquipmentNames 非空则用它，否则由 no/name/checkOutDate 补全——
+        # 条件/指定设备常无 mainEquipmentNames(非默认设备)，不补全则 build 按 ',' 解析会丢有效期/编号(信息不全)
         displays, names, ids = [], [], []
         for eq in matched:
             men = (eq.get("mainEquipmentNames") or "").strip()
             name = (eq.get("name") or "").strip()
+            if men:
+                display = men
+            else:
+                _eno = (eq.get("no") or eq.get("code") or eq.get("equipmentCode")
+                        or eq.get("equipmentNo") or eq.get("number") or eq.get("billCode") or "").strip()
+                _cod = eq.get("checkOutDate")
+                _edate = _cod[:10] if isinstance(_cod, str) else (str(_cod)[:10] if _cod else "")
+                display = f"{_eno},{name},{_edate}" if _eno else name
             eid = eq.get("equipmentBillId") or eq.get("id")
-            displays.append(men or name)
-            names.append(men or name)
-            if eid:
-                ids.append(str(eid))
+            if not eid:
+                continue   # 无 id 不能提交，跳过以保持 ids 与名称序列对齐(否则 build 按 index 错配 name↔id)
+            displays.append(display)
+            names.append(display)
+            ids.append(str(eid))
         cfg = dict(equipment_config)
         cfg["mainEquipment"] = "; ".join(displays)
         cfg["mainEquipmentNames"] = "; ".join(names)
@@ -2795,7 +2819,7 @@ class SequenceMaster:
             self._log("设备查询：未登录或会话失效，回退手动输入")
         current = row.get("equipment") or ""
         if items:
-            checked = {c.strip() for c in current.replace("；", ";").split(";") if c.strip()}
+            checked = set(_split_device_codes(current))
             selected = self._open_equipment_picker(row_index, items, checked)
         else:
             # 未取到方法设备列表：不再弹出手动输入框，仅记日志/状态栏提示
@@ -3613,6 +3637,7 @@ class SequenceMaster:
             "samples_total": len(samples),
             "samples_merged": len(samples) - n_skip,
             "skipped_list": list(skipped_samples),  # [(code, reason), ...] 供 _on_run_done 跨行汇总
+            "early_analysis": ctx.get("_early_analysis", []),  # [(code,分析日,受理日)] 分析时间<受理时间，供运行报告汇总
         })))
         extra = f"，跳过 {n_skip} 个样品" if n_skip else ""
         log(f"成功，{len(samples) - n_skip}/{len(samples)} 个样品参与合并，实验编号 {real_code}{extra}")
@@ -4048,6 +4073,28 @@ class SequenceMaster:
                 # 无有效称样时间：开始时间取结束时间
                 experiment_data["startTime"] = experiment_data["endTime"]
                 log(f"无称样时间，开始时间(startTime) <- 结束时间: {experiment_data['endTime']}")
+        # 服务端005校验：分析时间(startTime)不得早于受理时间。startTime 须 ≥ 批内最晚受理日，
+        # 否则把日期提到该受理日(保留称样时分)，记入运行报告。defaults_no_record 模式 startTime 已 ≥ 受理日，不触发。
+        try:
+            _start_d = date.fromisoformat(str(experiment_data.get("startTime"))[:10])
+        except ValueError:
+            _start_d = None
+        if _start_d is not None:
+            _accs = []  # [(sample_code, accept_date)]
+            for _it in batch_items:
+                _ad, _ = _accept_date_of((_it.get("project") or {}).get("_raw"))
+                if _ad:
+                    _accs.append((_it.get("sample_code"), _ad))
+            _latest = max([_d for _, _d in _accs], default=_start_d)  # 批内最晚受理日
+            if _latest > _start_d:
+                _orig = experiment_data["startTime"]
+                _time_part = str(_orig)[10:]                          # " HH:MM:SS" 保留称样时分
+                experiment_data["startTime"] = _latest.strftime("%Y-%m-%d") + _time_part
+                _violators = [(_sc, _orig, experiment_data["startTime"], _ad.isoformat())
+                              for _sc, _ad in _accs if _ad > _start_d]
+                log(f"分析时间早于受理时间，startTime 已调整: {_orig} → {experiment_data['startTime']}"
+                    f"（提到最晚受理日 {_latest}，涉及 {len(_violators)} 个样品）")
+                ctx.setdefault("_early_analysis", []).extend(_violators)
         # 注入谱图 fileIds/spectrumJsonList：每个谱图只绑定到「实际用到它的项目」(按 fileId 归并 projectId)。
         # 标记分流时(总和/苯并[a]芘用基样谱、5mm以内用M谱)，不可把整样所有谱图绑到全部 projectId，
         # 否则 5mm以内 会同时挂上基样谱与M谱。同谱图被多项目复用则 projectId 取并集。
@@ -4497,17 +4544,23 @@ class SequenceMaster:
             # ponytail: 方法未启用时，仅解析称量记录中标记了"解析"的样品
             if not method_enabled and not (wmap.get(sc) or {}).get("force_parse"):
                 continue
-            pdf, dil_pdf = _pick_sample_report_pdf(spectrum_path, sc, actual_method_name)
-            if not pdf:
+            normal_pdfs, dil_pdfs = _match_sample_report_pdfs(spectrum_path, sc, actual_method_name)
+            if not normal_pdfs:
                 log(f"报告解析: 样品 {sc} 在谱图目录未找到报告 PDF，浓度留空")
                 missing_samples.append(sc)
                 continue
-            try:
-                samples, headers = parse_pdf_report_multi(pdf)
-            except Exception as e:
-                log(f"报告解析: 样品 {sc} 解析失败({e})，浓度留空")
-                missing_samples.append(sc)
-                continue
+            dil_pdf = dil_pdfs[0] if dil_pdfs else None
+            # 平行样分离 PDF(GCMS: A/B 各一份)：按文件名序(A→B)逐份解析，合并样品段按平行槽回填
+            samples, headers = [], None
+            for _pp in normal_pdfs:
+                try:
+                    _s, _h = parse_pdf_report_multi(_pp)
+                except Exception as e:
+                    log(f"报告解析: 样品 {sc} 报告 {os.path.basename(_pp)} 解析失败({e})，跳过该份")
+                    continue
+                if _s:
+                    samples.extend(_s)
+                    headers = headers or _h
             if not samples:
                 log(f"报告解析: 样品 {sc} 未解析到化合物，浓度留空")
                 missing_samples.append(sc)
@@ -4536,7 +4589,8 @@ class SequenceMaster:
                 factor_by_sample[sc] = content_factor
             parsed_by_sample[sc] = (samples, diluted, headers)
             n_cmp = len(samples[0][1]) if samples else 0
-            log(f"报告解析: 样品 {sc} 解析到 {len(samples)} 个样品×{n_cmp} 化合物 ({os.path.basename(pdf)})"
+            _names = "、".join(os.path.basename(p) for p in normal_pdfs)
+            log(f"报告解析: 样品 {sc} 解析到 {len(samples)} 个样品×{n_cmp} 化合物 ({_names})"
                 + (f"，含稀释报告 {os.path.basename(dil_pdf)}×{factor_by_sample[sc]:g}" if dil_pdf else ""))
         if not parsed_by_sample:
             return  # 无一样品可解析：结果列保持默认
@@ -5038,6 +5092,11 @@ class SequenceMaster:
                 self._append_log(f"未录入样品（{len(skipped)} 个）：")
                 for sc, reason in skipped:
                     self._append_log(f"  - {sc}：{reason}")
+        early = [t for r in rows_ok for t in r.get("early_analysis", [])]
+        if early:
+            self._append_log(f"时间调整：{len(early)} 个样品分析时间早于受理时间，startTime 已提到受理日（服务端005校验）：")
+            for sc, orig, new, acc in early:
+                self._append_log(f"  - {sc}：{orig} → {new}（受理日 {acc}）")
         if fail:
             lines = []
             for i, r in enumerate(self.sequence_data):
@@ -5484,12 +5543,13 @@ def _selfcheck():
     # 回归：K 样品子方法切换(desc 匹配)与称样量回填不再因 key≠全码而 miss。
     _wm = _merge_parallel_groups(_ParallelWMap({
         "TN26080226K": {"desc": "草颗粒", "masses": [0.5140], "time": "2026-08-06 10:00:00"},
-        "TN26080248001A": {"desc": "草", "masses": [0.5268], "time": "2026-08-06 10:00:00"},
+        "TN26080248001A": {"desc": "草", "masses": [0.5268], "time": "2026-08-06 10:00:00", "force_parse": True},
         "TN26080248001B": {"desc": "草", "masses": [0.5016], "time": "2026-08-06 10:00:00"},
     }))
     assert "TN26080226K" in _wm and "TN26080248001" in _wm, dict(_wm)   # K 保留原键；A/B 合并为全码
     assert _wm.get("TN26080226001").get("desc") == "草颗粒", "K 后缀按 LIMS 全码查应命中"
     assert _wm.get("TN26080248001").get("masses") == [0.5268, 0.5016]   # A/B 平行合并(原有行为)
+    assert _wm.get("TN26080248001").get("force_parse") is True          # 「解析」标记随平行合并保留
     assert _wm.get("TN26080226K").get("desc") == "草颗粒"               # 原键仍可直接查
     # _accept_date_of：受理日期解析(含时分串/仅日期/空/多候选)
     assert _accept_date_of({"acceptTime": "2026-08-08 12:00:00"}) == (date(2026, 8, 8), "acceptTime")

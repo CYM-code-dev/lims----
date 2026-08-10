@@ -1624,14 +1624,25 @@ def _wrap_compounds(raw):
             for name, c in raw.items()}
 
 
+_GCMS_NAME_RE = re.compile(r'样品\s+名称\s+(\S+)')
+
+
+def _gcms_sample_name(content):
+    """GCMS 外标法等单样品报告「名称」字段值(如 TN26080282BK / 稀释样 TN26080282BK-10X)。
+    -NNX 随名称携带，由 _split_content_dilution 取稀释倍数；无该字段返回 None。"""
+    m = _GCMS_NAME_RE.search(content or '')
+    return m.group(1) if m else None
+
+
 def _split_non_icp_sections(content, analyzer, file_path):
     """按 `样品 :` 切非ICP报告 -> [(sample_id, compounds), ...]。镜像 parse_icp_report 的 `样品识别码：` 切分。
-    无该标记(PAE/氯苯/单样品) -> 回退 [('A', 全content化合物)] 保留旧行为。"""
+    无该标记(PAE/氯苯/单样品) -> 回退单样品段：样品标识取报告「名称」字段(TN26080282BK，含 -NNX 稀释)，
+    无名称字段才用 'A'。"""
     parts = _SAMPLE_MARKER_RE.split(content)[1:]
     basename = os.path.basename(file_path)
     if not parts:
         raw, _ = analyzer.parse_report_content(content, basename, file_path)
-        return [('A', _wrap_compounds(raw))]
+        return [(_gcms_sample_name(content) or 'A', _wrap_compounds(raw))]
     out = []
     for part in parts:
         m = re.match(r'(\S+)', part)

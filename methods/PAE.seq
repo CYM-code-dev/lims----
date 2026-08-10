@@ -1,9 +1,15 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/TR26070031/称量记录1.xlsx
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE固体.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/TR26070031
-  temperature: '22'
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD
+  temperature: '25'
+  humidity: '60'
+- id: 2
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD/称样记录.xlsx
+  method_file: D:/Agent/lims数据登记/methods/跑道PAE液体.mtd
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD
+  temperature: '25'
   humidity: '60'
 column_widths:
 - 50
