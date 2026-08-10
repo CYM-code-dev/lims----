@@ -492,7 +492,10 @@ def _filter_pdfs_by_rule(pdf_paths, project_name, filter_rules):
     return [p for p in paths if (kw in os.path.basename(p).lower()) != exclude]
 
 
-def _plan_submission_batches(query_rules, items):
+_MAX_BATCH_ITEMS = 500  # 单批录入条数硬上限：超限按 max_items 切片，每批独立实验编号(force_new)
+
+
+def _plan_submission_batches(query_rules, items, max_items=_MAX_BATCH_ITEMS):
     """按 query_rules 顺序规划提交批次（纯函数，可单测）。
     items: 每项为 dict，需含 switch_mid / sample_code / projectName / wdate(称样日期,可空)。
     返回 [{"switch_mid","wdate","items","force_new","_equipment"}, ...]，顺序 = 规则顺序，同规则内按 switch_mid、
@@ -500,7 +503,8 @@ def _plan_submission_batches(query_rules, items):
     同 switch_mid 内称样日期不同(跨天)拆独立批(各自实验编号)；同日/无日期仍合并。
     input_method=方法：同(switch_mid,设备,日期)的样品合并，每条规则各自的 max_select 超限切片(多片 force_new=True)；
     input_method=样品：每样品各一片。无 query_rules 退化为单条空规则(全中,方法)。
-    多个不同 method(如 XRF 多元素方法)：每条规则按项目 _qr_idx 认领各自方法，一方法一实验、不重复。"""
+    多个不同 method(如 XRF 多元素方法)：每条规则按项目 _qr_idx 认领各自方法，一方法一实验、不重复。
+    单批录入条数(len items)超 max_items 再切片(每片 force_new=True)，避免单实验编号录入过大。"""
     plan = []
     rules = query_rules or [{"project": "", "input_method": "方法"}]
     # 多个不同方法(如 XRF 多元素方法)→ 每条规则按 _qr_idx 认领各自方法的项目；否则按 project 拆分
@@ -555,14 +559,19 @@ def _plan_submission_batches(query_rules, items):
                     for d, d_items, slices in sub_batches:
                         for sb in slices:
                             sb_set = set(sb)
-                            plan.append({
-                                "switch_mid": mid,
-                                "_equipment": eq_key,
-                                "_lab_proc": lp_key,
-                                "wdate": d,
-                                "items": [it for it in d_items if it.get("sample_code", "") in sb_set],
-                                "force_new": force_new,
-                            })
+                            batch = [it for it in d_items if it.get("sample_code", "") in sb_set]
+                            # 单批录入条数硬上限：超 max_items 再切片，每片独立实验编号
+                            chunks = ([batch[i:i + max_items] for i in range(0, len(batch), max_items)]
+                                      if len(batch) > max_items else [batch])
+                            for ch in chunks:
+                                plan.append({
+                                    "switch_mid": mid,
+                                    "_equipment": eq_key,
+                                    "_lab_proc": lp_key,
+                                    "wdate": d,
+                                    "items": ch,
+                                    "force_new": force_new or len(chunks) > 1,
+                                })
     return plan
 
 
@@ -5268,6 +5277,16 @@ def _selfcheck():
     p3 = _plan_submission_batches(rules_max, items)
     assert [b["force_new"] for b in p3 if b["switch_mid"] == "4678"] == [True, True], p3
     assert [b["force_new"] for b in p3 if b["switch_mid"] == "4679"] == [False], p3
+
+    # 单批录入条数硬上限(max_items)：1样品5项目→原 force_new=False，切片[2,2,1]各出新编号
+    _one = [{"sample_code": "S1", "projectName": f"P{i}", "switch_mid": "4678",
+             "project": {"projectId": f"S1-P{i}", "projectName": f"P{i}"}} for i in range(5)]
+    p4 = _plan_submission_batches([{"project": "", "input_method": "方法"}], _one, max_items=2)
+    assert [len(b["items"]) for b in p4] == [2, 2, 1], [len(b["items"]) for b in p4]
+    assert all(b["force_new"] for b in p4), p4
+    assert sum(len(b["items"]) for b in p4) == 5, p4
+    _p4b = _plan_submission_batches([{"project": "", "input_method": "方法"}], _one, max_items=10)
+    assert len(_p4b) == 1 and not _p4b[0]["force_new"] and len(_p4b[0]["items"]) == 5, _p4b
 
     # 称样日期拆批(方法模式)：同 switch_mid 跨日 → 拆 2 批 force_new=True；同日仍合 1 批
     di = [item("S1", "苯", "4678"), item("S2", "苯", "4678")]
