@@ -69,6 +69,26 @@ def _prev_workday():
     return cur
 
 
+_ACCEPT_DATE_KEYS = ("acceptTime", "acceptDate", "checkInTime", "checkInDate",
+                     "receiveTime", "receiveDate", "sampleAcceptDate", "registerDate")
+
+
+def _accept_date_of(raw):
+    """从 LIMS 原始 sample_data(_raw) 提取受理日期(date)。返回 (date, 命中字段名) 或 (None, "")。
+    服务端005校验按日期比较(前端 startTime='受理日 00:00:00' 即通过)。解析 'YYYY-MM-DD...' 取前10位。"""
+    if not isinstance(raw, dict):
+        return None, ""
+    for k in _ACCEPT_DATE_KEYS:
+        v = raw.get(k)
+        if not v:
+            continue
+        try:
+            return date.fromisoformat(str(v).strip()[:10]), k
+        except ValueError:
+            continue
+    return None, ""
+
+
 class DraggableHeader:
     """可拖动的表头分隔线"""
 
@@ -4009,9 +4029,21 @@ class SequenceMaster:
                 log(f"警告: 称样时间格式无法解析({analysis_start!r})")
         if not _start_set:
             if ctx.get("defaults_no_record"):
-                # 无称样记录默认模式：开始时间取上一工作日(考虑法定假日/调休)
-                experiment_data["startTime"] = _prev_workday().strftime("%Y-%m-%d") + " 00:00:00"
-                log(f"无称样时间(默认模式)，开始时间(startTime) <- 上一工作日: {experiment_data['startTime']}")
+                # 无称样记录默认模式：startTime = max(上一工作日, 批内最晚受理日期) + 00:00:00
+                # 服务端005校验"分析时间不能早于受理时间"(按日期比较，与前端一致：受理日 00:00:00)
+                _prev = _prev_workday()
+                _latest, _hit_k = _prev, ""
+                for _it in batch_items:
+                    _d, _k = _accept_date_of((_it.get("project") or {}).get("_raw"))
+                    if _d and _d > _latest:
+                        _latest, _hit_k = _d, _k
+                experiment_data["startTime"] = _latest.strftime("%Y-%m-%d") + " 00:00:00"
+                _src = f"受理日(字段{_hit_k})" if _hit_k else "上一工作日(未取到受理时间)"
+                log(f"无称样时间(默认模式)，开始时间(startTime) <- max(上一工作日,批内最晚受理日): "
+                    f"{experiment_data['startTime']} 〔{_src}〕")
+                if not _hit_k and batch_items:  # 未命中受理时间字段→dump raw keys 以便精准修正
+                    _ks = list((batch_items[0].get("project") or {}).get("_raw") or {})
+                    log(f"警告: 未取到受理时间字段，raw keys={_ks}")
             else:
                 # 无有效称样时间：开始时间取结束时间
                 experiment_data["startTime"] = experiment_data["endTime"]
@@ -4753,7 +4785,6 @@ class SequenceMaster:
                                     for n, a, e in _retest_skipped)
                 return [], (f"{len(_retest_skipped)} 个项目因复测维度(cancel_test)不符被跳过：{_detail}。"
                             "请在方法编辑器调整该规则的 Retest 设置，或检查样品复测记录。")
-            hit_methods = ', '.join(sorted({ts for _i, ts, _ in rule_stds}))
             # 标准号命中却仍被剔除：细分是 子方法ID 还是 项目名 不匹配，避免误报"方法不在样品中"
             _std_hit = [p for p in projects
                         if any(_std_loose_match((p.get("standardNo") or ""), ts) for _i, ts, _ in rule_stds)]
@@ -4765,7 +4796,7 @@ class SequenceMaster:
                 _sub_part = f"子方法ID不符(规则={_sub_ids}，项目decideProjectMethodId={_dpids})" if _sub_ids else ""
                 _pn_part = f"项目名不符(规则={project_vals}，项目名={_pnames})"
                 _detail = f" 其中 {len(_std_hit)} 个项目标准号已命中，但 {_sub_part + '；' if _sub_part else ''}{_pn_part}。"
-            return None, (f"方法文件指定的方法（{hit_methods}）不在此样品项目中。"
+            return None, (f"方法文件指定的方法不在此样品项目中。"
                           f"样品实际方法: {', '.join(stdnos)}。{_detail}请检查录入方法文件。")
 
         # 方法文件未指定方法：仅当样品只含单一方法时才可用全部(再按 project 过滤)
@@ -5460,6 +5491,10 @@ def _selfcheck():
     assert _wm.get("TN26080226001").get("desc") == "草颗粒", "K 后缀按 LIMS 全码查应命中"
     assert _wm.get("TN26080248001").get("masses") == [0.5268, 0.5016]   # A/B 平行合并(原有行为)
     assert _wm.get("TN26080226K").get("desc") == "草颗粒"               # 原键仍可直接查
+    # _accept_date_of：受理日期解析(含时分串/仅日期/空/多候选)
+    assert _accept_date_of({"acceptTime": "2026-08-08 12:00:00"}) == (date(2026, 8, 8), "acceptTime")
+    assert _accept_date_of({"acceptDate": "2026-08-09"}) == (date(2026, 8, 9), "acceptDate")
+    assert _accept_date_of({})[0] is None
     print("selfcheck OK")
 
 

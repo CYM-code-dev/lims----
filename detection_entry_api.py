@@ -672,7 +672,8 @@ class DetectionAPI:
                     return False, None
             else:
                 if log_func:
-                    log_func(f"提交实验数据失败: HTTP {response.status_code}, 项目: {project_name}")
+                    _body = (response.text or "")[:500]
+                    log_func(f"提交实验数据失败: HTTP {response.status_code}, 响应: {_body}, 项目: {project_name}")
                 return False, None
 
         except Exception as e:
@@ -1435,7 +1436,8 @@ class DetectionAPI:
                                 'sampleSmallNo': small_no,
                                 'isRetest': is_retest,
                                 'oldSampleProjectId': old_sample_project_id,
-                                'checkInStatus': sample_data.get('checkInStatus', '')
+                                'checkInStatus': sample_data.get('checkInStatus', ''),
+                                '_raw': sample_data  # 透传原始(含受理时间等未解析字段)，供 startTime ≥ 受理时间 校验用
                             }
                             all_projects.append(project_data)
 
