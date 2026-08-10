@@ -1091,7 +1091,10 @@ def _match_processing_rule(processing_rules, std_no):
 def _apply_processing(raw, rule, wp):
     """按处理规则把原始称样量(float)转为提交字符串。
     type ∈ 直接读取/小数位补充/换算处理/换算加补充；
-    换算两类型相同(=raw×factor 四舍五入到 rule.decimal_places)，小数位补充用 wp.decimal_places。"""
+    换算处理=raw×factor 修约到 rule.decimal_places；
+    换算加补充=base=round(raw×factor,decimal_places) 后末尾补2位随机[01,49]
+      (pad<50 不进位，修约回 decimal_places 位仍=base)，总小数位=decimal_places+2；
+    小数位补充用 wp.decimal_places。"""
     rtype = (rule or {}).get("type") or "直接读取"
     if rtype in ("换算处理", "换算加补充"):
         try:
@@ -1102,6 +1105,10 @@ def _apply_processing(raw, rule, wp):
             n = int((rule or {}).get("decimal_places") or 2)
         except (TypeError, ValueError):
             n = 2
+        if rtype == "换算加补充":
+            base = round(float(raw) * factor, n)
+            pad = random.randint(1, 49)  # ponytail: 01-49(<50不进位) 保证修约回 n 位=base
+            return f"{base:.{n}f}{pad:02d}"
         return f"{float(raw) * factor:.{n}f}"
     if rtype == "小数位补充":
         try:
@@ -1303,6 +1310,7 @@ class UniversalCell:
         "fresh": ("现配现用", False),
         "fixed": ("配制序号", False),
         "none":  ("无需标液", True),
+        "conditional": ("条件匹配", True),
         "":      ("配制序号", False),
     }
     # 仪器设置 → (placeholder, readonly)
@@ -2524,11 +2532,14 @@ class SequenceMaster:
         except Exception:
             return []
 
-    def _apply_standard_config(self, row, st, prep):
+    def _apply_standard_config(self, row, st, prep, standard_rules=None):
         """标液配置应用到行"""
         row["standard_type"] = st
         if st == "fixed" and prep:
             row["configure_order"] = prep      # 带出固定编号，可覆盖
+        elif st == "conditional":
+            row["configure_order"] = ""        # 条件匹配时清空（运行时按样品匹配）
+            row["_standard_rules"] = standard_rules  # 保存规则供 _submit_batch 使用
         elif st == "none":
             row["configure_order"] = ""        # 无需标液，清空
         # fresh / 未知：保留用户已填或空
@@ -2548,7 +2559,8 @@ class SequenceMaster:
     def _apply_method_params(self, row, method_file):
         """选方法 / 编辑器保存后：一次读取并回填标液+设备+称样量模式配置（共用）"""
         ops = self._read_other_params(method_file)
-        self._apply_standard_config(row, ops.get("standard_type", ""), ops.get("preparation_number", ""))
+        self._apply_standard_config(row, ops.get("standard_type", ""), ops.get("preparation_number", ""),
+                                    ops.get("standard_rules"))
         self._apply_equipment_config(row, ops.get("instrument_setting", ""),
                                      ops.get("device_number", ""), ops.get("equipment_rules"))
         wp = self._read_weighing_params(method_file)
@@ -3437,6 +3449,8 @@ class SequenceMaster:
         ctx = {
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
             "fixed_params": _ops.get("fixed_params") or [], "method_file": row.get("method_file") or "",
+            "standard_type": (row.get("standard_type") or "").strip(),
+            "standard_rules": (row.get("_standard_rules") or _ops.get("standard_rules") or []),
             "defaults_no_record": defaults_no_record,
             "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
             "dilution_remark_enabled": bool(_ops.get("dilution_remark_enabled")),
@@ -3609,6 +3623,14 @@ class SequenceMaster:
                 it["_lab_proc"] = lp
                 if lp:
                     log(f"[{it['sample_code']}] 命中实验过程规则 → {lp}（项目:{pname}）")
+            # 条件标液匹配：按 standard_rules 为每个样品匹配配制序号（用于按批提交）
+            if ctx.get("standard_type") == "conditional" and ctx.get("standard_rules"):
+                sm = _match_conditional_rule(ctx["standard_rules"], pname, it.get("pdf_paths") or [], desc)
+                it["_standard"] = str((sm or {}).get("preparation_number") or "").strip()
+                if it["_standard"]:
+                    log(f"[{it['sample_code']}] 命中标液规则 → {it['_standard']}（项目:{pname}）")
+                else:
+                    log(f"[{it['sample_code']}] 未命中标液规则（项目:{pname}）")
 
         rules = self._read_query_rules(method_file)
         plan = _plan_submission_batches(rules, all_items)
@@ -3789,6 +3811,25 @@ class SequenceMaster:
             log(f"失败: {eq_err}")
             return False, ""
         equipment_config = self._enrich_weighing_bill(equipment_config, sp_ids_str, log)
+        # 标液：条件标液模式按批内 item 的 _standard 解析（同批同标液）；其余模式用行级 configure_order
+        _co = ctx.get("configure_order") or ""
+        if ctx.get("standard_type") == "conditional":
+            _stds = [str(it.get("_standard") or "").strip() for it in batch_items
+                     if str(it.get("_standard") or "").strip()]
+            _co = _stds[0] if _stds else ""
+            if _co:
+                log(f"本批条件标液: {_co}")
+                # 条件标液行级预检未覆盖(行级 configure_order 为空)，此处逐个校验
+                _stime = next(((_e or {}).get("time") for _e in (ctx.get("wmap") or {}).values()
+                               if (_e or {}).get("time")), None) or _prev_workday()
+                for _c in [x.strip() for x in _co.replace("，", ",").split(",") if x.strip()]:
+                    cid, emsg = self.api.get_solution_configure_id(_c, log, _stime)
+                    if not cid:
+                        self._ui_q.put(("status", (idx, "失败", f"标准溶液:{emsg}")))
+                        log(f"失败: 标准溶液校验未过 - {emsg}")
+                        return False, ""
+            else:
+                log("警告: 条件标液模式但本批未匹配到标液编号，跳过标液关联")
         dynamic_columns = all_cfg.get("dynamic_columns") or []
         actual_method_name = all_cfg.get("actual_method_name", actual_method_name)
         actual_method_id = all_cfg.get("actual_method_id", actual_method_id)
@@ -3805,7 +3846,7 @@ class SequenceMaster:
         values = {col.get("columeCode", ""): str(col.get("defaultVal") or "") for col in dynamic_columns}
         host = self._build_headless_host(
             values, experiment_config, equipment_config, dynamic_columns,
-            actual_method_name, actual_method_id, ctx["configure_order"], ctx["fixed_params"],
+            actual_method_name, actual_method_id, _co, ctx["fixed_params"],
             dilution_remark_enabled=ctx.get("dilution_remark_enabled", False),
             dilution_volume_column=ctx.get("dilution_volume_column", ""))
 
@@ -3859,6 +3900,9 @@ class SequenceMaster:
                 records = (experiment_config or {}).get("ocAnalysisRecordList") or []
                 _, n_par = _parallel_indices(records)
                 pmasses_by_sample, desc_by_sample = {}, {}
+                # random 模式：记录有值且匹配 processing_rule(换算加补充)时按规则换算(液体×4补随机位)
+                _prules = self._read_processing_rules(ctx["method_file"])
+                _prule = _match_processing_rule(_prules, actual_method_name)
                 for it in batch_items:
                     sc = it["sample_code"]
                     if sc in pmasses_by_sample:
@@ -3872,11 +3916,14 @@ class SequenceMaster:
                         samp = (ctx["wmap"] or {}).get(sc) or {}
                         recorded = samp.get("masses") or []
                         if recorded and len(recorded) >= n_par:
-                            try:
-                                _mdp = int((wp or {}).get("decimal_places") or 4)
-                            except (TypeError, ValueError):
-                                _mdp = 4
-                            pmasses_by_sample[sc] = [f"{float(recorded[i]):.{_mdp}f}" for i in range(n_par)]
+                            if _prule:
+                                pmasses_by_sample[sc] = [_apply_processing(recorded[i], _prule, wp) for i in range(n_par)]
+                            else:
+                                try:
+                                    _mdp = int((wp or {}).get("decimal_places") or 4)
+                                except (TypeError, ValueError):
+                                    _mdp = 4
+                                pmasses_by_sample[sc] = [f"{float(recorded[i]):.{_mdp}f}" for i in range(n_par)]
                         else:
                             pmasses_by_sample[sc] = [_gen_random_mass(wp) for _ in range(n_par)]
                         desc_by_sample[sc] = samp.get("desc") or ""
@@ -4154,10 +4201,10 @@ class SequenceMaster:
             log(f"[设备] 主检设备随实验载荷提交: ids={_we.get('mainEquipmentIds')}")
 
         # 标液关联——用真实编号（对照 detection_entry_main:1768-1776）
-        if ctx["configure_order"]:
+        if _co:
             experiment_codes = {pid: real_code for pid in project_ids}
             sok, serr = self.api.submit_solution_with_experiment(
-                project_ids, ctx["configure_order"], experiment_codes, log)
+                project_ids, _co, experiment_codes, log)
             if not sok:
                 self._ui_q.put(("status", (idx, "失败", f"标准溶液关联:{serr}")))
                 log(f"失败: 标准溶液关联失败 - {serr}")
@@ -5480,6 +5527,15 @@ def _selfcheck():
     # 称样量按 decimal_places 格式化，保留末尾0(0.552→0.5520)
     assert _apply_processing(0.552, {"type": "小数位补充"}, {"decimal_places": 4}) == "0.5520"
     assert f"{0.552:.4f}" == "0.5520"
+    # 换算加补充：base=round(raw×factor,dp) 后末尾补2位随机[01,49]，修约回 dp 位仍=base，末两位非00
+    _r = _apply_processing(0.52, {"type": "换算加补充", "factor": 4, "decimal_places": 2}, {})
+    assert _r.startswith("2.08") and _r[-2:] != "00" and round(float(_r), 2) == 2.08, _r
+    assert len(_r.split(".")[1]) == 4  # 总小数位 = dp(2) + 补2位
+    for _ in range(200):  # pad 始终落在 01-49，修约回2位恒=2.08
+        _rr = _apply_processing(0.52, {"type": "换算加补充", "factor": 4, "decimal_places": 2}, {})
+        assert 1 <= int(_rr[-2:]) <= 49 and round(float(_rr), 2) == 2.08, _rr
+    # 换算处理 不受影响(仍 raw×factor 修约)
+    assert _apply_processing(0.52, {"type": "换算处理", "factor": 4, "decimal_places": 2}, {}) == "2.08"
 
     # _exclusion_match：排除规则双维度(project 精确/通配 + method 标准号宽松匹配)，非空条件 AND
     _p = lambda pn, std: {"projectName": pn, "standardNo": std}

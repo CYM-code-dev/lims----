@@ -2536,6 +2536,7 @@ class OtherParamsTab:
         self.instrument_setting = "default"  # 默认仪器设置：使用立方默认设备
         self.device_number = ""  # 设备编号
         self.equipment_rules = []  # 条件设备匹配规则: [{filename, desc, project_name, device_number}, ...]
+        self.standard_rules = []  # 条件标液匹配规则: [{filename, desc, project_name, preparation_number}, ...]
         self.fixed_params = []  # 固定参数规则：[{trigger, param_name, param_value}]
         self.lab_proc_rules = []  # 条件实验过程规则: [{filename, desc, project_name, lab_proc}]，命中用 lab_proc 覆盖 experimentProcess
         # 不在 __init__ 建标签页：由 app 调 create_standard_tab / create_submit_tab 分两步建，
@@ -2629,6 +2630,14 @@ class OtherParamsTab:
             text="无需标液",
             variable=self.standard_type_var,
             value="none",
+            command=self.on_standard_type_change, bootstyle="primary").pack(side='left', padx=(0, 20))
+
+        # 条件标液单选按钮（类似条件设备，按文件名/项目名/试样描述匹配不同配制序号）
+        ttkb.Radiobutton(
+            type_frame,
+            text="条件标液",
+            variable=self.standard_type_var,
+            value="conditional",
             command=self.on_standard_type_change, bootstyle="primary").pack(side='left')
 
         # 配制序号输入区域（始终显示，但状态根据选择变化）
@@ -2652,6 +2661,49 @@ class OtherParamsTab:
 
         # 绑定配制序号变化事件
         self.preparation_number_var.trace('w', self.on_preparation_number_change)
+
+        # 条件标液规则表格（仅 standard_type=conditional 时显示）
+        self.standard_rules_frame = ttk.Frame(standard_frame)
+        # 输入行
+        sr_input = ttk.Frame(self.standard_rules_frame)
+        sr_input.pack(fill='x', pady=2)
+        ttk.Label(sr_input, text="文件名:").pack(side='left', padx=(0, 3))
+        self.sr_filename_var = tk.StringVar()
+        ttk.Entry(sr_input, textvariable=self.sr_filename_var, width=8).pack(side='left', padx=(0, 6))
+        ttk.Label(sr_input, text="项目名:").pack(side='left', padx=(0, 3))
+        self.sr_project_var = tk.StringVar()
+        ttk.Entry(sr_input, textvariable=self.sr_project_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(sr_input, text="试样描述:").pack(side='left', padx=(0, 3))
+        self.sr_desc_var = tk.StringVar()
+        ttk.Entry(sr_input, textvariable=self.sr_desc_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(sr_input, text="配制序号:").pack(side='left', padx=(0, 3))
+        self.sr_prep_var = tk.StringVar()
+        ttk.Entry(sr_input, textvariable=self.sr_prep_var, width=16).pack(side='left', padx=(0, 6))
+        ttkb.Button(sr_input, text="添加", command=self.add_standard_rule, bootstyle="secondary").pack(side='left')
+        # 表格
+        sr_list = ttk.Frame(self.standard_rules_frame)
+        sr_list.pack(fill='both', expand=True, pady=3)
+        scols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "配制序号")
+        self.sr_tree = ttk.Treeview(sr_list, columns=scols, show="headings", height=3)
+        for c in scols:
+            self.sr_tree.heading(c, text=c, anchor='w')
+        self.sr_tree.column("序号", width=8, anchor='w')
+        self.sr_tree.column("文件名关键词", width=70, anchor='w')
+        self.sr_tree.column("项目名关键词", width=80, anchor='w')
+        self.sr_tree.column("试样描述关键词", width=80, anchor='w')
+        self.sr_tree.column("配制序号", width=520, anchor='w')
+        self.sr_tree.pack(side='left', fill='both', expand=True)
+        sr_scroll = ttk.Scrollbar(sr_list, orient="vertical", command=self.sr_tree.yview)
+        sr_scroll.pack(side='right', fill='y')
+        self.sr_tree.configure(yscrollcommand=sr_scroll.set)
+        _setup_cell_tooltip(self.sr_tree, ("配制序号",))
+        self.sr_tree.bind("<Double-1>", self.on_standard_rule_double_click)
+        # 操作按钮
+        sr_btn = ttk.Frame(self.standard_rules_frame)
+        sr_btn.pack(fill='x', pady=2)
+        ttkb.Button(sr_btn, text="删除选中", command=self.delete_standard_rule, bootstyle="danger").pack(side='left', padx=2)
+        ttkb.Button(sr_btn, text="上移", command=lambda: self.move_standard_rule(-1), bootstyle="secondary").pack(side='left', padx=2)
+        ttkb.Button(sr_btn, text="下移", command=lambda: self.move_standard_rule(1), bootstyle="secondary").pack(side='left', padx=2)
 
         # 初始状态设置
         self.on_standard_type_change()
@@ -2962,8 +3014,13 @@ class OtherParamsTab:
             # 固定标液：启用配制序号输入框
             self.preparation_entry.config(state="normal")
         else:
-            # 现配现用或无需标液：禁用配制序号输入框
+            # 现配现用/无需标液/条件标液：禁用配制序号输入框
             self.preparation_entry.config(state="disabled")
+
+        # 条件标液：显示规则表格；其余隐藏
+        self.standard_rules_frame.pack_forget()
+        if standard_type == "conditional":
+            self.standard_rules_frame.pack(fill='both', expand=True, pady=5)
 
         # 标记已修改
         self.app.mark_modified()
@@ -3022,6 +3079,7 @@ class OtherParamsTab:
         return {
             "standard_type": self.standard_type_var.get(),
             "preparation_number": self.preparation_number_var.get().strip(),
+            "standard_rules": self.standard_rules,
             "instrument_setting": self.instrument_setting_var.get(),
             "device_number": self.device_number_var.get().strip(),
             "equipment_rules": self.equipment_rules,
@@ -3062,6 +3120,11 @@ class OtherParamsTab:
         if "equipment_rules" in settings:
             self.equipment_rules = list(settings["equipment_rules"])
             self.refresh_equipment_rules_tree()
+
+        # 设置条件标液规则
+        if "standard_rules" in settings:
+            self.standard_rules = list(settings["standard_rules"])
+            self.refresh_standard_rules_tree()
 
         # 设置固定参数（兼容旧扁平格式：按 trigger 合并为一行）
         fp_data = settings.get("fixed_params", [])
@@ -3189,6 +3252,114 @@ class OtherParamsTab:
             idx = int(item) - 1
             if 0 <= idx < len(self.equipment_rules):
                 self.equipment_rules[idx][col_key] = new_value
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
+
+    # ---------- 条件标液规则 CRUD ----------
+
+    def add_standard_rule(self):
+        """添加一条条件标液规则"""
+        fn = self.sr_filename_var.get().strip()
+        proj = self.sr_project_var.get().strip()
+        desc = self.sr_desc_var.get().strip()
+        prep = self.sr_prep_var.get().strip()
+        if not prep:
+            messagebox.showwarning("输入错误", "请填写配制序号")
+            return
+        self.standard_rules.append({
+            "filename": fn,
+            "project_name": proj,
+            "desc": desc,
+            "preparation_number": prep
+        })
+        self.refresh_standard_rules_tree()
+        # 清空输入
+        self.sr_filename_var.set("")
+        self.sr_project_var.set("")
+        self.sr_desc_var.set("")
+        self.sr_prep_var.set("")
+        self.app.mark_modified()
+
+    def delete_standard_rule(self):
+        """删除选中的条件标液规则"""
+        sel = self.sr_tree.selection()
+        if not sel:
+            messagebox.showwarning("选择错误", "请先选择要删除的规则")
+            return
+        idx = int(sel[0]) - 1
+        if 0 <= idx < len(self.standard_rules):
+            del self.standard_rules[idx]
+            self.refresh_standard_rules_tree()
+            self.app.mark_modified()
+
+    def move_standard_rule(self, delta):
+        """上移(delta=-1)或下移(delta=1)选中的规则"""
+        sel = self.sr_tree.selection()
+        if not sel:
+            return
+        i = int(sel[0]) - 1
+        if not (0 <= i < len(self.standard_rules)):
+            return
+        j = i + delta
+        if not (0 <= j < len(self.standard_rules)):
+            return
+        self.standard_rules[i], self.standard_rules[j] = self.standard_rules[j], self.standard_rules[i]
+        self.refresh_standard_rules_tree()
+        # 重新选中移动后的行
+        for item in self.sr_tree.get_children():
+            if int(item) == j + 1:
+                self.sr_tree.selection_set(item)
+                break
+        self.app.mark_modified()
+
+    def refresh_standard_rules_tree(self):
+        """重建条件标液规则表格"""
+        for item in self.sr_tree.get_children():
+            self.sr_tree.delete(item)
+        for i, r in enumerate(self.standard_rules):
+            self.sr_tree.insert("", "end", iid=str(i + 1),
+                               values=(str(i + 1), r.get("filename", ""),
+                                       r.get("project_name", ""), r.get("desc", ""),
+                                       r.get("preparation_number", "")))
+
+    def on_standard_rule_double_click(self, event):
+        """双击条件标液规则单元格就地编辑"""
+        sel = self.sr_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        column_index = int(self.sr_tree.identify_column(event.x).replace('#', '')) - 1
+        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "preparation_number"}.get(column_index)
+        if col_key is None:  # 序号列或越界
+            return
+
+        current_values = self.sr_tree.item(item, 'values')
+        current_value = current_values[column_index]
+
+        x, y, width, height = self.sr_tree.bbox(item, self.sr_tree.identify_column(event.x))
+        entry = ttk.Entry(self.sr_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.sr_tree.item(item, values=new_values)
+            idx = int(item) - 1
+            if 0 <= idx < len(self.standard_rules):
+                self.standard_rules[idx][col_key] = new_value
             self.app.mark_modified()
             entry.destroy()
 
