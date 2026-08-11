@@ -308,33 +308,48 @@ def _match_sample_report_pdfs(spectrum_path, sample_code, method_hint=""):
     分为正常/稀释；各自按方法/项目类别关键词过滤后按文件名序保留全部——同类多份即 A/B 平行
     (GCMS 每平行一份 PDF)，由调用方逐份解析按平行槽回填。ICP-MS 按报告内 Sample Name 认领时
     normal 为单元素。对应无则空列表。"""
-    from report_parser import _dilution_factor, extract_content_sample_ids, extract_icp_ms_sample_name
+    from report_parser import (_dilution_factor, extract_content_sample_ids,
+                               extract_icp_ms_sample_name, _split_content_dilution)
     sc = (sample_code or '').lower()
     if not sc or not spectrum_path or not os.path.isdir(spectrum_path):
         return [], []
     # ICP-MS：按报告内 Sample Name 认领(优先于文件名——文件名可能与报告样品号不一致)
-    try:
-        _all_pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
-                     if fn.lower().endswith('.pdf')]
-    except Exception:
-        _all_pdfs = []
+    # ponytail: ICP-OES 稀释报告成对置于 稀释/ 子目录(正常+稀释各一份)；一并扫描，无该目录则仅顶层。
+    def _list_pdfs(d):
+        try:
+            return [os.path.join(d, fn) for fn in os.listdir(d) if fn.lower().endswith('.pdf')]
+        except Exception:
+            return []
+    _pdf_dirs = [spectrum_path, os.path.join(spectrum_path, '稀释')]
+    _all_pdfs = [p for d in _pdf_dirs if os.path.isdir(d) for p in _list_pdfs(d)]
+    # ICP-MS：按报告内 Sample Name 认领(优先于文件名——文件名可能与报告样品号不一致)。
+    # 稀释报告 Sample Name 带 -NNX(如 TS…001-10X)，去后缀后匹配样品号；
+    # 正常+稀释(-NNX)成对，按 _dilution_factor 分流(供下游超线性换源 + 稀释列填倍数)。
+    _icp_hits = []
     for p in _all_pdfs:
         _sn = extract_icp_ms_sample_name(p)
-        if _sn and (_sn == sample_code or sample_code.startswith(_sn) or _sn.startswith(sample_code)):
-            return [p], []  # ICP-MS 单样品、无稀释 PDF 概念
-    try:
-        pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
-                if fn.lower().endswith('.pdf') and fn.lower().startswith(sc)]
-    except Exception:
-        return [], []
-    if not pdfs:  # 兜底：文件名无小号(ICP 等只用 8 位流水)时按去小号前缀匹配
-        stripped = _strip_parallel_suffix(sample_code).lower()
-        if stripped and stripped != sc:
-            try:
-                pdfs = [os.path.join(spectrum_path, fn) for fn in os.listdir(spectrum_path)
-                        if fn.lower().endswith('.pdf') and fn.lower().startswith(stripped)]
-            except Exception:
-                pdfs = []
+        if not _sn:
+            continue
+        _base, _ = _split_content_dilution(_sn)
+        if _base == sample_code or sample_code.startswith(_base) or _base.startswith(sample_code):
+            _icp_hits.append(p)
+    if _icp_hits:
+        _icp_hits = sorted(set(_icp_hits))
+        _normal = [p for p in _icp_hits if _dilution_factor(p) == 1.0]
+        _dil = [p for p in _icp_hits if _dilution_factor(p) != 1.0]
+        if not _normal:      # 全 -NNX(无独立正常报告)：整体作正常源
+            _normal = _icp_hits
+            _dil = []
+        return _normal, _dil
+    pdfs = [p for p in _all_pdfs if os.path.basename(p).lower().startswith(sc)]
+    # ponytail: 报验编号命名(无小号，如 TN26080187.pdf)的正常报告并入——
+    # 不再仅兜底(if not pdfs)，否则只匹中稀释报告会令 normal_pdfs 为空触发"全-NNX→正常"误并。
+    # 词干须精确等同报验编号(非前缀)：避免误并同报验编号其它小号样品(如 TS...893012)的报告。
+    stripped = _strip_parallel_suffix(sample_code).lower()
+    if stripped and stripped != sc:
+        pdfs += [p for p in _all_pdfs
+                 if p not in pdfs
+                 and os.path.splitext(os.path.basename(p))[0].lower() == stripped]
     if not pdfs:  # 文件名前缀全 miss -> 按 PDF 内容 `样品 :` 字段关联(支持 文件名≠内容id 的 PAHS 报告)
         sc_stripped = _strip_parallel_suffix(sample_code).strip()
         for p in _all_pdfs:
@@ -391,6 +406,16 @@ def _gen_random_mass(wp):
     except (TypeError, ValueError):
         dp = 2
     return f"{random.uniform(lo, hi):.{dp}f}"
+
+
+def _random_masses(recorded, n_par, prule, wp, mdp):
+    """random 称样量：记录值不少于本样品平行数(n_par)则用记录(按 prule 换算或按 mdp 格式化)，
+    否则随机生成。平行数取本样品的，混批下不因他样多平行而丢弃本样记录值。"""
+    if recorded and len(recorded) >= n_par:
+        if prule:
+            return [_apply_processing(recorded[i], prule, wp) for i in range(n_par)]
+        return [f"{float(recorded[i]):.{mdp}f}" for i in range(n_par)]
+    return [_gen_random_mass(wp) for _ in range(n_par)]
 
 
 def _parallel_indices(records):
@@ -744,12 +769,16 @@ def _code_belongs_sample(any_code, code, key):
     按小号匹配，避免 startswith(key) 把同报验号的其它小号全吃进：
     - 精确: any_code == code
     - 平行字母文件: any_code 去尾字母 == code (TN…001A.pdf ↔ 样品 TN…001)
-    - 简写报验编号(仅当 code 小号==001): any_code == key (TS26072277.pdf 代表 …001)"""
+    - 简写报验编号(code 无小号=代表001)：any_code 去尾字母 == code+001
+      (称样记录写报验编号 TN…20、谱图文件名带小号 TN…20001T/TS 也归属本样品，不依赖 PDF 内容)
+    - 简写文件名(仅当 code 小号==001): any_code == key (TS26072277.pdf 代表 …001)"""
     any_code = (any_code or "").strip()
     if any_code == code:
         return True
     b, _ = _base_and_letter(any_code)
     if b == code and b != any_code:
+        return True
+    if code == key and b == code + "001":   # 称样记录用报验编号、文件名带001(+T/TS字母)
         return True
     return any_code == key and code == key + "001"
 
@@ -1078,13 +1107,16 @@ def _equipment_env_candidates(row, equipment_config, matched_list):
 
 
 def _match_processing_rule(processing_rules, std_no):
-    """按标准号(standardNo)匹配处理规则；支持精确→包含双向。无匹配返回 None(→直接读取兜底)。"""
+    """按标准号(standardNo)匹配处理规则；支持精确→包含双向。
+    空 method=通配(对该方法文件所有样品生效，与目标标准号无关)；建议放末条作兜底。
+    无匹配返回 None(→直接读取兜底)。"""
     std = (std_no or "").strip()
-    if std:
-        for r in processing_rules or []:
-            rm = str((r or {}).get("method") or "").strip()
-            if rm and (rm == std or rm in std or std in rm):
-                return r
+    for r in processing_rules or []:
+        rm = str((r or {}).get("method") or "").strip()
+        if not rm:                  # 空 method = 通配
+            return r
+        if std and (rm == std or rm in std or std in rm):
+            return r
     return None
 
 
@@ -1337,12 +1369,13 @@ class UniversalCell:
 
     # 称样量模式 → (placeholder, readonly)
     _WEIGHING_MODES = {
-        "random":  ("随机称样", True),
-        "none":    ("无需称样", True),
-        "record":  ("称量记录", False),
-        "process": ("过程称量", False),
-        "pdf":     ("PDF报告称样", True),
-        "":        ("称样记录", False),
+        "random":      ("随机称样", True),
+        "none":        ("无需称样", True),
+        "record":      ("称量记录", False),
+        "process":     ("过程称量", False),
+        "pdf":         ("PDF报告称样", True),
+        "conditional": ("条件称样", True),
+        "":            ("称样记录", False),
     }
 
     def set_weighing_mode(self, mode):
@@ -2507,6 +2540,11 @@ class SequenceMaster:
         wmode = (wp.get("weighing_mode") or "").strip()
         if wmode in ("record", "process"):
             return False, "", ""
+        if wmode == "conditional":
+            # 条件称样：任一规则需 record/process 则必须读称量记录 → 不支持无记录默认录入
+            if any(str((r or {}).get("weighing_mode") or "") in ("record", "process")
+                   for r in (wp.get("weighing_rules") or [])):
+                return False, "", ""
         fps = (self._read_other_params(method_file) or {}).get("fixed_params") or []
         labels, vals = [], []
         for rule in fps:
@@ -3337,6 +3375,7 @@ class SequenceMaster:
         """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q。
         循环按当前行数动态推进：运行期间新增的行(append 到末尾)会在当行结束后自动纳入运行。"""
         self._method_projects_cache.clear()  # 每次运行重建方法查询缓存(运行中样品已登记会使旧池过期)
+        weighing_caches = {}  # {组名: {sample_code: {masses,desc}}} 跨行共享称样量(称样量共享组)
         idx = start_idx
         while idx < len(self.sequence_data):
             if self._stop.is_set():
@@ -3348,7 +3387,7 @@ class SequenceMaster:
             self._ui_q.put(("status", (idx, "运行中", "")))
             self._log(f"--- 第 {idx + 1}/{n} 行 ---")
             try:
-                outcome = self._run_one_row(idx)
+                outcome = self._run_one_row(idx, weighing_caches)
             except Exception as e:
                 self._ui_q.put(("status", (idx, "失败", str(e))))
                 self._log(f"[行{idx + 1}] 异常: {e}")
@@ -3366,11 +3405,12 @@ class SequenceMaster:
             return True
         return False
 
-    def _run_one_row(self, idx):
+    def _run_one_row(self, idx, weighing_caches=None):
         """单行流水线（worker 线程内）。返回 'ok'/'skip'/'abort'/'fail'，失败自行 put status。
         谱图为目录+多PDF+未填样品编号时，按「称样记录excel ∩ 谱图目录」展开为多个样品；
         跨样品按方法(default_rules.to_id)合并：所有样品的同方法项目合并到一个实验编号提交，
-        再按 max_select 分批。某样品查询失败仅跳过(尽量多录入)，任一提交失败整行标失败。"""
+        再按 max_select 分批。某样品查询失败仅跳过(尽量多录入)，任一提交失败整行标失败。
+        weighing_caches: 运行级 {组名: 缓存dict}；方法设了称样量共享组时同组跨行共享缓存。"""
         row = self.sequence_data[idx]
         log = lambda m: self._log(f"[行{idx + 1}] {m}")
 
@@ -3383,7 +3423,12 @@ class SequenceMaster:
         _sup_def, _, _ = self._method_default_desc(row.get("method_file"))
         defaults_no_record = bool(_sup_def and not rec_path)
         wmap = None
-        if wmode in ("record", "process"):
+        # 是否强制需要称量记录文件：record/process 模式必读；conditional 时只要任一规则命中 record/process 即必读
+        _needs_record = wmode in ("record", "process")
+        if wmode == "conditional":
+            _needs_record = any(str((r or {}).get("weighing_mode") or "") in ("record", "process")
+                                for r in (wp.get("weighing_rules") or []))
+        if _needs_record:
             if not rec_path or not os.path.isfile(rec_path):
                 self._ui_q.put(("status", (idx, "失败", "未设置称量记录文件")))
                 log(f"失败: 称样量模式={wmode} 但未设置称量记录文件路径")
@@ -3446,14 +3491,20 @@ class SequenceMaster:
                     return "fail"
 
         _ops = self._read_other_params(row.get("method_file")) or {}
+        _grp = (wp.get("weighing_share_group") or "").strip() if wp else ""
+        # 称样量共享组：同名组跨行复用同一缓存(同一样品首方法生成、后方法复用)；无组名则每行独立
+        _pcache = weighing_caches.setdefault(_grp, {}) if (_grp and weighing_caches is not None) else {}
         ctx = {
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
+            "weighing_rules": (wp.get("weighing_rules") or []) if wmode == "conditional" else [],
             "fixed_params": _ops.get("fixed_params") or [], "method_file": row.get("method_file") or "",
             "standard_type": (row.get("standard_type") or "").strip(),
             "standard_rules": (row.get("_standard_rules") or _ops.get("standard_rules") or []),
             "defaults_no_record": defaults_no_record,
-            "primary_cache": {},  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
-            "dilution_remark_enabled": bool(_ops.get("dilution_remark_enabled")),
+            "primary_cache": _pcache,  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
+            # 标「解析」的样品若稀释，自动启用稀释备注(无需方法勾选)；下游 dil_extra>1 仅稀释记录实际生成备注
+            "dilution_remark_enabled": bool(_ops.get("dilution_remark_enabled")) or any(
+                ((wmap or {}).get(_sc) or {}).get("force_parse") for _sc, _ in samples),
             "dilution_volume_column": (_ops.get("dilution_volume_column") or "").strip(),
         }
 
@@ -3631,6 +3682,14 @@ class SequenceMaster:
                     log(f"[{it['sample_code']}] 命中标液规则 → {it['_standard']}（项目:{pname}）")
                 else:
                     log(f"[{it['sample_code']}] 未命中标液规则（项目:{pname}）")
+            # 条件称样匹配：按 weighing_rules 为每个样品匹配称样方式（运行时按样品分发用）
+            if ctx.get("wmode") == "conditional" and ctx.get("weighing_rules"):
+                wm = _match_conditional_rule(ctx["weighing_rules"], pname, it.get("pdf_paths") or [], desc)
+                it["_wmode"] = str((wm or {}).get("weighing_mode") or "").strip()
+                if it["_wmode"]:
+                    log(f"[{it['sample_code']}] 命中称样规则 → {it['_wmode']}（项目:{pname}）")
+                else:
+                    log(f"[{it['sample_code']}] 未命中称样规则（项目:{pname}），将跳过该样品称样")
 
         rules = self._read_query_rules(method_file)
         plan = _plan_submission_batches(rules, all_items)
@@ -3893,172 +3952,121 @@ class SequenceMaster:
         primary_cache = ctx["primary_cache"]
         cached_before = set(primary_cache)  # 本批开始前已缓存的样品 → 这些样品将复用缓存
 
-        if wmode == "random":
-            mass_col = _find_weighing_column(dynamic_columns)
-            if mass_col is not None:
-                mass_code = mass_col.get("columeCode", "")
-                records = (experiment_config or {}).get("ocAnalysisRecordList") or []
-                _, n_par = _parallel_indices(records)
-                pmasses_by_sample, desc_by_sample = {}, {}
-                # random 模式：记录有值且匹配 processing_rule(换算加补充)时按规则换算(液体×4补随机位)
-                _prules = self._read_processing_rules(ctx["method_file"])
-                _prule = _match_processing_rule(_prules, actual_method_name)
-                for it in batch_items:
-                    sc = it["sample_code"]
-                    if sc in pmasses_by_sample:
-                        continue
-                    rv = primary_cache.get(sc)
-                    if rv:
-                        pmasses_by_sample[sc] = list(rv["masses"])
-                        desc_by_sample[sc] = rv["desc"]
-                    else:
-                        # random 模式：若称样记录已含该样品称样量，以记录为准；否则随机生成
-                        samp = (ctx["wmap"] or {}).get(sc) or {}
-                        recorded = samp.get("masses") or []
-                        if recorded and len(recorded) >= n_par:
-                            if _prule:
-                                pmasses_by_sample[sc] = [_apply_processing(recorded[i], _prule, wp) for i in range(n_par)]
-                            else:
-                                try:
-                                    _mdp = int((wp or {}).get("decimal_places") or 4)
-                                except (TypeError, ValueError):
-                                    _mdp = 4
-                                pmasses_by_sample[sc] = [f"{float(recorded[i]):.{_mdp}f}" for i in range(n_par)]
-                        else:
-                            pmasses_by_sample[sc] = [_gen_random_mass(wp) for _ in range(n_par)]
-                        desc_by_sample[sc] = samp.get("desc") or ""
-                        primary_cache[sc] = {"masses": list(pmasses_by_sample[sc]), "desc": desc_by_sample[sc]}
-                host.data_fields[mass_code] = _mass_field_by_project(records, pid_to_sample, pmasses_by_sample)
-                log(f"称样量(random) {mass_col.get('columeName', '')} 跨{len(pmasses_by_sample)}样品 按平行({n_par})")
-                _fill_desc_column(records, desc_by_sample)
-            else:
-                log("称样量(random) 未找到称量记录列(isWeighing=1)，跳过")
-            first_sc = batch_items[0]["sample_code"] if batch_items else ""
-            analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
-        elif wmode == "none":
+        # 称样量注入：统一按样品分发（支持 conditional：各样品按命中规则走不同称样方式）
+        base_wmode = wmode
+        _cond = (base_wmode == "conditional")
+        if base_wmode == "none" and not _cond:
             log("称样量模式=无需称样量，跳过称样列")
-            # 不称样，但称量记录里的「试样描述」「称样时间」仍需录入(与称样量无关的样品元数据)
-            records = (experiment_config or {}).get("ocAnalysisRecordList") or []
-            desc_by_sample = {sc: ((ctx["wmap"] or {}).get(sc) or {}).get("desc") or "" for sc in batch_samples}
-            _fill_desc_column(records, desc_by_sample)
-            first_sc = batch_items[0]["sample_code"] if batch_items else ""
-            analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
-        elif wmode in ("record", "process"):
-            mass_col = _find_weighing_column(dynamic_columns)
-            if not mass_col:
-                log(f"称样量({wmode}) 未找到称量记录列(isWeighing=1)，跳过")
-            else:
-                records = (experiment_config or {}).get("ocAnalysisRecordList") or []
-                # 各样品平行数 = 该样品项目记录的最大 serialNumber(扩展后)；混批时各样品可不同
-                n_par_by_sample = {}
-                for _r in records:
-                    _rsc = pid_to_sample.get(str(_r.get("projectId")))
-                    if not _rsc:
-                        continue
-                    try:
-                        _rsv = int(_r.get("serialNumber"))
-                    except (TypeError, ValueError):
-                        _rsv = 1
-                    n_par_by_sample[_rsc] = max(n_par_by_sample.get(_rsc, 0), _rsv)
-                prules = self._read_processing_rules(ctx["method_file"]) if wmode == "process" else []
-                rule = _match_processing_rule(prules, actual_method_name) if wmode == "process" else None
-                pmasses_by_sample, marker_masses_by_sample, desc_by_sample = {}, {}, {}
-                for it in batch_items:
-                    sc = it["sample_code"]
-                    if sc in pmasses_by_sample:
-                        continue
-                    rv = primary_cache.get(sc)
-                    if rv:
-                        pmasses_by_sample[sc] = list(rv["masses"])
-                        marker_masses_by_sample[sc] = dict(rv.get("marker_masses") or {})
-                        desc_by_sample[sc] = rv["desc"]
-                        continue
-                    samp = ctx["wmap"].get(sc) or {}
-                    masses = samp.get("masses")
-                    n_par = n_par_by_sample.get(sc, 1)
-                    if not masses or len(masses) < n_par:
-                        self._ui_q.put(("status", (idx, "失败", f"称量记录平行不足({len(masses or [])}/{n_par})")))
-                        log(f"失败: 样品 {sc} 称量记录仅 {len(masses or [])} 个平行，实验需 {n_par}")
-                        return False, ""
-                    raw_marker = samp.get("marker_masses") or {}
-                    if wmode == "record":
-                        # 按方法 decimal_places 格式化，保留末尾0(0.552→0.5520)；不再用 %g 吞末尾0
-                        try:
-                            _mdp = int((wp or {}).get("decimal_places") or 4)  # 称样量天平标准4位(0.0001g)
-                        except (TypeError, ValueError):
-                            _mdp = 4
-                        pmasses_by_sample[sc] = [f"{float(masses[i]):.{_mdp}f}" for i in range(n_par)]
-                        marker_masses_by_sample[sc] = {mk: [f"{float(v):.{_mdp}f}" for v in mv]
-                                                       for mk, mv in raw_marker.items()}
-                    else:
-                        pmasses_by_sample[sc] = [_apply_processing(masses[i], rule, wp) for i in range(n_par)]
-                        marker_masses_by_sample[sc] = {mk: [_apply_processing(v, rule, wp) for v in mv]
-                                                       for mk, mv in raw_marker.items()}
-                    desc_by_sample[sc] = samp.get("desc") or ""
-                    primary_cache[sc] = {"masses": list(pmasses_by_sample[sc]),
-                                         "marker_masses": dict(marker_masses_by_sample[sc]),
-                                         "desc": desc_by_sample[sc]}
-                # 标记项目路由：projectId -> 谱图filter；filter 为标记字母(如 M)时该记录取标记称样量
-                pid_filter = {str(it["project"].get("projectId")):
-                              _pname_filter.get(it["project"].get("projectName", ""), "")
-                              for it in batch_items}
-                mass_code = mass_col.get("columeCode", "")
-                host.data_fields[mass_code] = _mass_field_by_project(
-                    records, pid_to_sample, pmasses_by_sample, pid_filter, marker_masses_by_sample)
-                rname = ((rule or {}).get("type") or "直接读取(无匹配规则)") if wmode == "process" else "record"
-                _npars = sorted(set(n_par_by_sample.values())) if n_par_by_sample else [1]
-                log(f"称样量({wmode}) {mass_col.get('columeName', '')} 规则[{rname}] 跨{len(pmasses_by_sample)}样品 按平行({'/'.join(map(str, _npars))})")
-                _fill_desc_column(records, desc_by_sample)
-            # ponytail: analysis_start 须在 else 外——总和项目无称样列(mass_col=None)时仍需称样时间作 startTime
-            first_sc = batch_items[0]["sample_code"] if batch_items else ""
-            analysis_start = (ctx["wmap"].get(first_sc) or {}).get("time")
-        elif wmode == "pdf":
-            # PDF报告 - 称样量取自报告(样品初始质量)，按 decimal_places 保留末尾0(0.31→0.3100)
-            mass_col = _find_weighing_column(dynamic_columns)
-            if mass_col is None:
-                log("称样量(pdf) 未找到称量记录列(isWeighing=1)，跳过")
-            else:
+        mass_col = _find_weighing_column(dynamic_columns)
+        mass_code = mass_col.get("columeCode", "") if mass_col else ""
+        records = (experiment_config or {}).get("ocAnalysisRecordList") or []
+        # 各样品平行数：projectId->样品 的最大 serialNumber；混批各样品可不同(record/process/random 共用)
+        _n_par_by_sample = {}
+        for _r in records:
+            _rsc = pid_to_sample.get(str(_r.get("projectId")))
+            if not _rsc:
+                continue
+            try:
+                _rsv = int(_r.get("serialNumber"))
+            except (TypeError, ValueError):
+                _rsv = 1
+            _n_par_by_sample[_rsc] = max(_n_par_by_sample.get(_rsc, 0), _rsv)
+        _prules = self._read_processing_rules(ctx["method_file"])
+        _prule = _match_processing_rule(_prules, actual_method_name)  # random/process 共用同一匹配规则
+        try:
+            _mdp = int((wp or {}).get("decimal_places") or 4)  # 天平标准4位(0.0001g)
+        except (TypeError, ValueError):
+            _mdp = 4
+        # marker 路由(与方式无关)：projectId -> 谱图filter；filter 为标记字母(如 M)时取标记称样量
+        pid_filter = {str(it["project"].get("projectId")):
+                      _pname_filter.get(it["project"].get("projectName", ""), "")
+                      for it in batch_items}
+        pmasses_by_sample, marker_masses_by_sample, desc_by_sample = {}, {}, {}
+        _sp = (row.get("spectrum_path") or "").strip()
+
+        for it in batch_items:
+            sc = it["sample_code"]
+            if sc in pmasses_by_sample:
+                continue
+            eff = (it.get("_wmode") or "") if _cond else base_wmode  # 条件称样按样品命中；否则整批统一
+            samp = (ctx["wmap"] or {}).get(sc) or {}
+            rv = primary_cache.get(sc)
+            if rv:
+                pmasses_by_sample[sc] = list(rv["masses"])
+                marker_masses_by_sample[sc] = dict(rv.get("marker_masses") or {})
+                desc_by_sample[sc] = rv["desc"]
+                continue
+
+            if eff == "random":
+                # 平行数取本样品的(与 record/process 一致)，混批下不因他样多平行而丢弃本样记录值
+                _n_par = _n_par_by_sample.get(sc, 1)
+                pmasses_by_sample[sc] = _random_masses(samp.get("masses") or [], _n_par, _prule, wp, _mdp)
+                desc_by_sample[sc] = samp.get("desc") or ""
+            elif eff in ("record", "process"):
+                masses = samp.get("masses")
+                n_par = _n_par_by_sample.get(sc, 1)
+                if not masses or len(masses) < n_par:
+                    self._ui_q.put(("status", (idx, "失败", f"称量记录平行不足({len(masses or [])}/{n_par})")))
+                    log(f"失败: 样品 {sc} 称量记录仅 {len(masses or [])} 个平行，实验需 {n_par}")
+                    return False, ""
+                raw_marker = samp.get("marker_masses") or {}
+                if eff == "record":
+                    # 按方法 decimal_places 格式化，保留末尾0(0.552→0.5520)；不再用 %g 吞末尾0
+                    pmasses_by_sample[sc] = [f"{float(masses[i]):.{_mdp}f}" for i in range(n_par)]
+                    marker_masses_by_sample[sc] = {mk: [f"{float(v):.{_mdp}f}" for v in mv]
+                                                   for mk, mv in raw_marker.items()}
+                else:
+                    pmasses_by_sample[sc] = [_apply_processing(masses[i], _prule, wp) for i in range(n_par)]
+                    marker_masses_by_sample[sc] = {mk: [_apply_processing(v, _prule, wp) for v in mv]
+                                                   for mk, mv in raw_marker.items()}
+                desc_by_sample[sc] = samp.get("desc") or ""
+            elif eff == "pdf":
+                # PDF报告：称样量取自报告(样品初始质量)，按 decimal_places 保留末尾0(0.31→0.3100)
                 from report_parser import parse_pdf_report_meta, filter_samples_by_code
-                field = (mass_col.get('equipRelativeTitle') or '').strip() or '样品初始质量'
-                try:
-                    _mdp = int((wp or {}).get("decimal_places") or 4)  # 天平标准4位(0.0001g)
-                except (TypeError, ValueError):
-                    _mdp = 4
-                records = (experiment_config or {}).get("ocAnalysisRecordList") or []
-                sp = (row.get("spectrum_path") or "").strip()
-                pmasses_by_sample, desc_by_sample = {}, {}
-                for it in batch_items:
-                    sc = it["sample_code"]
-                    if sc in pmasses_by_sample:
-                        continue
-                    rv = primary_cache.get(sc)
-                    if rv:
-                        pmasses_by_sample[sc] = list(rv["masses"])
-                        desc_by_sample[sc] = rv["desc"]
-                        continue
-                    pdf, _dil = _pick_sample_report_pdf(sp, sc, actual_method_name)
-                    raw = []
-                    if pdf:
-                        try:
-                            meta = filter_samples_by_code(parse_pdf_report_meta(pdf, field), sc)
-                            raw = [v for _sid, v in meta if v]
-                        except Exception as e:
-                            log(f"称样量(pdf) 样品 {sc} 报告解析失败({e})")
-                    else:
-                        log(f"称样量(pdf) 样品 {sc} 谱图目录未找到报告 PDF，称样量留空")
-                    masses = [f"{float(v):.{_mdp}f}" for v in raw]  # 报告段顺序=平行槽(A→0,B→1)
-                    pmasses_by_sample[sc] = masses
-                    desc_by_sample[sc] = ((ctx["wmap"] or {}).get(sc) or {}).get("desc") or ""
-                    primary_cache[sc] = {"masses": list(masses), "desc": desc_by_sample[sc]}
-                mass_code = mass_col.get("columeCode", "")
-                host.data_fields[mass_code] = _mass_field_by_project(records, pid_to_sample, pmasses_by_sample)
-                _npars = sorted({len(v) for v in pmasses_by_sample.values() if v}) or [0]
-                log(f"称样量(pdf) {mass_col.get('columeName', '')} 字段[{field}] 跨{len(pmasses_by_sample)}样品 按报告段({'/'.join(map(str, _npars))})")
-                _fill_desc_column(records, desc_by_sample)
-            first_sc = batch_items[0]["sample_code"] if batch_items else ""
-            analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
-        elif wmode:
-            log(f"称样量模式={wmode} 暂未接入(本轮支持 random/none/record/process/pdf)")
+                field = ((mass_col or {}).get('equipRelativeTitle') or '').strip() or '样品初始质量'
+                pdf, _dil = _pick_sample_report_pdf(_sp, sc, actual_method_name)
+                raw = []
+                if pdf:
+                    try:
+                        meta = filter_samples_by_code(parse_pdf_report_meta(pdf, field), sc)
+                        raw = [v for _sid, v in meta if v]
+                    except Exception as e:
+                        log(f"称样量(pdf) 样品 {sc} 报告解析失败({e})")
+                else:
+                    log(f"称样量(pdf) 样品 {sc} 谱图目录未找到报告 PDF，称样量留空")
+                pmasses_by_sample[sc] = [f"{float(v):.{_mdp}f}" for v in raw]  # 报告段顺序=平行槽(A→0,B→1)
+                desc_by_sample[sc] = samp.get("desc") or ""
+            elif eff in ("none", ""):
+                # 无需称样 / 条件未命中：不产称样量，仅留描述
+                pmasses_by_sample[sc] = []
+                desc_by_sample[sc] = samp.get("desc") or ""
+                if eff == "":
+                    log(f"样品 {sc} 条件称样未命中任何规则，称样量留空")
+            else:
+                log(f"称样量模式={eff} 暂未接入(本轮支持 random/none/record/process/pdf)")
+                pmasses_by_sample[sc] = []
+                desc_by_sample[sc] = samp.get("desc") or ""
+
+            primary_cache[sc] = {"masses": list(pmasses_by_sample[sc]),
+                                 "marker_masses": dict(marker_masses_by_sample.get(sc) or {}),
+                                 "desc": desc_by_sample[sc]}
+
+        # 写入称量记录列(所有方式共用)；纯 none 模式不写称样列(保持原行为)
+        _skip_mass = (base_wmode == "none" and not _cond)
+        if not _skip_mass and mass_col is not None:
+            host.data_fields[mass_code] = _mass_field_by_project(
+                records, pid_to_sample, pmasses_by_sample, pid_filter, marker_masses_by_sample)
+            if _cond:
+                from collections import Counter
+                _cnt = Counter((it.get("_wmode") or "未命中") for it in batch_items)
+                log(f"称样量(条件) {mass_col.get('columeName', '')} 跨{len(pmasses_by_sample)}样品 方式分布{dict(_cnt)}")
+            else:
+                log(f"称样量({base_wmode}) {mass_col.get('columeName', '')} 跨{len(pmasses_by_sample)}样品")
+        elif not _skip_mass:
+            log(f"称样量({base_wmode}) 未找到称量记录列(isWeighing=1)，跳过称样量写入")
+        _fill_desc_column(records, desc_by_sample)
+        first_sc = batch_items[0]["sample_code"] if batch_items else ""
+        analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
 
         _reused = [sc for sc in batch_samples if sc in cached_before]
         if _reused:
@@ -4580,7 +4588,7 @@ class SequenceMaster:
         # 1) 按样品解析报告 PDF（正常 + 可选稀释）；同一样品多项目共用
         # ICP 一 PDF 多样品(A/B 平行样)：samples = [(标识码, compounds), ...]，按平行槽分取
         from report_parser import (parse_pdf_report, parse_pdf_report_multi, _dilution_factor,
-                                   filter_samples_by_code, _split_content_dilution)
+                                   filter_samples_by_code, _split_content_dilution, parse_pdf_report_meta)
         parsed_by_sample = {}   # {sample_code: (samples, diluted_compounds, headers)}
         factor_by_sample = {}   # {sample_code: 稀释倍数}
         missing_samples = []
@@ -4628,10 +4636,15 @@ class SequenceMaster:
             # 文件名稀释 PDF 仍优先(两者互斥:单样品PDF文件名 vs 多样品PDF内容)
             if dil_pdf:
                 try:
-                    diluted, _ = parse_pdf_report(dil_pdf)
+                    _dil_s, _ = parse_pdf_report_multi(dil_pdf)
+                    _dil_s = filter_samples_by_code(_dil_s, sc)
+                    # ponytail: 稀释源按平行槽对齐(A-10X→槽0, B-10X→槽1)，不再只取首样
+                    diluted = [cmp for _sid, cmp in _dil_s] or None
                 except Exception as e:
                     log(f"报告解析: 样品 {sc} 稀释报告解析失败({e})，按正常报告处理")
-                factor_by_sample[sc] = _dilution_factor(dil_pdf)
+                # ponytail: 倍数优先取报告内「稀释：」字段(权威)，回退文件名 -NNX
+                _fv = next((v for _s, v in parse_pdf_report_meta(dil_pdf, '稀释') if v), None)
+                factor_by_sample[sc] = float(_fv) if _fv else _dilution_factor(dil_pdf)
             elif content_factor is not None:
                 factor_by_sample[sc] = content_factor
             parsed_by_sample[sc] = (samples, diluted, headers)
@@ -4692,6 +4705,10 @@ class SequenceMaster:
             samples, diluted_compounds, _headers = parsed
             # 取该平行槽样品；槽超界(平行数<样品数，如 N=1 而报告有 A/B)则取首个
             compounds = samples[slot][1] if slot < len(samples) else samples[0][1]
+            # 稀释源按平行槽取(dil_pdf 多样品 A-10X/B-10X 各对其槽)；单 dict(内容稀释)或 None 原样
+            if isinstance(diluted_compounds, list):
+                diluted_compounds = (diluted_compounds[slot] if slot < len(diluted_compounds)
+                                     else diluted_compounds[0]) if diluted_compounds else None
             det_pid = item["project"].get("detectionProjectId")
             if not det_pid:
                 return "", False
@@ -5022,12 +5039,13 @@ class SequenceMaster:
         ps = params.get("sample") or {}
         if ps.get("enabled"):
             suf_str = ps.get("keyword")
-            # 中英文逗号都当分隔符(方法文件里可能混用，如 "*,*T，*TS")
-            suffixes = [s.strip() for s in (suf_str or "").replace("，", ",").split(",") if s.strip()] or [""]
+            # 逗号/分号(中英文)都当分隔符(如 "A,B" / "*,*T；*TS")
+            suffixes = _split_device_codes(suf_str) or [""]
             need = ps.get("count") or 1
             # 后缀表：关键字去 * 后(如 *,*T,*TS → ['','t','ts'])；非空后缀长者优先扣(避免 t 抢 ts)
             reqs = [s.replace("*", "").lower() for s in suffixes]
             known = sorted({s for s in reqs if s}, key=len, reverse=True)
+            from report_parser import _DILUTION_RE  # 剥 -NNX 稀释后缀，避免稀释报告自成平行组被强求各后缀齐全
             for sc, _pdfs in samples:
                 base = _strip_parallel_suffix(sc).lower()  # 报验号(去平行小号 001)
                 head = re.compile(re.escape(base) + r"(\d{3})?(.*)$")
@@ -5035,7 +5053,9 @@ class SequenceMaster:
                 # 文件名约定 base + 可选小号 + 可选平行字母(A/B) + 后缀(T/TS)；简写无小号
                 groups = {}
                 for n in names:
-                    m = head.match(os.path.splitext(n)[0].lower())
+                    # 稀释报告 -NNX 先剥：并入基样(算作其谱图一份)，不另成平行组(否则被要求 T/TS 齐全)
+                    stem = _DILUTION_RE.sub('', os.path.splitext(n)[0].lower())
+                    m = head.match(stem)
                     if not m:
                         continue
                     tail = m.group(2)
@@ -5594,6 +5614,11 @@ def _selfcheck():
     assert _code_belongs_sample("TN26070729001A", "TN26070729001", "TN26070729")     # 平行字母文件
     assert _code_belongs_sample("TS26072277", "TS26072277001", "TS26072277")         # 简写报验编号代表001
     assert not _code_belongs_sample("TS26072277", "TS26072277087", "TS26072277")     # 简写不代表087
+    # 称样记录用报验编号(无小号=代表001)：谱图文件名带001(+T/TS字母)也归属，不依赖 PDF 内容
+    assert _code_belongs_sample("TN26080320001", "TN26080320", "TN26080320")        # base 全码
+    assert _code_belongs_sample("TN26080320001T", "TN26080320", "TN26080320")       # T 变体
+    assert _code_belongs_sample("TN26080320001TS", "TN26080320", "TN26080320")      # TS 变体
+    assert not _code_belongs_sample("TN26080320002T", "TN26080320", "TN26080320")   # 不同小号(002)不吃进
 
     # _ParallelWMap：单字母后缀称样记录(如 TN…K)按 LIMS 全码(…001)能查回 desc/称样量。
     # 回归：K 样品子方法切换(desc 匹配)与称样量回填不再因 key≠全码而 miss。
@@ -5611,6 +5636,28 @@ def _selfcheck():
     assert _accept_date_of({"acceptTime": "2026-08-08 12:00:00"}) == (date(2026, 8, 8), "acceptTime")
     assert _accept_date_of({"acceptDate": "2026-08-09"}) == (date(2026, 8, 9), "acceptDate")
     assert _accept_date_of({})[0] is None
+
+    # _match_processing_rule：空 method=通配(对该方法文件所有样品生效，与标准号无关)；
+    # 非空 method 仍按标准号精确/包含双向匹配。回归 TDI/液体TDI 的 method="" 换算加补充规则。
+    _pr_blank = {"method": "", "type": "换算加补充", "factor": 4}
+    assert _match_processing_rule([_pr_blank], "GB/T 18446-2009") is _pr_blank   # 空通配命中
+    assert _match_processing_rule([_pr_blank], "") is _pr_blank                  # 标准号为空也命中
+    assert _match_processing_rule([{"method": "18446", "type": "换算处理"}], "GB/T 18446-2009") \
+        == {"method": "18446", "type": "换算处理"}                              # 子串匹配仍有效
+    assert _match_processing_rule([{"method": "GB/T 9999"}], "GB/T 18446-2009") is None  # 不中→None
+    assert _match_processing_rule([], "GB/T 18446-2009") is None                          # 无规则→None
+
+    # _random_masses：random 称样量按本样品平行数(n_par)决定用记录还是随机(不再用全局 max)。
+    # 回归 PAE TN26080385：混批(他样2平行→旧代码全局 max=2)下本样1平行且录了0.2751 → 必须用记录。
+    _wp_r = {"min_value": 1.9, "max_value": 2.2, "decimal_places": 4}
+    assert _random_masses(["0.2751"], 1, None, _wp_r, 4) == ["0.2751"]            # 单值不被随机覆盖
+    assert _random_masses(["0.5000", "0.6000"], 2, None, _wp_r, 4) == ["0.5000", "0.6000"]  # 2平行2值
+    _r2 = _random_masses(["0.2751"], 2, None, _wp_r, 4)                          # 需2平行仅录1值→随机补
+    assert len(_r2) == 2 and all(1.9 <= float(v) <= 2.2 for v in _r2)
+    _r3 = _random_masses([], 1, None, _wp_r, 4)                                  # 无记录→随机
+    assert len(_r3) == 1 and 1.9 <= float(_r3[0]) <= 2.2
+    _pr_x4 = {"type": "换算处理", "factor": 4, "decimal_places": 4}              # prule 换算路径
+    assert _random_masses(["0.2751"], 1, _pr_x4, _wp_r, 4) == ["1.1004"]
     print("selfcheck OK")
 
 

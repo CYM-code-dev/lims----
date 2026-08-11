@@ -1,16 +1,16 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD/称样记录.xlsx
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260811-pd/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE固体.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260811-pd
   temperature: '25'
-  humidity: '60'
+  humidity: '58'
 - id: 2
-  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD/称样记录.xlsx
+  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260811-pd/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE液体.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260810-PD
+  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/20260811-pd
   temperature: '25'
-  humidity: '60'
+  humidity: '58'
 column_widths:
 - 50
 - 260

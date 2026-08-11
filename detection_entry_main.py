@@ -770,20 +770,44 @@ class DetectionEntrySystem:
     def _find_result_column(self, pdf_headers=()):
         """挑数据采集结果列：
         1) equipRelativeTitle 精确匹配 PDF 报告表头(原系统机制，非硬编码：浓度/校准浓度等都能对上)；
+           表头命中多列时优先结果列(表头/列名含 浓度/计算值/报告值...)，避免化合物/峰面积等非结果列抢中；
         2) 兜底：列名关键词(计算值/报告值/浓度...)。多命中取 columeOrder 最小。"""
+        KW = ('计算值', '报告值', '测定值', '浓度', '结果值', '含量')
+
+        def _ok(c):
+            return not self._is_merge_column(c) and not self._is_component_column(c)
+
+        def _desc(c):
+            return "(%s|%s|表头=%s|o%s%s%s)" % (
+                c.get('columeCode'), c.get('columeName'), c.get('equipRelativeTitle'), c.get('columeOrder'),
+                '|合并' if self._is_merge_column(c) else '', '|组分' if self._is_component_column(c) else '')
+
+        self.log("全部动态列: %s" % [_desc(c) for c in self.dynamic_columns])
+
+        pick, path = None, ""
         if pdf_headers:
-            cands = [c for c in self.dynamic_columns
-                     if not self._is_merge_column(c) and not self._is_component_column(c)
+            cands = [c for c in self.dynamic_columns if _ok(c)
                      and (c.get('equipRelativeTitle') or '').strip() in pdf_headers]
             if cands:
-                return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
-        KW = ('计算值', '报告值', '测定值', '浓度', '结果值', '含量')
-        cands = [c for c in self.dynamic_columns
-                 if not self._is_merge_column(c) and not self._is_component_column(c)
-                 and any(k in (c.get('columeName') or '') for k in KW)]
-        if not cands:
-            return None
-        return min(cands, key=lambda c: c.get('columeOrder', 9999)).get('columeCode')
+                # 表头命中多列：优先结果列(表头/列名含结果关键词)，否则取 columeOrder 最小
+                kw_hits = [c for c in cands
+                           if any(k in ((c.get('equipRelativeTitle') or '') + (c.get('columeName') or ''))
+                                  for k in KW)]
+                pool = kw_hits or cands
+                pick = min(pool, key=lambda c: c.get('columeOrder', 9999))
+                path = "表头命中%s %s" % ("(结果列优先)" if kw_hits else "", [_desc(c) for c in cands])
+        if pick is None:
+            cands = [c for c in self.dynamic_columns if _ok(c)
+                     and any(k in (c.get('columeName') or '') for k in KW)]
+            if cands:
+                pick = min(cands, key=lambda c: c.get('columeOrder', 9999))
+                path = "列名关键词兜底 %s" % [_desc(c) for c in cands]
+        if pick is not None:
+            self.log("选列诊断: PDF表头=%s | %s → 选 %s" % (list(pdf_headers), path, _desc(pick)))
+            return pick.get('columeCode')
+        self.log("选列诊断: PDF表头=%s | 未找到结果列(非合并/非组分列中无表头命中、列名也无关键词)"
+                 % list(pdf_headers))
+        return None
 
     def acquire_data(self):
         """数据采集：本地解析谱图 PDF -> 按项目别名求值 -> 回填检测数据结果列。"""

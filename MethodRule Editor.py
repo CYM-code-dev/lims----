@@ -1104,10 +1104,22 @@ class MethodTab:
 
 
 class WeighingTab:
+    # 称样方式码 ↔ 编辑器显示标签（条件称样规则表用）
+    _WEIGHING_MODE_OPTIONS = [
+        ("record", "称量记录"),
+        ("random", "随机数生成"),
+        ("process", "称量记录处理"),
+        ("none", "无需称样量"),
+        ("pdf", "PDF报告"),
+    ]
+    _LABEL_BY_MODE = {code: lbl for code, lbl in _WEIGHING_MODE_OPTIONS}
+    _MODE_BY_LABEL = {lbl: code for code, lbl in _WEIGHING_MODE_OPTIONS}
+
     def __init__(self, parent, app):
         self.parent = parent
         self.app = app
         self.processing_rules = []
+        self.weighing_rules = []  # 条件称样规则：[{filename,project_name,desc,weighing_mode}]
         self.weighing_params = {
             "decimal_places": "",
             "min_value": "",
@@ -1115,7 +1127,8 @@ class WeighingTab:
             "conversion_factor": "",
             "result_decimal_places": "",
             "weighing_mode": "random",
-            "non_parallel_suffixes": []
+            "non_parallel_suffixes": [],
+            "weighing_share_group": ""
         }
         self.create_tab()
 
@@ -1145,6 +1158,9 @@ class WeighingTab:
         ttkb.Radiobutton(mode_frame, text="PDF报告",
                         variable=self.weighing_mode, value="pdf",
                         command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
+        ttkb.Radiobutton(mode_frame, text="条件称样",
+                        variable=self.weighing_mode, value="conditional",
+                        command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
 
         # 平行样合并设置：不并入平行样的标记后缀字母(如 M=基体加标)
         parallel_frame = ttk.LabelFrame(weighing_frame, text="平行样合并", padding=5)
@@ -1158,12 +1174,26 @@ class WeighingTab:
         ttk.Label(parallel_frame, text="这些后缀(如 M=基体加标)不计入平行样；其称样量用于谱图filter=该标记的项目，逗号分隔",
                   foreground="gray").pack(fill='x', pady=(2, 0))
 
+        # 称样量共享组：同名组的方法跨行共享称样缓存(同一样品首方法生成、后方法复用)
+        share_frame = ttk.LabelFrame(weighing_frame, text="称样量共享组", padding=5)
+        share_frame.pack(fill='x', padx=5, pady=(0, 5))
+        sf = ttk.Frame(share_frame)
+        sf.pack(fill='x')
+        ttk.Label(sf, text="共享组名:").pack(side='left', padx=(0, 5))
+        self.weighing_share_group = tk.StringVar(value="")
+        ttk.Entry(sf, textvariable=self.weighing_share_group, width=24).pack(side='left', padx=(0, 8))
+        ttk.Label(share_frame, text="相同组名的方法共享称样量：同一样品首方法生成、后方法复用；须同一次运行、生成方法在前",
+                  foreground="gray").pack(fill='x', pady=(2, 0))
+
         # 创建内容区域 - 所有模式的内容都显示
         self.weighing_content_frame = ttk.Frame(weighing_frame)
         self.weighing_content_frame.pack(fill='both', expand=True, padx=5, pady=5)
 
         # 创建所有模式的内容区域
         self.create_all_weighing_modes()
+
+        # 条件称样规则表（初始隐藏，仅 conditional 时显示）
+        self.create_weighing_rules_section(weighing_frame)
 
         # 初始状态设置
         self.on_weighing_mode_change()
@@ -1382,6 +1412,10 @@ class WeighingTab:
         """称样量模式改变时的处理"""
         # 设置所有框架的状态
         mode = self.weighing_mode.get()
+        # 条件称样规则表：仅 conditional 时显示
+        self.weighing_rules_frame.pack_forget()
+        if mode == "conditional":
+            self.weighing_rules_frame.pack(fill='both', expand=True, pady=5)
         if mode == "record":
             # 称量记录模式 - 两个区域都禁用
             self.set_frame_state(self.random_frame, "disabled")
@@ -1405,6 +1439,10 @@ class WeighingTab:
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
             self.decimal_entry.configure(state="normal")
+        elif mode == "conditional":
+            # 条件称样：不同样品按规则命中不同方式，随机/处理参数都可能被引用 → 两者都启用
+            self.set_frame_state(self.random_frame, "normal")
+            self.set_frame_state(self.process_frame, "normal")
 
     def set_frame_state(self, frame, state):
         """设置框架及其子组件的状态"""
@@ -1557,6 +1595,184 @@ class WeighingTab:
                 decimal_places_display
             ))
 
+    def create_weighing_rules_section(self, parent):
+        """条件称样规则表（仅 weighing_mode=conditional 时显示）：
+        按 文件名/项目名/试样描述 关键词命中 → 用对应称样方式。首条命中即用，末条留空三条件=默认方式。"""
+        self.weighing_rules_frame = ttk.LabelFrame(
+            parent, text="条件称样规则（首条命中即用；末条留空三条件=默认方式）", padding=5)
+        # 初始不 pack，由 on_weighing_mode_change 控制显隐
+        wr_input = ttk.Frame(self.weighing_rules_frame)
+        wr_input.pack(fill='x', pady=2)
+        ttk.Label(wr_input, text="文件名:").pack(side='left', padx=(0, 3))
+        self.wr_filename_var = tk.StringVar()
+        ttk.Entry(wr_input, textvariable=self.wr_filename_var, width=8).pack(side='left', padx=(0, 6))
+        ttk.Label(wr_input, text="项目名:").pack(side='left', padx=(0, 3))
+        self.wr_project_var = tk.StringVar()
+        ttk.Entry(wr_input, textvariable=self.wr_project_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(wr_input, text="试样描述:").pack(side='left', padx=(0, 3))
+        self.wr_desc_var = tk.StringVar()
+        ttk.Entry(wr_input, textvariable=self.wr_desc_var, width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(wr_input, text="称样方式:").pack(side='left', padx=(0, 3))
+        self.wr_mode_var = tk.StringVar()
+        ttk.Combobox(wr_input, textvariable=self.wr_mode_var,
+                     values=[lbl for _, lbl in self._WEIGHING_MODE_OPTIONS],
+                     state="readonly", width=12).pack(side='left', padx=(0, 6))
+        ttkb.Button(wr_input, text="添加", command=self.add_weighing_rule, bootstyle="secondary").pack(side='left')
+        # 表格
+        wr_list = ttk.Frame(self.weighing_rules_frame)
+        wr_list.pack(fill='both', expand=True, pady=3)
+        wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式")
+        self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=4)
+        for c in wcols:
+            self.wr_tree.heading(c, text=c, anchor='w')
+        self.wr_tree.column("序号", width=40, anchor='w')
+        self.wr_tree.column("文件名关键词", width=90, anchor='w')
+        self.wr_tree.column("项目名关键词", width=110, anchor='w')
+        self.wr_tree.column("试样描述关键词", width=110, anchor='w')
+        self.wr_tree.column("称样方式", width=120, anchor='w')
+        self.wr_tree.pack(side='left', fill='both', expand=True)
+        wr_scroll = ttk.Scrollbar(wr_list, orient="vertical", command=self.wr_tree.yview)
+        wr_scroll.pack(side='right', fill='y')
+        self.wr_tree.configure(yscrollcommand=wr_scroll.set)
+        self.wr_tree.bind("<Double-1>", self.on_weighing_rule_double_click)
+        # 操作按钮
+        wr_btn = ttk.Frame(self.weighing_rules_frame)
+        wr_btn.pack(fill='x', pady=2)
+        ttkb.Button(wr_btn, text="删除选中", command=self.delete_weighing_rule, bootstyle="danger").pack(side='left', padx=2)
+        ttkb.Button(wr_btn, text="上移", command=lambda: self.move_weighing_rule(-1), bootstyle="secondary").pack(side='left', padx=2)
+        ttkb.Button(wr_btn, text="下移", command=lambda: self.move_weighing_rule(1), bootstyle="secondary").pack(side='left', padx=2)
+
+    # ---------- 条件称样规则 CRUD ----------
+
+    def add_weighing_rule(self):
+        """添加一条条件称样规则"""
+        mode_code = self._MODE_BY_LABEL.get(self.wr_mode_var.get().strip(), "")
+        if not mode_code:
+            messagebox.showwarning("输入错误", "请选择称样方式")
+            return
+        self.weighing_rules.append({
+            "filename": self.wr_filename_var.get().strip(),
+            "project_name": self.wr_project_var.get().strip(),
+            "desc": self.wr_desc_var.get().strip(),
+            "weighing_mode": mode_code
+        })
+        self.refresh_weighing_rules_tree()
+        self.wr_filename_var.set(""); self.wr_project_var.set(""); self.wr_desc_var.set(""); self.wr_mode_var.set("")
+        self.app.mark_modified()
+
+    def delete_weighing_rule(self):
+        """删除选中的条件称样规则"""
+        sel = self.wr_tree.selection()
+        if not sel:
+            messagebox.showwarning("选择错误", "请先选择要删除的规则")
+            return
+        idx = int(sel[0]) - 1
+        if 0 <= idx < len(self.weighing_rules):
+            del self.weighing_rules[idx]
+            self.refresh_weighing_rules_tree()
+            self.app.mark_modified()
+
+    def move_weighing_rule(self, delta):
+        """上移(delta=-1)或下移(delta=1)选中的规则（顺序即优先级）"""
+        sel = self.wr_tree.selection()
+        if not sel:
+            return
+        i = int(sel[0]) - 1
+        if not (0 <= i < len(self.weighing_rules)):
+            return
+        j = i + delta
+        if not (0 <= j < len(self.weighing_rules)):
+            return
+        self.weighing_rules[i], self.weighing_rules[j] = self.weighing_rules[j], self.weighing_rules[i]
+        self.refresh_weighing_rules_tree()
+        for item in self.wr_tree.get_children():
+            if int(item) == j + 1:
+                self.wr_tree.selection_set(item)
+                break
+        self.app.mark_modified()
+
+    def refresh_weighing_rules_tree(self):
+        """重建条件称样规则表格（称样方式列显示标签）"""
+        for item in self.wr_tree.get_children():
+            self.wr_tree.delete(item)
+        for i, r in enumerate(self.weighing_rules):
+            self.wr_tree.insert("", "end", iid=str(i + 1),
+                                values=(str(i + 1), r.get("filename", ""),
+                                        r.get("project_name", ""), r.get("desc", ""),
+                                        self._LABEL_BY_MODE.get(r.get("weighing_mode", ""),
+                                                                 r.get("weighing_mode", ""))))
+
+    def on_weighing_rule_double_click(self, event):
+        """双击条件称样规则单元格就地编辑（称样方式列用 Combobox，其余用 Entry）"""
+        sel = self.wr_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        column_index = int(self.wr_tree.identify_column(event.x).replace('#', '')) - 1
+        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "weighing_mode"}.get(column_index)
+        if col_key is None:  # 序号列或越界
+            return
+        current_values = self.wr_tree.item(item, 'values')
+        current_value = current_values[column_index]
+        x, y, width, height = self.wr_tree.bbox(item, self.wr_tree.identify_column(event.x))
+
+        if col_key == "weighing_mode":
+            combo = ttk.Combobox(self.wr_tree, values=[lbl for _, lbl in self._WEIGHING_MODE_OPTIONS],
+                                 state="readonly")
+            combo.place(x=x, y=y - 4, width=width, height=height + 8)
+            combo.set(current_value)
+            combo.focus_set()
+
+            def save_mode(event=None):
+                if not combo.winfo_exists():
+                    return
+                lbl = combo.get()
+                code = self._MODE_BY_LABEL.get(lbl, "")
+                if code:
+                    new_values = list(current_values)
+                    new_values[column_index] = lbl
+                    self.wr_tree.item(item, values=new_values)
+                    idx = int(item) - 1
+                    if 0 <= idx < len(self.weighing_rules):
+                        self.weighing_rules[idx]["weighing_mode"] = code
+                        self.app.mark_modified()
+                combo.destroy()
+
+            def cancel_mode(event=None):
+                if combo.winfo_exists():
+                    combo.destroy()
+
+            combo.bind("<<ComboboxSelected>>", save_mode)
+            combo.bind("<FocusOut>", save_mode)
+            combo.bind("<Escape>", cancel_mode)
+            return
+
+        entry = ttk.Entry(self.wr_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.wr_tree.item(item, values=new_values)
+            idx = int(item) - 1
+            if 0 <= idx < len(self.weighing_rules):
+                self.weighing_rules[idx][col_key] = new_value
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
+
     def get_rules_and_params(self):
         """获取处理规则和称样量参数"""
         # 非平行样标记后缀：逗号分隔(中英文) → 大写字母列表
@@ -1569,7 +1785,9 @@ class WeighingTab:
             "conversion_factor": self.conversion_factor.get(),
             "result_decimal_places": self.result_decimal_places.get(),
             "weighing_mode": self.weighing_mode.get(),
-            "non_parallel_suffixes": non_par
+            "non_parallel_suffixes": non_par,
+            "weighing_share_group": self.weighing_share_group.get().strip(),
+            "weighing_rules": self.weighing_rules
         }
 
         return {
@@ -1590,6 +1808,11 @@ class WeighingTab:
         self.result_decimal_places.set(weighing_params.get("result_decimal_places", ""))
         self.non_parallel_suffixes.set(
             ", ".join(str(s).strip().upper() for s in (weighing_params.get("non_parallel_suffixes") or [])))
+        self.weighing_share_group.set(weighing_params.get("weighing_share_group", ""))
+
+        # 条件称样规则
+        self.weighing_rules = list(weighing_params.get("weighing_rules") or [])
+        self.refresh_weighing_rules_tree()
 
         # 设置称样量模式
         saved_weighing_mode = weighing_params.get("weighing_mode", "random")

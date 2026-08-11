@@ -621,6 +621,12 @@ class ChemicalReportAnalyzer:
                 compound = parts[0]
 
                 # 查找浓度值（通常在最后一列或倒数第二列）
+                # ponytail: 检出项的数值与单位常被单空格切成两 token("0.21 mg/L")，
+                # 先合并末尾 数值+单位，否则逐 token 正则匹配不到、整行被当未检出丢弃(如 DEHP-149)。
+                if (len(parts) >= 2
+                        and re.match(r'^(mg/L|μg/mL|ng/ml)$', parts[-1], re.IGNORECASE)
+                        and re.match(r'^-?\d+(\.\d+)?$', parts[-2])):
+                    parts = parts[:-2] + [parts[-2] + ' ' + parts[-1]]
                 concentration = None
                 for part in parts[-3:]:  # 检查最后三列
                     if 'N.D.' in part:
@@ -675,7 +681,12 @@ class ChemicalReportAnalyzer:
             if len(parts) >= 5:
                 # 第一列是化合物名称，最后一列是浓度
                 compound = parts[0]
+                # ponytail: 检出项数值与单位常被单空格切成两 token("0.21 mg/L")，
+                # parts[-1] 会取到单位"mg/L"(无数值)→正则失配→该化合物被丢(如 DEHP-149)。
                 concentration = parts[-1]
+                if (re.match(r'^(mg/L|μg/mL|ng/ml)$', concentration, re.IGNORECASE)
+                        and re.match(r'^-?\d+(\.\d+)?$', parts[-2])):
+                    concentration = parts[-2] + ' ' + concentration
 
                 # 处理特殊情况：如果化合物名称包含逗号，可能需要合并
                 if ',' in compound and len(parts) > 5:
@@ -1724,6 +1735,18 @@ if __name__ == "__main__":
     assert filter_samples_by_code([('TS26072901001-10X', {})], 'TS26072901001') == [('TS26072901001-10X', {})]
     assert _split_content_dilution('TS26072901001-10X') == ('TS26072901001', 10.0)
     assert _split_content_dilution('TS26080100001A') == ('TS26080100001A', 1.0)
+    # ponytail: 自检——外标法检出项的数值与单位被单空格切成两 token("0.21 mg/L")，
+    # 合并后才匹配数字+单位正则；N.D. 行不受影响。两条提取路径同根因同修。
+    _pa = _HeadlessReportAnalyzer()
+    _ext = ("类型 样品 名称 TN26080385\n样品色谱图\n"
+            "名称 RT 响应 离子对 最终浓度单位\n"
+            "DBP-149 5.737 936 223.0 N.D.\n"
+            "DEHP-149 6.967 109688 149.0 0.21 mg/L\n")
+    _cext = _pa.extract_from_external_standard(_ext)
+    _ctxt, _ = _pa.extract_from_text(_ext)
+    assert _cext.get('DEHP-149') == '0.21 mg/L', _cext
+    assert _ctxt.get('DEHP-149') == '0.21 mg/L', _ctxt
+    assert _cext.get('DBP-149') == 'N.D.' and _ctxt.get('DBP-149') == 'N.D.', (_cext, _ctxt)
     # ponytail: 自检——ICP 样品初始质量提取(三份报告存在时；不存在则跳过)
     import glob as _glob, os as _os
 
