@@ -1,10 +1,16 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/TDI/称量记录1.xlsx
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/MDI/称量记录1.xlsx
+  method_file: D:/Agent/lims数据登记/methods/MDI.mtd
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/MDI
+  temperature: '23'
+  humidity: '56'
+- id: 2
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/TDI/称量记录1.xlsx
   method_file: D:/Agent/lims数据登记/methods/TDI.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/TDI
-  temperature: '22'
-  humidity: '55'
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/TDI
+  temperature: '23'
+  humidity: '56'
 column_widths:
 - 50
 - 260

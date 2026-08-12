@@ -1129,6 +1129,7 @@ class WeighingTab:
             "weighing_mode": "random",
             "non_parallel_suffixes": [],
             "weighing_share_group": "",
+            "counterpart": "",
             "single_weighing": False,
             "writeback_excel": False
         }
@@ -1188,13 +1189,17 @@ class WeighingTab:
         ttk.Label(sf, text="共享组名:").pack(side='left', padx=(0, 5))
         self.weighing_share_group = tk.StringVar(value="")
         ttk.Entry(sf, textvariable=self.weighing_share_group, width=24).pack(side='left', padx=(0, 8))
+        # 跨序列共享：填对应项目名时，跨序列从 LIMS 已登记对应方法回读称样量(方法标准号运行时现读，不填)
+        cf = ttk.Frame(share_frame)
+        cf.pack(fill='x', pady=(4, 0))
+        ttk.Label(cf, text="对应项目:").pack(side='left', padx=(0, 3))
+        self.counterpart_project = tk.StringVar(value="")
+        ttk.Entry(cf, textvariable=self.counterpart_project, width=30).pack(side='left')
 
-        # 创建内容区域 - 所有模式的内容都显示
-        self.weighing_content_frame = ttk.Frame(weighing_frame)
-        self.weighing_content_frame.pack(fill='both', expand=True, padx=5, pady=5)
-
+        # 创建内容区域 - 随机数模式 + 处理模式直接挂在外层 weighing_frame（都不撑满，
+        # 可折叠收起时下方模块真正上移）
         # 创建所有模式的内容区域
-        self.create_all_weighing_modes()
+        self.create_all_weighing_modes(weighing_frame)
 
         # 条件称样规则表（初始隐藏，仅 conditional 时显示）
         self.create_weighing_rules_section(weighing_frame)
@@ -1202,12 +1207,43 @@ class WeighingTab:
         # 初始状态设置
         self.on_weighing_mode_change()
 
-    def create_all_weighing_modes(self):
-        """创建所有称样量模式的内容区域"""
-        content_frame = self.weighing_content_frame
+    def _make_collapsible(self, parent, title, expanded=True):
+        """建一个标题可点击折叠/展开的区块：
+        容器内顶部一个 ▼/▶ 标题 Label，下方一个 Labelframe(含 body)。
+        收起时整个 labelframe pack_forget——只留标题一行，下方真正上移。
+        （ttkb.Labelframe forget 内部 body 后自身不收缩，故必须整体 forget labelframe。）
+        返回 (container, body)：container 是整个区块(含标题+labelframe)，子控件 pack 进 body。"""
+        container = ttk.Frame(parent)
+        container.pack(fill='x', pady=5)
+        # 标题行（始终可见，点击切换）
+        toggle_lbl = ttkb.Label(container, text=f"{'▼' if expanded else '▶'} {title}",
+                                bootstyle="secondary", cursor="hand2")
+        toggle_lbl.pack(anchor='w')
+        # 内容 labelframe
+        labelframe = ttkb.Labelframe(container)
+        if expanded:
+            labelframe.pack(fill='x')
+        body = ttk.Frame(labelframe)
+        body.pack(fill='x', padx=5, pady=5)
+        state = {"expanded": expanded}
 
+        def _toggle(_e=None):
+            if state["expanded"]:
+                labelframe.pack_forget()
+                toggle_lbl.configure(text=f"▶ {title}")
+                state["expanded"] = False
+            else:
+                labelframe.pack(fill='x')
+                toggle_lbl.configure(text=f"▼ {title}")
+                state["expanded"] = True
+
+        toggle_lbl.bind('<Button-1>', _toggle)
+        return container, body
+
+    def create_all_weighing_modes(self, parent):
+        """创建所有称样量模式的内容区域"""
         # 随机数生成模式
-        self.random_frame = ttk.LabelFrame(content_frame, text="随机数生成模式", padding=5)
+        self.random_frame = ttk.LabelFrame(parent, text="随机数生成模式", padding=5)
         self.random_frame.pack(fill='x', pady=5)
 
         # 参数设置区域
@@ -1240,12 +1276,11 @@ class WeighingTab:
         ttk.Checkbutton(decimal_frame, text=" 回写称量记录Excel",
                         variable=self.writeback_excel, style=self.app.large_cb_style).pack(side='left', padx=(10, 0))
 
-        # 称量记录处理模式
-        self.process_frame = ttk.LabelFrame(content_frame, text="称量记录处理模式", padding=5)
-        self.process_frame.pack(fill='both', expand=True, pady=5)
+        # 称量记录处理模式（标题可点击折叠/展开）
+        self.process_frame, process_body = self._make_collapsible(parent, "称量记录处理模式", expanded=True)
 
         # 处理规则配置区域 - 使用grid布局
-        config_frame = ttk.Frame(self.process_frame)
+        config_frame = ttk.Frame(process_body)
         config_frame.pack(fill='x', pady=5)
 
         # 配置列的权重，使添加按钮可以右对齐
@@ -1295,7 +1330,7 @@ class WeighingTab:
         self.show_processing_params()
 
         # 处理规则列表
-        rules_list_frame = ttk.Frame(self.process_frame)
+        rules_list_frame = ttk.Frame(process_body)
         rules_list_frame.pack(fill='both', expand=True, pady=5)
 
         columns = ("检测方法", "处理类型", "换算因子", "结果小数位数")
@@ -1325,7 +1360,7 @@ class WeighingTab:
         self.processing_rules_tree.bind("<Double-1>", self.on_processing_rule_double_click)
 
         # 处理规则操作按钮 - 只保留删除按钮，移除执行处理按钮
-        rules_button_frame = ttk.Frame(self.process_frame)
+        rules_button_frame = ttk.Frame(process_body)
         rules_button_frame.pack(fill='x', pady=2)
 
         self.delete_processing_rule_btn = ttkb.Button(rules_button_frame, text="删除选中",
@@ -1424,7 +1459,7 @@ class WeighingTab:
         # 条件称样规则表：仅 conditional 时显示
         self.weighing_rules_frame.pack_forget()
         if mode == "conditional":
-            self.weighing_rules_frame.pack(fill='both', expand=True, pady=5)
+            self.weighing_rules_frame.pack(fill='x', pady=5)  # 不 expand：与可折叠助手一致，收起释放空间
         if mode == "record":
             # 称量记录模式 - 两个区域都禁用
             self.set_frame_state(self.random_frame, "disabled")
@@ -1607,10 +1642,9 @@ class WeighingTab:
     def create_weighing_rules_section(self, parent):
         """条件称样规则表（仅 weighing_mode=conditional 时显示）：
         按 文件名/项目名/试样描述 关键词命中 → 用对应称样方式。首条命中即用，末条留空三条件=默认方式。"""
-        self.weighing_rules_frame = ttk.LabelFrame(
-            parent, text="条件称样规则", padding=5)
-        # 初始不 pack，由 on_weighing_mode_change 控制显隐
-        wr_input = ttk.Frame(self.weighing_rules_frame)
+        # 标题可点击折叠/展开；初始 pack 由助手完成，on_weighing_mode_change 控制整体显隐
+        self.weighing_rules_frame, wr_body = self._make_collapsible(parent, "条件称样规则", expanded=True)
+        wr_input = ttk.Frame(wr_body)
         wr_input.pack(fill='x', pady=2)
         ttk.Label(wr_input, text="文件名:").pack(side='left', padx=(0, 3))
         self.wr_filename_var = tk.StringVar()
@@ -1628,7 +1662,7 @@ class WeighingTab:
                      state="readonly", width=12).pack(side='left', padx=(0, 6))
         ttkb.Button(wr_input, text="添加", command=self.add_weighing_rule, bootstyle="secondary").pack(side='left')
         # 表格
-        wr_list = ttk.Frame(self.weighing_rules_frame)
+        wr_list = ttk.Frame(wr_body)
         wr_list.pack(fill='both', expand=True, pady=3)
         wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式")
         self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=3)
@@ -1645,7 +1679,7 @@ class WeighingTab:
         self.wr_tree.configure(yscrollcommand=wr_scroll.set)
         self.wr_tree.bind("<Double-1>", self.on_weighing_rule_double_click)
         # 操作按钮
-        wr_btn = ttk.Frame(self.weighing_rules_frame)
+        wr_btn = ttk.Frame(wr_body)
         wr_btn.pack(fill='x', pady=2)
         ttkb.Button(wr_btn, text="删除选中", command=self.delete_weighing_rule, bootstyle="danger").pack(side='left', padx=2)
         ttkb.Button(wr_btn, text="上移", command=lambda: self.move_weighing_rule(-1), bootstyle="secondary").pack(side='left', padx=2)
@@ -1796,6 +1830,7 @@ class WeighingTab:
             "weighing_mode": self.weighing_mode.get(),
             "non_parallel_suffixes": non_par,
             "weighing_share_group": self.weighing_share_group.get().strip(),
+            "counterpart": self.counterpart_project.get().strip(),
             "single_weighing": self.single_weighing.get(),
             "writeback_excel": self.writeback_excel.get(),
             "weighing_rules": self.weighing_rules
@@ -1820,6 +1855,7 @@ class WeighingTab:
         self.non_parallel_suffixes.set(
             ", ".join(str(s).strip().upper() for s in (weighing_params.get("non_parallel_suffixes") or [])))
         self.weighing_share_group.set(weighing_params.get("weighing_share_group", ""))
+        self.counterpart_project.set(weighing_params.get("counterpart") or "")
         self.single_weighing.set(bool(weighing_params.get("single_weighing", False)))
         self.writeback_excel.set(bool(weighing_params.get("writeback_excel", False)))
 

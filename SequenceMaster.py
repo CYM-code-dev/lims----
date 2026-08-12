@@ -22,7 +22,7 @@ from PIL import Image, ImageTk
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from login import MultiUserLoginSystem
 from method_file import load_method
-from detection_entry_api import DetectionAPI, build_grouped_experiment_data, _Box, _norm_cn
+from detection_entry_api import DetectionAPI, build_grouped_experiment_data, _Box, _norm_cn, _detection_no_of
 
 
 # ==================== 节假日/工作日（法定假日+调休，数据源：标准品服务器 10.1.93.25:5000）====================
@@ -245,6 +245,11 @@ _WEIGHING_COL_KEYS = ("isWeighing", "称量记录", "isWeighingRecord", "weighin
 _WEIGHING_TRUE = ("是", "1", "true", "True", "yes", "Y")
 
 
+class _AbortRun(Exception):
+    """用户中止序列：worker 内部函数(如 _submit_batch)经 _check_abort 抛出，
+    由 _run_worker 主循环捕获转为 'abort'，跳出深层调用栈、立即结束本行。"""
+
+
 def _find_weighing_column(dynamic_columns):
     """返回标记为称量记录(称样量)的动态列对象；按方法表头属性「称量记录=是」识别。
     兼容中英文键名；未找到返回 None。"""
@@ -347,9 +352,11 @@ def _match_sample_report_pdfs(spectrum_path, sample_code, method_hint=""):
     # 词干须精确等同报验编号(非前缀)：避免误并同报验编号其它小号样品(如 TS...893012)的报告。
     stripped = _strip_parallel_suffix(sample_code).lower()
     if stripped and stripped != sc:
+        # 词干须精确等同报验编号(非前缀)：避免误并同报验编号其它小号样品(如 TS...893012)的报告。
+        # 兼容材质/平行字母后缀(如 TN…K.pdf / TN…AK.pdf)：去尾字母后按基编号比较。
         pdfs += [p for p in _all_pdfs
                  if p not in pdfs
-                 and os.path.splitext(os.path.basename(p))[0].lower() == stripped]
+                 and _base_and_letter(os.path.splitext(os.path.basename(p))[0])[0].lower() == stripped]
     if not pdfs:  # 文件名前缀全 miss -> 按 PDF 内容 `样品 :` 字段关联(支持 文件名≠内容id 的 PAHS 报告)
         sc_stripped = _strip_parallel_suffix(sample_code).strip()
         for p in _all_pdfs:
@@ -2030,10 +2037,14 @@ class SequenceMaster:
         self.create_table_container(main_frame)
 
         # 运行日志区（阶段1）：标题可点击折叠/展开
-        log_frame = ttkb.Labelframe(main_frame)
-        log_frame.pack(fill='both', expand=False, pady=(5, 0))
-        toggle_lbl = ttkb.Label(log_frame, text="▼ 运行日志", bootstyle="secondary", cursor="hand2")
-        log_frame.configure(labelwidget=toggle_lbl)
+        # 标题独立行 + 内容 labelframe；收起时整个 labelframe pack_forget（ttkb.Labelframe
+        # forget 内部内容后自身不收缩，故必须整体 forget 才能真正释放高度、窗口缩小）
+        log_container = ttkb.Frame(main_frame)
+        log_container.pack(fill='x', pady=(5, 0))
+        toggle_lbl = ttkb.Label(log_container, text="▼ 运行日志", bootstyle="secondary", cursor="hand2")
+        toggle_lbl.pack(anchor='w')
+        log_frame = ttkb.Labelframe(log_container)
+        log_frame.pack(fill='x')
 
         self.log_text = tk.Text(log_frame, height=7, wrap='word', state='disabled',
                                 bg="#f7f7f7", fg="#3e3f3a", relief="flat", bd=0,
@@ -2044,18 +2055,16 @@ class SequenceMaster:
         self.log_text.pack(side='left', fill='both', expand=True)
         log_scroll.pack(side='right', fill='y')
 
-        # 折叠/展开：点击标题切换 log_text 与滚动条的显隐
+        # 折叠/展开：点击标题切换整个内容 labelframe 的显隐
         self._log_expanded = True
 
         def _toggle_log(_e=None):
             if self._log_expanded:
-                self.log_text.pack_forget()
-                log_scroll.pack_forget()
+                log_frame.pack_forget()
                 toggle_lbl.configure(text="▶ 运行日志")
                 self._log_expanded = False
             else:
-                self.log_text.pack(side='left', fill='both', expand=True)
-                log_scroll.pack(side='right', fill='y')
+                log_frame.pack(fill='x')
                 toggle_lbl.configure(text="▼ 运行日志")
                 self._log_expanded = True
 
@@ -2583,6 +2592,49 @@ class SequenceMaster:
             return y.get("weighing_params") or {}
         except Exception:
             return {}
+
+    def _counterpart(self, wp):
+        """读 weighing_params.counterpart（跨序列对应项目名，字符串）；非空返回，否则 None。
+        跨序列共享称样量：对应方法已在 LIMS 登记时，回读其称样量塞 primary_cache。"""
+        p = str((wp or {}).get("counterpart") or "").strip()
+        return p or None
+
+    def _counterpart_weighing(self, sc, counterpart_project, log):
+        """跨序列共享：回读同报验编号已登记对应方法的称样量，返回 primary_cache 项或 None。
+        定位靠 projectName(唯一)；方法标准号从定位结果现读。称样列复用 _find_weighing_column(isWeighing=1)，
+        试样描述列复用 _find_column_by_name。records 为已登记记录(带 dynamic 已存值)。"""
+        raw = self.api.get_counterpart_experiment(sc, counterpart_project, log)
+        if not raw:
+            return None
+        dynamic_columns = raw.get("dynamic_columns") or []
+        records = raw.get("records") or []
+        mass_col = _find_weighing_column(dynamic_columns)
+        if not mass_col:
+            log(f"跨序列对应: {sc} 的「{counterpart_project}」未找到称量记录列(isWeighing=1)，落新生成")
+            return None
+        mass_code = mass_col.get("columeCode", "")
+        # 按 serialNumber 顺序取各平行称样量(已验证平行 serialNumber 1/2 值相同 2.0159)
+        def _serial(r):
+            try:
+                return int(r.get("serialNumber"))
+            except (TypeError, ValueError):
+                return 1
+        ordered = sorted(records, key=_serial)
+        masses = [str(r.get(mass_code) or "").strip() for r in ordered if str(r.get(mass_code) or "").strip()]
+        if not masses:
+            log(f"跨序列对应: {sc} 的「{counterpart_project}」称样列({mass_code})值全空，落新生成")
+            return None
+        # 试样描述列(与主流程同款定位)；取首个非空值
+        desc = ""
+        info_col = _find_column_by_name(dynamic_columns, "试样信息", "试样描述")
+        if info_col:
+            info_code = info_col.get("columeCode", "")
+            for r in ordered:
+                v = str(r.get(info_code) or "").strip()
+                if v:
+                    desc = v
+                    break
+        return {"masses": masses, "marker_masses": {}, "desc": desc}
 
     def _method_default_desc(self, method_file):
         """判定方法是否支持「无称样记录默认录入」并取默认试样信息/描述值。
@@ -3441,6 +3493,8 @@ class SequenceMaster:
             self._log(f"--- 第 {idx + 1}/{n} 行 ---")
             try:
                 outcome = self._run_one_row(idx, weighing_caches)
+            except _AbortRun:
+                outcome = "abort"  # _submit_batch 等深层调用经 _check_abort 抛出 → 中止本行
             except Exception as e:
                 self._ui_q.put(("status", (idx, "失败", str(e))))
                 self._log(f"[行{idx + 1}] 异常: {e}")
@@ -3457,6 +3511,13 @@ class SequenceMaster:
             self._ui_q.put(("status", (idx, "中止", "用户中止")))
             return True
         return False
+
+    def _check_abort(self, idx):
+        """worker 线程：检查中止标志，命中则抛 _AbortRun 让控制流立即跳出深层调用栈
+        （用于 _submit_batch 等无法用返回值表达 abort 的内部函数；由 _run_worker 主循环捕获转 'abort'）"""
+        if self._stop.is_set():
+            self._ui_q.put(("status", (idx, "中止", "用户中止")))
+            raise _AbortRun()
 
     def _run_one_row(self, idx, weighing_caches=None):
         """单行流水线（worker 线程内）。返回 'ok'/'skip'/'abort'/'fail'，失败自行 put status。
@@ -3555,6 +3616,7 @@ class SequenceMaster:
             "standard_rules": (row.get("_standard_rules") or _ops.get("standard_rules") or []),
             "defaults_no_record": defaults_no_record,
             "primary_cache": _pcache,  # {sample_code: {masses, desc}} 首项目(组分)生成后供依赖项目(总和)复用
+            "_share_group": _grp,  # 跨序列共享组名透传给 _submit_batch(它只收 ctx，看不到 _run_one_row 的 _grp)
             # 标「解析」的样品若稀释，自动启用稀释备注(无需方法勾选)；下游 dil_extra>1 仅稀释记录实际生成备注
             "dilution_remark_enabled": bool(_ops.get("dilution_remark_enabled")) or any(
                 ((wmap or {}).get(_sc) or {}).get("force_parse") for _sc, _ in samples),
@@ -3587,7 +3649,8 @@ class SequenceMaster:
         missing = [sc for sc in target_codes if sc not in projects_by_sample]
         if missing:
             t0 = time.time()
-            log(f"逐样品精确查询 {len(missing)} 个(并行, 窗口{window_days}天) ...")
+            _dnos = {_detection_no_of(c) for c in missing}
+            log(f"逐样品精确查询 {len(missing)} 个样品(去重后 {len(_dnos)} 个报验编号, 并行, 窗口{window_days}天) ...")
             fetched = self._query_samples_parallel(missing, log, days=window_days)
             for sc, plist in fetched.items():
                 projects_by_sample.setdefault(sc, []).extend(plist)
@@ -3622,6 +3685,7 @@ class SequenceMaster:
         all_pids = ",".join(str(it["project"].get("projectId")) for it in all_items
                             if it["project"].get("projectId"))
         if all_pids:
+            self._check_abort(idx)  # 收集项目完成、清空旧实验前：用户中止则不等 clear(网络请求)直接结束
             log("清空旧实验暂存与谱图 ...")
             self.api.clear_experiment_cache(all_pids, log)
 
@@ -3748,7 +3812,8 @@ class SequenceMaster:
         plan = _plan_submission_batches(rules, all_items)
 
         codes = []
-        for b in plan:
+        n_batches = len(plan)
+        for bi, b in enumerate(plan):
             if self._aborted(idx):
                 return "abort"
             sb = [it["sample_code"] for it in b["items"]]
@@ -3761,6 +3826,20 @@ class SequenceMaster:
                 log(f"未匹配切换规则（{len(sb)} 个样品）{dw} {eq_info}{lp_info}，用默认方法")
             ok, code = self._submit_batch(idx, row, b["items"], ctx, log, b["force_new"], b["switch_mid"], b.get("_lab_proc") or "")
             if not ok:
+                # 部分成功：本行多批，前面批已提交(有实验编号)，本批失败。记已成功编号 + 未成功批信息，
+                # 供运行报告给出"哪些成功、哪批没成功、为何失败"，避免重跑重复录入已成功批。
+                _fail_method = next((str((it.get("project") or {}).get("standardNo") or "").strip()
+                                     for it in b["items"] if (it.get("project") or {}).get("standardNo")), "")
+                _fail_reason = getattr(self, "_batch_fail_reason", "") or ""  # submit 失败带详细原因(超时/HTTP码)
+                _fail_code = getattr(self, "_batch_fail_code", "") or ""  # 失败批本地待提交编号(服务端可能未落库)
+                self._ui_q.put(("rowdata", (idx, {
+                    "partial_codes": list(codes),  # 本批之前已成功提交的实验编号
+                    "partial_failed": {"batch": f"第{bi + 1}/{n_batches}批",
+                                       "method": _fail_method,
+                                       "samples": sb,
+                                       "reason": _fail_reason,
+                                       "pending_code": _fail_code},  # 未成功的批次定位 + 原因 + 待提交编号
+                })))
                 return "fail"
             codes.append(code)
 
@@ -3805,7 +3884,7 @@ class SequenceMaster:
             # 复用同一过滤逻辑查 ALREADY 列表，命中则报"已登记"，避免误报"方法不在此样品中"。
             try:
                 _done = self.api.query_samples_by_conditions(
-                    sample_code=sample_code, exact_match=True, log_func=None, days=_days,
+                    sample_code=sample_code, exact_match=True, log_func=log, days=_days,
                     check_in_status="CHECK_IN_STATUS_ALREADY")
                 if _done:
                     _filt, _ferr2 = self._filter_projects_by_method(_done, row, lambda *a, **k: None)
@@ -3875,6 +3954,7 @@ class SequenceMaster:
                 sub = self.api.sub_method_map[str(method_id)]
                 actual_method_id = sub.get("sub_method_id")
                 self.api.update_method(sp_ids_str, actual_method_id, project_names, log)
+        self._check_abort(idx)  # 方法切换/取配置阶段边界：用户中止则立即跳出，不等 get_all_configs
         log("取全量配置 ...")
         all_cfg = self.api.get_all_configs(sp_ids_str, method_name, "", sample_id, log, method_id, project_names)
         if not all_cfg:
@@ -4045,6 +4125,15 @@ class SequenceMaster:
             eff = (it.get("_wmode") or "") if _cond else base_wmode  # 条件称样按样品命中；否则整批统一
             _eff_by_sample[sc] = eff
             samp = (ctx["wmap"] or {}).get(sc) or {}
+            # ponytail: 跨序列共享——运行级缓存未命中、对应方法已在 LIMS 登记时，回读称样量塞缓存，
+            # 现有下面的 rv 复用分支原样生效(免新写第二处分发)。
+            if ctx.get("_share_group") and sc not in primary_cache:
+                _cp = self._counterpart(ctx["wp"])  # 对应项目名(str)或 None
+                if _cp:
+                    _rb = self._counterpart_weighing(sc, _cp, log)
+                    if _rb:
+                        primary_cache[sc] = _rb
+                        log(f"称样量共享(跨序列): 样品 {sc} 从 LIMS 已登记的 {_cp} 读取 {_rb['masses']}")
             rv = primary_cache.get(sc)
             if rv:
                 pmasses_by_sample[sc] = list(rv["masses"])
@@ -4239,11 +4328,15 @@ class SequenceMaster:
             time.sleep(1.0 - (_now - _last) + 0.15)
         self._last_exp_submit_ts = time.time()
         _require_sign = bool((self._read_other_params(ctx.get("method_file") or "") or {}).get("require_signature"))
+        self._check_abort(idx)  # 提交前最后关口：配置都就绪，用户中止则不发起主提交(最重请求)立即跳出
         log(f"提交实验数据 ({'submitOcExperiment/提交签名' if _require_sign else 'saveOcExperiment/仅保存'}) ...")
-        ok, _ = self.api.submit_experiment_data(experiment_data, actual_method_name, log, require_signature=_require_sign)
+        ok, reason = self.api.submit_experiment_data(experiment_data, actual_method_name, log, require_signature=_require_sign)
         if not ok:
-            self._ui_q.put(("status", (idx, "失败", "实验数据提交失败")))
-            log("失败: submit_experiment_data 返回 False")
+            _why = reason or "实验数据提交失败"
+            self._batch_fail_reason = _why  # 供调用方循环把详细原因带进运行报告(如读超时/HTTP码/服务端拒绝)
+            self._batch_fail_code = experiment_code  # 失败批本地生成的待提交编号(服务端可能未落库,仅用于 LIMS 对照查找)
+            self._ui_q.put(("status", (idx, "失败", _why)))
+            log(f"失败: {_why}")
             return False, ""
 
         # 回读服务端真实实验编号 + experiment_id（对照 detection_entry_main:1730-1752）
@@ -4478,26 +4571,44 @@ class SequenceMaster:
         return pooled
 
     def _query_samples_parallel(self, sample_codes, log, max_workers=6, days=30):
-        """并行按样品编号精确查(I/O 密集、各样品独立)，返回 {sampleCode: [project...]}。
+        """并行按报验编号精确查(I/O 密集)，返回 {sampleCode: [project...]}。
         days: 受理日期窗口(天)，默认30；与方法池共用 date_window_days 配置，按方法文件收窄/放宽。
-        单样品异常不影响其余。worker 内静默，日志由调用方汇总。"""
+        单样品异常不影响其余。worker 内静默，日志由调用方汇总。
+
+        报验编号去重：精确查的服务端 keyword 本就是报验编号(_detection_no_of)，样品号=报验编号+小号，
+        同报验编号下多个样品会重复拉取同一份结果集。先按报验编号去重、每个唯一报验编号只查一次，
+        再把结果按 sampleCode 分发回各样品。请求数 = 唯一报验编号数 ≤ 样品数，从不会变多。
+
+        必须用 exact_match=True(精确模式)：模糊模式(exact_match=False)服务端检索语义不同，
+        会漏掉部分小号(实测同报验编号40样品只命中30)，导致落兜底再各查一次全量返回卡死。
+        精确模式 keyword=报验编号，早退条件 sampleCode==sample_code 因报验编号短于全码永不命中，
+        故必翻完全部分页、返回该报验编号所有小号全集。"""
         from concurrent.futures import ThreadPoolExecutor
         out = {}
         codes = [c for c in sample_codes if c]
         if not codes:
             return out
 
-        def _one(code):
-            try:
-                return code, self.api.query_samples_by_conditions(
-                    sample_code=code, exact_match=True, log_func=None, days=days) or []
-            except Exception:
-                return code, []  # ponytail: 单样品失败静默，调用方按空结果跳过
+        # 报验编号 -> [原始样品号, ...]，保序去重
+        codes_by_dno = {}
+        for c in codes:
+            codes_by_dno.setdefault(_detection_no_of(c), []).append(c)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:  # ponytail: 固定6线程，>50样品再调
-            for code, plist in ex.map(_one, codes):
-                if plist:
-                    out[code] = plist
+        def _one(dno):
+            try:
+                return dno, self.api.query_samples_by_conditions(
+                    sample_code=dno, exact_match=True, log_func=None, days=days) or []
+            except Exception:
+                return dno, []  # ponytail: 单报验编号失败静默，调用方按空结果跳过
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:  # ponytail: 固定6线程
+            for dno, plist in ex.map(_one, list(codes_by_dno)):
+                if not plist:
+                    continue
+                for code in codes_by_dno[dno]:
+                    matched = [p for p in plist if p.get("sampleCode") == code]
+                    if matched:
+                        out[code] = matched
         return out
 
     def _read_exclusion_rules(self, method_file):
@@ -5236,6 +5347,19 @@ class SequenceMaster:
                     _tag = f"[{_code}]" if _code else (f"[{_sp}]" if _sp else "")
                     _head = f"{_tag} " if _tag else ""
                     lines.append(f"  · 第{i + 1}行 {_head}{r.get('error_msg') or ''}")
+                    # 部分成功：多批提交中途失败，已成功批已落库(避免重跑重复录入)，未成功批需补录
+                    _pc = r.get("partial_codes") or []
+                    _pf = r.get("partial_failed")
+                    if _pc:
+                        lines.append(f"      ✓ 已成功 {len(_pc)} 批，实验编号：{' / '.join(_pc)}")
+                    if _pf:
+                        _m = f"（{_pf.get('method')}）" if _pf.get('method') else ""
+                        _why = f"：{_pf.get('reason')}" if _pf.get('reason') else ""
+                        lines.append(f"      ✗ {_pf.get('batch')} 未成功{_m}{_why}，样品：{', '.join(_pf.get('samples') or [])}")
+                        # 待提交编号：失败批本地已生成的编号，服务端可能未落库（超时≠未处理），仅用于 LIMS 对照查找
+                        _pc2 = _pf.get('pending_code')
+                        if _pc2:
+                            lines.append(f"        待提交编号：{_pc2}（未确认是否落库，请到 LIMS 核对）")
                     for sc, reason in r.get("skipped_list", []):
                         lines.append(f"      - {sc}：{reason}")
             self._append_log("失败明细：\n" + "\n".join(lines))

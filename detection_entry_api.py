@@ -648,12 +648,15 @@ class DetectionAPI:
             }
 
             endpoint = "submitOcExperiment" if require_signature else "saveOcExperiment"
+            # 提交签名(submitOcExperiment)服务端要推进工作流、比仅保存慢(实测 6-11s，偶有批次>30s 读超时)；
+            # 读超时给 90s 余量，连接超时维持 10s。仅保存(saveOcExperiment)维持 30s。
+            _timeout = (10, 90) if require_signature else 30
             response = self.login_system.session.post(
                 f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/{endpoint}",
                 json=experiment_data,
                 headers=headers,
                 verify=False,
-                timeout=30
+                timeout=_timeout
             )
 
             if response.status_code == 200:
@@ -665,21 +668,21 @@ class DetectionAPI:
                         error_msg = result.get('errorCtx', {}).get('errorMsg', '未知错误')
                         if log_func:
                             log_func(f"提交实验数据失败: {error_msg}, 项目: {project_name}")
-                        return False, None
+                        return False, f"服务端拒绝: {error_msg}"
                 except json.JSONDecodeError:
                     if log_func:
                         log_func(f"提交实验数据失败: 响应不是有效的JSON格式")
-                    return False, None
+                    return False, "响应不是有效的JSON格式"
             else:
                 if log_func:
                     _body = (response.text or "")[:500]
                     log_func(f"提交实验数据失败: HTTP {response.status_code}, 响应: {_body}, 项目: {project_name}")
-                return False, None
+                return False, f"HTTP {response.status_code}"
 
         except Exception as e:
             if log_func:
                 log_func(f"提交实验数据异常: {str(e)}, 项目: {project_name}")
-            return False, None
+            return False, f"异常: {type(e).__name__}: {str(e)[:120]}"
 
     def extract_experiment_code(self, result_data, local_code):
         """从提交响应里递归找服务端真实实验编号（与 local_code 同前缀、同长度、后段为数字）；
@@ -1304,6 +1307,50 @@ class DetectionAPI:
         except Exception as e:
             return {}
 
+    def get_counterpart_experiment(self, sample_code, counterpart_project, log_func=None):
+        """跨序列共享称样量：定位同报验编号已登记的「对应方法」实验，回读其称样量。
+        counterpart_project = 对应项目名(编辑器 weighing_params.counterpart 填的)。
+        流程：查该样品已登记项目(CHECK_IN_STATUS_ALREADY) → projectName 精确匹配定位对应方法那一条
+        (projectName 唯一；不用标准号超集定位) → get_all_configs 取其实验记录+动态列元数据。
+        返回 {"dynamic_columns":[...], "records":[...], "project_name":"..."} 或 None。
+        None 含义：对应方法未登记/未找到/取配置失败 → 调用方落新生成。"""
+        try:
+            cp = _norm_cn(counterpart_project)
+            if not cp:
+                return None
+            # 精确查该报验编号的已登记项目(同主流程精确匹配)
+            projects = self.query_samples_by_conditions(
+                sample_code=sample_code, exact_match=True,
+                check_in_status="CHECK_IN_STATUS_ALREADY", log_func=log_func,
+            ) or []
+            located = next(
+                (p for p in projects if _norm_cn(p.get("projectName") or "") == cp), None
+            )
+            if not located:
+                if log_func:
+                    log_func(f"跨序列对应: {sample_code} 的已登记项目中无「{counterpart_project}」")
+                return None
+            pid = located.get("projectId")
+            if not pid:
+                return None
+            standard_no = located.get("standardNo") or ""  # 从定位结果现读(跟主流程 projects[0].standardNo 一致)
+            method_id = located.get("decideProjectMethodId")
+            # get_all_configs 协调子方法切换+实验记录+动态列元数据(含 isWeighing)；抛异常时落 None
+            cfg = self.get_all_configs(str(pid), standard_no, "", "", log_func, method_id, [])
+            experiment = (cfg or {}).get("experiment") or {}
+            records = experiment.get("ocAnalysisRecordList") or []
+            dynamic_columns = (cfg or {}).get("dynamic_columns") or []
+            if not records or not dynamic_columns:
+                if log_func:
+                    log_func(f"跨序列对应: {sample_code} 的「{counterpart_project}」取到空记录/空列")
+                return None
+            return {"dynamic_columns": dynamic_columns, "records": records,
+                    "project_name": located.get("projectName") or ""}
+        except Exception as e:
+            if log_func:
+                log_func(f"get_counterpart_experiment 异常: {type(e).__name__}: {str(e)[:200]}")
+            return None
+
     def get_oc_compare_show_data(self, sample_code, items, log_func=None):
         """读取"对比展示"数据：给定样品号 + 组分项目名列表(items)，返回各组分已录入实验记录
         (含 projectName/reportValue/calculatedValue/serialNumber/sampleCode …)。
@@ -1442,7 +1489,10 @@ class DetectionAPI:
                             all_projects.append(project_data)
 
                         # 精确匹配模式：找到完全匹配的样品后立即返回
-                        if exact_match and sample_code:
+                        # 早退仅当 sample_code 是完整样品号(含小号)时安全：
+                        # 报验编号级 sample_code(如 dedup 传报验编号)会命中 smallNo 为空的
+                        # 残留记录(sampleCode 恰为报验编号)而误早退，丢弃该报验编号下其余小号。
+                        if exact_match and sample_code and sample_code != _detection_no_of(sample_code):
                             matched_projects = [p for p in all_projects if p.get('sampleCode') == sample_code]
                             if matched_projects:
                                 return matched_projects
@@ -1482,7 +1532,8 @@ class DetectionAPI:
             r = sess.get(url, params=params, headers=headers, verify=False, timeout=60)
             if r.status_code != 200:
                 return False
-            return bool((r.json().get('resultData') or {}).get('voList'))
+            _vl = (r.json().get('resultData') or {}).get('voList') or []
+            return bool(_vl)
 
         try:
             # 1) 项目已登记：重查录入端点，checkInStatus 用 ALREADY(非 YES——抓包确认已登记列表页用此枚举)
