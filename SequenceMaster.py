@@ -408,13 +408,20 @@ def _gen_random_mass(wp):
     return f"{random.uniform(lo, hi):.{dp}f}"
 
 
-def _random_masses(recorded, n_par, prule, wp, mdp):
+def _random_masses(recorded, n_par, prule, wp, mdp, single=False):
     """random 称样量：记录值不少于本样品平行数(n_par)则用记录(按 prule 换算或按 mdp 格式化)，
-    否则随机生成。平行数取本样品的，混批下不因他样多平行而丢弃本样记录值。"""
+    否则随机生成。平行数取本样品的，混批下不因他样多平行而丢弃本样记录值。
+    single=单称样多次进样(如 TDI 称1次进样2次)：记录不足平行数时复用末值，不丢弃真实称样量去随机生成。"""
+    def _clamp(i):
+        return recorded[i] if i < len(recorded) else recorded[-1]
     if recorded and len(recorded) >= n_par:
         if prule:
             return [_apply_processing(recorded[i], prule, wp) for i in range(n_par)]
         return [f"{float(recorded[i]):.{mdp}f}" for i in range(n_par)]
+    if single and recorded:  # 单称样：复用唯一称样量补齐各平行槽
+        if prule:
+            return [_apply_processing(_clamp(i), prule, wp) for i in range(n_par)]
+        return [f"{float(_clamp(i)):.{mdp}f}" for i in range(n_par)]
     return [_gen_random_mass(wp) for _ in range(n_par)]
 
 
@@ -817,10 +824,12 @@ def _merge_parallel_groups(wmap, non_parallel_suffixes=()):
         if not g["marker"] and len(par_codes) == 1:
             out[par_codes[0]] = wmap[par_codes[0]]  # 普通样品原样
             continue
-        masses = []
+        masses, cells = [], []
         for c in par_codes:
-            masses.extend((wmap[c] or {}).get("masses") or [])
-        entry = {"masses": masses, "time": g["time"], "desc": g["desc"]}
+            src = wmap[c] or {}
+            masses.extend(src.get("masses") or [])
+            cells.extend(src.get("cells") or [])
+        entry = {"masses": masses, "cells": cells, "time": g["time"], "desc": g["desc"]}
         if any((wmap[c] or {}).get("force_parse") for c in par_codes):
             entry["force_parse"] = True  # E列「解析」标记随平行合并保留(任一平行行标即生效)
         if g["marker"]:
@@ -960,20 +969,23 @@ def _read_weighing_records(path):
     time_col, desc_col = find("称样时间", 0), find("试样描述", 3)
     parse_col = find("解析", 4)  # E列：强制解析标记
     m = {}
-    for r in rows[1:]:
+    for _ri, r in enumerate(rows[1:], 1):
         if not r:
             continue
         code = r[code_col] if code_col < len(r) else None
         if code is None or str(code).strip() == "":
             continue
-        entry = m.setdefault(str(code).strip(), {"masses": [], "time": None, "desc": ""})
+        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "time": None, "desc": ""})
         # 称样量可能为空(random 模式称样量随机生成，excel 仅记录编号/试样描述)；有值才追加
         mass = r[mass_col] if mass_col < len(r) else None
+        added = False
         if mass is not None:
             try:
                 entry["masses"].append(float(mass))
+                added = True
             except (TypeError, ValueError):
                 pass
+        entry["cells"].append((_ri + 1, not added))  # 回写用：(1-based表行号, 该格是否空)
         if entry["time"] is None:
             entry["time"] = _parse_weigh_time(r[time_col] if time_col < len(r) else None)
         if not entry["desc"]:
@@ -984,6 +996,47 @@ def _read_weighing_records(path):
             if pv is not None and str(pv).strip():
                 entry["force_parse"] = True
     return m, None
+
+
+def _writeback_weighing_excel(path, pmasses_by_sample, eff_by_sample, wmap, log):
+    """random 模式生成的称样量回写到称量记录 Excel 的空格(称样量列为空的行)。
+    仅 .xlsx/.xlsm(openpyxl 可写)，CSV/XLS 跳过；按读入时记下的 cells[slot]=(1-based表行号, 该格是否空)
+    对齐平行槽，只填空格、不覆盖已有称样量。全程失败仅 log，不影响 LIMS 提交。"""
+    path = (path or "").strip()
+    if not path:
+        return
+    if not str(path).lower().endswith((".xlsx", ".xlsm")):
+        log(f"称量记录回写: 跳过(仅支持 xlsx/xlsm，当前 {os.path.basename(path)})")
+        return
+    try:
+        wb = openpyxl.load_workbook(path)
+        ws = wb[wb.sheetnames[0]]
+        header = [str(c.value or "").strip() for c in ws[1]]
+
+        def _find(key, default):
+            for i, h in enumerate(header):
+                if key in h:
+                    return i
+            return default
+
+        mass_col = _find("称样量", 2) + 1  # openpyxl 1-based，与读取同列
+        wrote = 0
+        for sc, pm in (pmasses_by_sample or {}).items():
+            if eff_by_sample.get(sc) != "random" or not pm:
+                continue
+            cells = ((wmap or {}).get(sc) or {}).get("cells") or []
+            for slot, val in enumerate(pm):
+                if slot < len(cells) and cells[slot][1]:  # 仅空格
+                    try:
+                        ws.cell(row=cells[slot][0], column=mass_col, value=float(val))
+                        wrote += 1
+                    except (TypeError, ValueError):
+                        pass
+        wb.save(path)
+        if wrote:
+            log(f"称量记录回写: 已回填 {wrote} 个称样量到 {os.path.basename(path)}")
+    except Exception as e:
+        log(f"称量记录回写: 失败({e})")
 
 
 def _find_column_by_name(dynamic_columns, *substrs):
@@ -1124,8 +1177,8 @@ def _apply_processing(raw, rule, wp):
     """按处理规则把原始称样量(float)转为提交字符串。
     type ∈ 直接读取/小数位补充/换算处理/换算加补充；
     换算处理=raw×factor 修约到 rule.decimal_places；
-    换算加补充=base=round(raw×factor,decimal_places) 后末尾补2位随机[01,49]
-      (pad<50 不进位，修约回 decimal_places 位仍=base)，总小数位=decimal_places+2；
+    换算加补充=base=round(raw×factor,decimal_places-2) 后末2位补随机[01,49]
+      (pad<50 不进位，修约回 decimal_places-2 位仍=base)，总小数位=decimal_places(=结果小数位数)；
     小数位补充用 wp.decimal_places。"""
     rtype = (rule or {}).get("type") or "直接读取"
     if rtype in ("换算处理", "换算加补充"):
@@ -1137,10 +1190,10 @@ def _apply_processing(raw, rule, wp):
             n = int((rule or {}).get("decimal_places") or 2)
         except (TypeError, ValueError):
             n = 2
-        if rtype == "换算加补充":
-            base = round(float(raw) * factor, n)
-            pad = random.randint(1, 49)  # ponytail: 01-49(<50不进位) 保证修约回 n 位=base
-            return f"{base:.{n}f}{pad:02d}"
+        if rtype == "换算加补充" and n >= 2:
+            base = round(float(raw) * factor, n - 2)
+            pad = random.randint(1, 49)  # ponytail: 末2位随机[01,49]<50，修约回 n-2 位仍=base；结果共 n 位
+            return f"{base + pad / (10 ** n):.{n}f}"
         return f"{float(raw) * factor:.{n}f}"
     if rtype == "小数位补充":
         try:
@@ -3982,6 +4035,7 @@ class SequenceMaster:
                       _pname_filter.get(it["project"].get("projectName", ""), "")
                       for it in batch_items}
         pmasses_by_sample, marker_masses_by_sample, desc_by_sample = {}, {}, {}
+        _eff_by_sample = {}  # 样品→称样方式(回写仅对 random 生效)
         _sp = (row.get("spectrum_path") or "").strip()
 
         for it in batch_items:
@@ -3989,6 +4043,7 @@ class SequenceMaster:
             if sc in pmasses_by_sample:
                 continue
             eff = (it.get("_wmode") or "") if _cond else base_wmode  # 条件称样按样品命中；否则整批统一
+            _eff_by_sample[sc] = eff
             samp = (ctx["wmap"] or {}).get(sc) or {}
             rv = primary_cache.get(sc)
             if rv:
@@ -4000,23 +4055,26 @@ class SequenceMaster:
             if eff == "random":
                 # 平行数取本样品的(与 record/process 一致)，混批下不因他样多平行而丢弃本样记录值
                 _n_par = _n_par_by_sample.get(sc, 1)
-                pmasses_by_sample[sc] = _random_masses(samp.get("masses") or [], _n_par, _prule, wp, _mdp)
+                pmasses_by_sample[sc] = _random_masses(samp.get("masses") or [], _n_par, _prule, wp, _mdp,
+                                                        single=bool(wp.get("single_weighing")))
                 desc_by_sample[sc] = samp.get("desc") or ""
             elif eff in ("record", "process"):
-                masses = samp.get("masses")
+                masses = samp.get("masses") or []
                 n_par = _n_par_by_sample.get(sc, 1)
-                if not masses or len(masses) < n_par:
-                    self._ui_q.put(("status", (idx, "失败", f"称量记录平行不足({len(masses or [])}/{n_par})")))
-                    log(f"失败: 样品 {sc} 称量记录仅 {len(masses or [])} 个平行，实验需 {n_par}")
+                _single = bool(wp.get("single_weighing"))  # 单称样多次进样：一个称样量复用于各平行槽
+                if not masses or (len(masses) < n_par and not _single):
+                    self._ui_q.put(("status", (idx, "失败", f"称量记录平行不足({len(masses)}/{n_par})")))
+                    log(f"失败: 样品 {sc} 称量记录仅 {len(masses)} 个平行，实验需 {n_par}")
                     return False, ""
+                _mi = lambda i: masses[i] if i < len(masses) else masses[-1]  # single 时复用末值补齐平行槽
                 raw_marker = samp.get("marker_masses") or {}
                 if eff == "record":
                     # 按方法 decimal_places 格式化，保留末尾0(0.552→0.5520)；不再用 %g 吞末尾0
-                    pmasses_by_sample[sc] = [f"{float(masses[i]):.{_mdp}f}" for i in range(n_par)]
+                    pmasses_by_sample[sc] = [f"{float(_mi(i)):.{_mdp}f}" for i in range(n_par)]
                     marker_masses_by_sample[sc] = {mk: [f"{float(v):.{_mdp}f}" for v in mv]
                                                    for mk, mv in raw_marker.items()}
                 else:
-                    pmasses_by_sample[sc] = [_apply_processing(masses[i], _prule, wp) for i in range(n_par)]
+                    pmasses_by_sample[sc] = [_apply_processing(_mi(i), _prule, wp) for i in range(n_par)]
                     marker_masses_by_sample[sc] = {mk: [_apply_processing(v, _prule, wp) for v in mv]
                                                    for mk, mv in raw_marker.items()}
                 desc_by_sample[sc] = samp.get("desc") or ""
@@ -4050,6 +4108,10 @@ class SequenceMaster:
             primary_cache[sc] = {"masses": list(pmasses_by_sample[sc]),
                                  "marker_masses": dict(marker_masses_by_sample.get(sc) or {}),
                                  "desc": desc_by_sample[sc]}
+
+        # random 模式回写称量记录 Excel(开关 wp.writeback_excel)：把生成的称样量回填到称样量空格
+        if wp.get("writeback_excel"):
+            _writeback_weighing_excel(row.get("weighing_path"), pmasses_by_sample, _eff_by_sample, ctx.get("wmap"), log)
 
         # 写入称量记录列(所有方式共用)；纯 none 模式不写称样列(保持原行为)
         _skip_mass = (base_wmode == "none" and not _cond)
@@ -5547,13 +5609,18 @@ def _selfcheck():
     # 称样量按 decimal_places 格式化，保留末尾0(0.552→0.5520)
     assert _apply_processing(0.552, {"type": "小数位补充"}, {"decimal_places": 4}) == "0.5520"
     assert f"{0.552:.4f}" == "0.5520"
-    # 换算加补充：base=round(raw×factor,dp) 后末尾补2位随机[01,49]，修约回 dp 位仍=base，末两位非00
+    # 换算加补充：base=round(raw×factor,dp-2) 后末2位补随机[01,49]，总小数位=dp(结果小数位数)，修约回 dp-2 位仍=base
     _r = _apply_processing(0.52, {"type": "换算加补充", "factor": 4, "decimal_places": 2}, {})
-    assert _r.startswith("2.08") and _r[-2:] != "00" and round(float(_r), 2) == 2.08, _r
-    assert len(_r.split(".")[1]) == 4  # 总小数位 = dp(2) + 补2位
-    for _ in range(200):  # pad 始终落在 01-49，修约回2位恒=2.08
+    assert len(_r.split(".")[1]) == 2 and _r[-2:] != "00" and round(float(_r), 0) == 2.0, _r
+    for _ in range(200):  # pad 始终落在 01-49，修约回 dp-2=0 位恒=2.0
         _rr = _apply_processing(0.52, {"type": "换算加补充", "factor": 4, "decimal_places": 2}, {})
-        assert 1 <= int(_rr[-2:]) <= 49 and round(float(_rr), 2) == 2.08, _rr
+        assert 1 <= int(_rr[-2:]) <= 49 and round(float(_rr), 0) == 2.0, _rr
+    # 回归 TDI 报告的 bug：dp=4 总4位(原为6)，base=round(0.57×4,2)=2.28，末2位随机，修约回2位=2.28
+    _t = _apply_processing(0.57, {"type": "换算加补充", "factor": 4, "decimal_places": 4}, {})
+    assert len(_t.split(".")[1]) == 4 and round(float(_t), 2) == 2.28 and _t.startswith("2.28"), _t
+    for _ in range(200):
+        _tt = _apply_processing(0.57, {"type": "换算加补充", "factor": 4, "decimal_places": 4}, {})
+        assert len(_tt.split(".")[1]) == 4 and 1 <= int(_tt[-2:]) <= 49 and round(float(_tt), 2) == 2.28, _tt
     # 换算处理 不受影响(仍 raw×factor 修约)
     assert _apply_processing(0.52, {"type": "换算处理", "factor": 4, "decimal_places": 2}, {}) == "2.08"
 

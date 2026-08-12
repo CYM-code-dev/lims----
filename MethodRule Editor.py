@@ -1128,7 +1128,9 @@ class WeighingTab:
             "result_decimal_places": "",
             "weighing_mode": "random",
             "non_parallel_suffixes": [],
-            "weighing_share_group": ""
+            "weighing_share_group": "",
+            "single_weighing": False,
+            "writeback_excel": False
         }
         self.create_tab()
 
@@ -1162,28 +1164,30 @@ class WeighingTab:
                         variable=self.weighing_mode, value="conditional",
                         command=self.on_weighing_mode_change, bootstyle="primary").pack(side='left', padx=10)
 
+        # 平行样合并 + 称样量共享组 左右并排
+        merge_share_row = ttk.Frame(weighing_frame)
+        merge_share_row.pack(fill='x', padx=5, pady=(0, 5))
         # 平行样合并设置：不并入平行样的标记后缀字母(如 M=基体加标)
-        parallel_frame = ttk.LabelFrame(weighing_frame, text="平行样合并", padding=5)
-        parallel_frame.pack(fill='x', padx=5, pady=(0, 5))
+        parallel_frame = ttk.LabelFrame(merge_share_row, text="平行样合并", padding=5)
+        parallel_frame.pack(side='left', fill='both', expand=True, padx=(0, 8))
         nps_input = ttk.Frame(parallel_frame)
         nps_input.pack(fill='x')
         ttk.Label(nps_input, text="非平行样标记后缀:").pack(side='left', padx=(0, 5))
         self.non_parallel_suffixes = tk.StringVar(value="")
         ttk.Entry(nps_input, textvariable=self.non_parallel_suffixes, width=16).pack(side='left', padx=(0, 8))
-        # 说明另起一行
-        ttk.Label(parallel_frame, text="这些后缀(如 M=基体加标)不计入平行样；其称样量用于谱图filter=该标记的项目，逗号分隔",
-                  foreground="gray").pack(fill='x', pady=(2, 0))
+        # 单称样多次进样：一个称样量复用于各平行槽(如 TDI 称1次进样2次，LIMS 多平行槽时不再报"称量记录平行不足")
+        self.single_weighing = tk.BooleanVar(value=False)
+        ttk.Checkbutton(parallel_frame, text=" 单称样多次进样",
+                        variable=self.single_weighing, style=self.app.large_cb_style).pack(fill='x', pady=(4, 0))
 
         # 称样量共享组：同名组的方法跨行共享称样缓存(同一样品首方法生成、后方法复用)
-        share_frame = ttk.LabelFrame(weighing_frame, text="称样量共享组", padding=5)
-        share_frame.pack(fill='x', padx=5, pady=(0, 5))
+        share_frame = ttk.LabelFrame(merge_share_row, text="称样量共享组", padding=5)
+        share_frame.pack(side='left', fill='both', expand=True)
         sf = ttk.Frame(share_frame)
         sf.pack(fill='x')
         ttk.Label(sf, text="共享组名:").pack(side='left', padx=(0, 5))
         self.weighing_share_group = tk.StringVar(value="")
         ttk.Entry(sf, textvariable=self.weighing_share_group, width=24).pack(side='left', padx=(0, 8))
-        ttk.Label(share_frame, text="相同组名的方法共享称样量：同一样品首方法生成、后方法复用；须同一次运行、生成方法在前",
-                  foreground="gray").pack(fill='x', pady=(2, 0))
 
         # 创建内容区域 - 所有模式的内容都显示
         self.weighing_content_frame = ttk.Frame(weighing_frame)
@@ -1230,6 +1234,11 @@ class WeighingTab:
         self.max_value = tk.StringVar(value="")
         self.max_entry = ttk.Entry(decimal_frame, textvariable=self.max_value, width=8)
         self.max_entry.pack(side='left', padx=(0, 5))  # 添加这行
+
+        # 回写称量记录Excel：random 模式生成的称样量回填到称样量空格（序列运行时），与小数位同行
+        self.writeback_excel = tk.BooleanVar(value=False)
+        ttk.Checkbutton(decimal_frame, text=" 回写称量记录Excel",
+                        variable=self.writeback_excel, style=self.app.large_cb_style).pack(side='left', padx=(10, 0))
 
         # 称量记录处理模式
         self.process_frame = ttk.LabelFrame(content_frame, text="称量记录处理模式", padding=5)
@@ -1290,7 +1299,7 @@ class WeighingTab:
         rules_list_frame.pack(fill='both', expand=True, pady=5)
 
         columns = ("检测方法", "处理类型", "换算因子", "结果小数位数")
-        self.processing_rules_tree = ttk.Treeview(rules_list_frame, columns=columns, show="headings", height=5)
+        self.processing_rules_tree = ttk.Treeview(rules_list_frame, columns=columns, show="headings", height=3)
 
         column_configs = {
             "检测方法": {"width": 150, "anchor": "w"},
@@ -1599,7 +1608,7 @@ class WeighingTab:
         """条件称样规则表（仅 weighing_mode=conditional 时显示）：
         按 文件名/项目名/试样描述 关键词命中 → 用对应称样方式。首条命中即用，末条留空三条件=默认方式。"""
         self.weighing_rules_frame = ttk.LabelFrame(
-            parent, text="条件称样规则（首条命中即用；末条留空三条件=默认方式）", padding=5)
+            parent, text="条件称样规则", padding=5)
         # 初始不 pack，由 on_weighing_mode_change 控制显隐
         wr_input = ttk.Frame(self.weighing_rules_frame)
         wr_input.pack(fill='x', pady=2)
@@ -1622,7 +1631,7 @@ class WeighingTab:
         wr_list = ttk.Frame(self.weighing_rules_frame)
         wr_list.pack(fill='both', expand=True, pady=3)
         wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式")
-        self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=4)
+        self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=3)
         for c in wcols:
             self.wr_tree.heading(c, text=c, anchor='w')
         self.wr_tree.column("序号", width=40, anchor='w')
@@ -1787,6 +1796,8 @@ class WeighingTab:
             "weighing_mode": self.weighing_mode.get(),
             "non_parallel_suffixes": non_par,
             "weighing_share_group": self.weighing_share_group.get().strip(),
+            "single_weighing": self.single_weighing.get(),
+            "writeback_excel": self.writeback_excel.get(),
             "weighing_rules": self.weighing_rules
         }
 
@@ -1809,6 +1820,8 @@ class WeighingTab:
         self.non_parallel_suffixes.set(
             ", ".join(str(s).strip().upper() for s in (weighing_params.get("non_parallel_suffixes") or [])))
         self.weighing_share_group.set(weighing_params.get("weighing_share_group", ""))
+        self.single_weighing.set(bool(weighing_params.get("single_weighing", False)))
+        self.writeback_excel.set(bool(weighing_params.get("writeback_excel", False)))
 
         # 条件称样规则
         self.weighing_rules = list(weighing_params.get("weighing_rules") or [])
