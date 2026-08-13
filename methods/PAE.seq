@@ -1,16 +1,16 @@
 sequence_data:
 - id: 1
-  weighing_path: D:/下载文件/钉钉/20260812-PD/称样记录1.xlsx
+  weighing_path: D:/下载文件/钉钉/仪器036/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE固体.mtd
-  spectrum_path: D:/下载文件/钉钉/20260812-PD
+  spectrum_path: D:/下载文件/钉钉/仪器036
   temperature: '25'
-  humidity: '55'
+  humidity: '60'
 - id: 2
-  weighing_path: D:/下载文件/钉钉/20260812-PD/称样记录1.xlsx
+  weighing_path: D:/下载文件/钉钉/仪器036/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE液体.mtd
-  spectrum_path: D:/下载文件/钉钉/20260812-PD
+  spectrum_path: D:/下载文件/钉钉/仪器036
   temperature: '25'
-  humidity: '55'
+  humidity: '60'
 column_widths:
 - 50
 - 260

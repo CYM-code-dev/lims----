@@ -976,6 +976,7 @@ def _read_weighing_records(path):
     time_col, desc_col = find("称样时间", 0), find("试样描述", 3)
     parse_col = find("解析", 4)  # E列：强制解析标记
     m = {}
+    last_time = None  # 称样时间向下填充：仅每组首行填日期，空单元格继承上一个非空值
     for _ri, r in enumerate(rows[1:], 1):
         if not r:
             continue
@@ -993,8 +994,12 @@ def _read_weighing_records(path):
             except (TypeError, ValueError):
                 pass
         entry["cells"].append((_ri + 1, not added))  # 回写用：(1-based表行号, 该格是否空)
+        # 称样时间向下填充：当前格非空则更新 last_time，空格继承 last_time
+        _t = _parse_weigh_time(r[time_col] if time_col < len(r) else None)
+        if _t is not None:
+            last_time = _t
         if entry["time"] is None:
-            entry["time"] = _parse_weigh_time(r[time_col] if time_col < len(r) else None)
+            entry["time"] = last_time
         if not entry["desc"]:
             d = r[desc_col] if desc_col < len(r) else None
             entry["desc"] = str(d).strip() if d is not None else ""
