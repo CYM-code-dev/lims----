@@ -3599,28 +3599,38 @@ class SequenceMaster:
             raise _AbortRun()
 
     def _sign_all_pending(self):
-        """Phase 2：对已暂存批次统一调 submitOcExperiment 提交签名/推进工作流(两步式)。
+        """Phase 2：对已暂存批次【并行】调 submitOcExperiment 提交签名/推进工作流(两步式)。
+        各批实验编号已在 Phase 1 取定(不同记录、互不撞号)，故可并行——session 并发安全同 _query_samples_parallel。
         每批独立：某批签名失败不影响其它批；失败批数据已暂存(可手动签名/重跑)。
-        中止用 _stop 轮询 + break——不能用 _check_abort，其抛 _AbortRun 只被 _run_one_row 外层捕获，Phase 2 在循环外会失捕。"""
-        self._log(f"==== 阶段2：提交签名（{len(self._pending_signs)} 批）====")
-        for p in self._pending_signs:
+        中止：_sign_one 起始查 _stop，未起的批跳过；已发出的 HTTP 不可中断会跑完(签名即目的，无害)。
+        ponytail: 固定6线程；串行23批≈7min(submitOcExperiment 推进工作流，大批~30s)，6并行压到~2min。
+        服务端若扛不住6并发，下调 _workers 即可。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        self._log(f"==== 阶段2：提交签名（{len(self._pending_signs)} 批，并行）====")
+        # 保险：让 Phase 1 末批 saveOcExperiment 落库可见后再并行签名(原串行节流的最低保留)
+        _last = getattr(self, "_last_exp_submit_ts", None)
+        if _last and time.time() - _last < 1.0:
+            time.sleep(1.0 - (time.time() - _last) + 0.15)
+
+        def _sign_one(p):
             if self._stop.is_set():
-                self._log("用户中止签名，剩余批次未签名（已暂存）")
-                break
-            # 复用提交节流：服务端按时间戳生成编号，距上一提交≥1s(签名推进同记录，仍沿用保险)
-            _last = getattr(self, "_last_exp_submit_ts", None)
-            _now = time.time()
-            if _last and _now - _last < 1.0:
-                time.sleep(1.0 - (_now - _last) + 0.15)
+                return p, False, "用户中止(已暂存)"
             self._log(f"[行{p['idx'] + 1}] 提交签名 (submitOcExperiment) 实验编号 {p['real_code']} ...")
             ok, reason = self.api.submit_experiment_data(
                 p["experiment_data"], p["method_name"], self._log, require_signature=True)
-            self._last_exp_submit_ts = time.time()
-            self._sign_results.append({"idx": p["idx"], "code": p["real_code"], "ok": ok, "reason": reason or ""})
-            if ok:
-                self._log(f"[行{p['idx'] + 1}] 签名成功 实验编号 {p['real_code']}")
-            else:
-                self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存）实验编号 {p['real_code']}：{reason} — 可手动签名或重跑")
+            return p, ok, reason
+
+        _workers = min(6, len(self._pending_signs) or 1)
+        with ThreadPoolExecutor(max_workers=_workers) as ex:
+            futs = [ex.submit(_sign_one, p) for p in self._pending_signs]
+            for fut in as_completed(futs):
+                p, ok, reason = fut.result()
+                self._sign_results.append({"idx": p["idx"], "code": p["real_code"], "ok": ok, "reason": reason or ""})
+                if ok:
+                    self._log(f"[行{p['idx'] + 1}] 签名成功 实验编号 {p['real_code']}")
+                else:
+                    self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存）实验编号 {p['real_code']}：{reason} — 可手动签名或重跑")
+        self._sign_results.sort(key=lambda s: s["idx"])
 
     def _run_one_row(self, idx, weighing_caches=None):
         """单行流水线（worker 线程内）。返回 'ok'/'skip'/'abort'/'fail'，失败自行 put status。

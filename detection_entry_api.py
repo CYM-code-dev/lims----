@@ -648,9 +648,9 @@ class DetectionAPI:
             }
 
             endpoint = "submitOcExperiment" if require_signature else "saveOcExperiment"
-            # 提交签名(submitOcExperiment)服务端要推进工作流、比仅保存慢(实测 6-11s，偶有批次>30s 读超时)；
-            # 读超时给 90s 余量，连接超时维持 10s。仅保存(saveOcExperiment)维持 30s。
-            _timeout = (10, 90) if require_signature else 30
+            # 大批(百余条) saveOcExperiment/submitOcExperiment 服务端均可能>30s(暂存重跑实测偶>30s 读超时)；
+            # 读超时统一给 90s 余量，连接超时维持 10s。
+            _timeout = (10, 90)
             response = self.login_system.session.post(
                 f"{self.login_system.base_url}/detectionManager/manager/ocExperiment/{endpoint}",
                 json=experiment_data,

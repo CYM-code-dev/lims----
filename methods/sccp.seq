@@ -4,7 +4,7 @@ sequence_data:
   method_file: D:/Agent/lims数据登记/methods/跑道SCCP.mtd
   spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/SCCP
   temperature: '25'
-  humidity: '55'
+  humidity: '60'
 column_widths:
 - 50
 - 260
