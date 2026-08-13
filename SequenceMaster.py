@@ -3480,6 +3480,8 @@ class SequenceMaster:
         """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q。
         循环按当前行数动态推进：运行期间新增的行(append 到末尾)会在当行结束后自动纳入运行。"""
         self._method_projects_cache.clear()  # 每次运行重建方法查询缓存(运行中样品已登记会使旧池过期)
+        self._pending_signs = []   # Phase 2 待签名批：勾选提交签名的方法暂存后入队，全部暂存完成再统一签名
+        self._sign_results = []    # Phase 2 签名结果(供 _on_run_done 汇总)：[{idx,code,ok,reason}]
         weighing_caches = {}  # {组名: {sample_code: {masses,desc}}} 跨行共享称样量(称样量共享组)
         idx = start_idx
         while idx < len(self.sequence_data):
@@ -3503,6 +3505,12 @@ class SequenceMaster:
                 self._log("用户中止序列")
                 break
             idx += 1
+        # Phase 2：全部暂存完成后统一提交签名(仅勾选了提交签名的方法)。中止则不自动签名，仅报告未签名批数。
+        if self._stop.is_set():
+            if self._pending_signs:
+                self._log(f"中止：{len(self._pending_signs)} 批已暂存未签名（可手动签名或重跑）")
+        elif self._pending_signs:
+            self._sign_all_pending()
         self._ui_q.put(("done", None))
 
     def _aborted(self, idx):
@@ -3518,6 +3526,30 @@ class SequenceMaster:
         if self._stop.is_set():
             self._ui_q.put(("status", (idx, "中止", "用户中止")))
             raise _AbortRun()
+
+    def _sign_all_pending(self):
+        """Phase 2：对已暂存批次统一调 submitOcExperiment 提交签名/推进工作流(两步式)。
+        每批独立：某批签名失败不影响其它批；失败批数据已暂存(可手动签名/重跑)。
+        中止用 _stop 轮询 + break——不能用 _check_abort，其抛 _AbortRun 只被 _run_one_row 外层捕获，Phase 2 在循环外会失捕。"""
+        self._log(f"==== 阶段2：提交签名（{len(self._pending_signs)} 批）====")
+        for p in self._pending_signs:
+            if self._stop.is_set():
+                self._log("用户中止签名，剩余批次未签名（已暂存）")
+                break
+            # 复用提交节流：服务端按时间戳生成编号，距上一提交≥1s(签名推进同记录，仍沿用保险)
+            _last = getattr(self, "_last_exp_submit_ts", None)
+            _now = time.time()
+            if _last and _now - _last < 1.0:
+                time.sleep(1.0 - (_now - _last) + 0.15)
+            self._log(f"[行{p['idx'] + 1}] 提交签名 (submitOcExperiment) 实验编号 {p['real_code']} ...")
+            ok, reason = self.api.submit_experiment_data(
+                p["experiment_data"], p["method_name"], self._log, require_signature=True)
+            self._last_exp_submit_ts = time.time()
+            self._sign_results.append({"idx": p["idx"], "code": p["real_code"], "ok": ok, "reason": reason or ""})
+            if ok:
+                self._log(f"[行{p['idx'] + 1}] 签名成功 实验编号 {p['real_code']}")
+            else:
+                self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存）实验编号 {p['real_code']}：{reason} — 可手动签名或重跑")
 
     def _run_one_row(self, idx, weighing_caches=None):
         """单行流水线（worker 线程内）。返回 'ok'/'skip'/'abort'/'fail'，失败自行 put status。
@@ -4329,8 +4361,9 @@ class SequenceMaster:
         self._last_exp_submit_ts = time.time()
         _require_sign = bool((self._read_other_params(ctx.get("method_file") or "") or {}).get("require_signature"))
         self._check_abort(idx)  # 提交前最后关口：配置都就绪，用户中止则不发起主提交(最重请求)立即跳出
-        log(f"提交实验数据 ({'submitOcExperiment/提交签名' if _require_sign else 'saveOcExperiment/仅保存'}) ...")
-        ok, reason = self.api.submit_experiment_data(experiment_data, actual_method_name, log, require_signature=_require_sign)
+        # Phase 1：恒走暂存(saveOcExperiment)。勾选提交签名时，签名(submitOcExperiment)留到全部暂存后统一做(_sign_all_pending)。
+        log("暂存实验数据 (saveOcExperiment) ...")
+        ok, reason = self.api.submit_experiment_data(experiment_data, actual_method_name, log, require_signature=False)
         if not ok:
             _why = reason or "实验数据提交失败"
             self._batch_fail_reason = _why  # 供调用方循环把详细原因带进运行报告(如读超时/HTTP码/服务端拒绝)
@@ -4373,6 +4406,12 @@ class SequenceMaster:
                 log(f"失败: 标准溶液关联失败 - {serr}")
                 return False, ""
 
+        if _require_sign:
+            # 入队 Phase 2 签名：experiment_data 暂存后不再变更(fileIds/spectrumJsonList 提交前已写定)，可原样复用提交
+            self._pending_signs.append({
+                "experiment_data": experiment_data, "method_name": actual_method_name,
+                "idx": idx, "real_code": real_code,
+            })
         log(f"本批完成，实验编号 {real_code}")
         return True, real_code
 
@@ -5319,6 +5358,16 @@ class SequenceMaster:
         total = ok + fail + abort
         self._append_log("==== 序列运行结束 ====")
         self._append_log(f"运行报告：共 {total} 行 — 成功 {ok} / 失败 {fail} / 中止 {abort}")
+        # 提交签名汇总（两步式 Phase 2；_sign_results 由 worker 线程在 Phase 2 写入，经 done 队列 happens-before）
+        _signs = getattr(self, "_sign_results", None)
+        if _signs:
+            _s_ok = sum(1 for s in _signs if s["ok"])
+            _s_fail = [s for s in _signs if not s["ok"]]
+            self._append_log(f"提交签名：{_s_ok}/{len(_signs)} 批成功")
+            if _s_fail:
+                self._append_log(f"签名失败（已暂存，请手动签名或重跑）{len(_s_fail)} 批：")
+                for _s in _s_fail:
+                    self._append_log(f"  - 行{_s['idx'] + 1} 实验编号 {_s['code']}：{_s['reason']}")
         # 汇总：各成功行样品合并情况(跨行合计)，格式对齐单行「成功，… 个样品参与合并」
         rows_ok = [r for r in self.sequence_data if r.get("status") == "成功"]
         tot = sum(r.get("samples_total", 0) for r in rows_ok)

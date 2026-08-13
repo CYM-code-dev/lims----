@@ -2842,7 +2842,7 @@ class OtherParamsTab:
         self.lab_proc_enable_var = tk.BooleanVar(value=False)
         self.lab_proc_toggle_frame = ttk.Frame(submit_frame)
         self.lab_proc_toggle_frame.pack(fill='x', padx=5, pady=(2, 0))
-        ttk.Checkbutton(self.lab_proc_toggle_frame, text=" 启用条件实验过程 labProc",
+        ttk.Checkbutton(self.lab_proc_toggle_frame, text=" 启用条件实验过程",
                         variable=self.lab_proc_enable_var,
                         style=self.app.large_cb_style,
                         command=self.toggle_lab_proc).pack(side='left')
@@ -2853,7 +2853,7 @@ class OtherParamsTab:
         self.dilution_remark_enable_var = tk.BooleanVar(value=False)
         self.dil_remark_toggle_frame = ttk.Frame(submit_frame)
         self.dil_remark_toggle_frame.pack(fill='x', padx=5, pady=(2, 0))
-        ttk.Checkbutton(self.dil_remark_toggle_frame, text=" 启用稀释备注（按稀释倍数+定容体积自动生成）",
+        ttk.Checkbutton(self.dil_remark_toggle_frame, text=" 启用稀释备注",
                         variable=self.dilution_remark_enable_var,
                         style=self.app.large_cb_style,
                         command=self.toggle_dilution_remark).pack(side='left')
@@ -2864,7 +2864,7 @@ class OtherParamsTab:
         self.require_signature_var = tk.BooleanVar(value=False)
         self.sign_frame = ttk.Frame(submit_frame)
         self.sign_frame.pack(fill='x', padx=5, pady=(2, 5))
-        ttk.Checkbutton(self.sign_frame, text=" 提交签名（序列录入后调用 submitOcExperiment）",
+        ttk.Checkbutton(self.sign_frame, text=" 提交签名",
                         variable=self.require_signature_var,
                         style=self.app.large_cb_style,
                         command=self.app.mark_modified).pack(side='left')
