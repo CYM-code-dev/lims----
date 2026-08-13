@@ -1660,11 +1660,14 @@ class WeighingTab:
         ttk.Combobox(wr_input, textvariable=self.wr_mode_var,
                      values=[lbl for _, lbl in self._WEIGHING_MODE_OPTIONS],
                      state="readonly", width=12).pack(side='left', padx=(0, 6))
+        ttk.Label(wr_input, text="对应项目:").pack(side='left', padx=(0, 3))
+        self.wr_counterpart_var = tk.StringVar()
+        ttk.Entry(wr_input, textvariable=self.wr_counterpart_var, width=14).pack(side='left', padx=(0, 6))
         ttkb.Button(wr_input, text="添加", command=self.add_weighing_rule, bootstyle="secondary").pack(side='left')
         # 表格
         wr_list = ttk.Frame(wr_body)
         wr_list.pack(fill='both', expand=True, pady=3)
-        wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式")
+        wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式", "对应项目")
         self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=3)
         for c in wcols:
             self.wr_tree.heading(c, text=c, anchor='w')
@@ -1673,6 +1676,7 @@ class WeighingTab:
         self.wr_tree.column("项目名关键词", width=110, anchor='w')
         self.wr_tree.column("试样描述关键词", width=110, anchor='w')
         self.wr_tree.column("称样方式", width=120, anchor='w')
+        self.wr_tree.column("对应项目", width=120, anchor='w')
         self.wr_tree.pack(side='left', fill='both', expand=True)
         wr_scroll = ttk.Scrollbar(wr_list, orient="vertical", command=self.wr_tree.yview)
         wr_scroll.pack(side='right', fill='y')
@@ -1697,10 +1701,11 @@ class WeighingTab:
             "filename": self.wr_filename_var.get().strip(),
             "project_name": self.wr_project_var.get().strip(),
             "desc": self.wr_desc_var.get().strip(),
-            "weighing_mode": mode_code
+            "weighing_mode": mode_code,
+            "counterpart": self.wr_counterpart_var.get().strip()
         })
         self.refresh_weighing_rules_tree()
-        self.wr_filename_var.set(""); self.wr_project_var.set(""); self.wr_desc_var.set(""); self.wr_mode_var.set("")
+        self.wr_filename_var.set(""); self.wr_project_var.set(""); self.wr_desc_var.set(""); self.wr_mode_var.set(""); self.wr_counterpart_var.set("")
         self.app.mark_modified()
 
     def delete_weighing_rule(self):
@@ -1743,7 +1748,8 @@ class WeighingTab:
                                 values=(str(i + 1), r.get("filename", ""),
                                         r.get("project_name", ""), r.get("desc", ""),
                                         self._LABEL_BY_MODE.get(r.get("weighing_mode", ""),
-                                                                 r.get("weighing_mode", ""))))
+                                                                 r.get("weighing_mode", "")),
+                                        r.get("counterpart", "")))
 
     def on_weighing_rule_double_click(self, event):
         """双击条件称样规则单元格就地编辑（称样方式列用 Combobox，其余用 Entry）"""
@@ -1752,7 +1758,7 @@ class WeighingTab:
             return
         item = sel[0]
         column_index = int(self.wr_tree.identify_column(event.x).replace('#', '')) - 1
-        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "weighing_mode"}.get(column_index)
+        col_key = {1: "filename", 2: "project_name", 3: "desc", 4: "weighing_mode", 5: "counterpart"}.get(column_index)
         if col_key is None:  # 序号列或越界
             return
         current_values = self.wr_tree.item(item, 'values')

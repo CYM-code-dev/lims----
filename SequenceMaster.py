@@ -3840,6 +3840,8 @@ class SequenceMaster:
             if ctx.get("wmode") == "conditional" and ctx.get("weighing_rules"):
                 wm = _match_conditional_rule(ctx["weighing_rules"], pname, it.get("pdf_paths") or [], desc)
                 it["_wmode"] = str((wm or {}).get("weighing_mode") or "").strip()
+                if wm and "counterpart" in wm:  # 规则显式设对应项目(含空=禁用回读)；无键=回退方法级
+                    it["_counterpart"] = str(wm.get("counterpart") or "").strip()
                 if it["_wmode"]:
                     log(f"[{it['sample_code']}] 命中称样规则 → {it['_wmode']}（项目:{pname}）")
                 else:
@@ -4165,7 +4167,11 @@ class SequenceMaster:
             # ponytail: 跨序列共享——运行级缓存未命中、对应方法已在 LIMS 登记时，回读称样量塞缓存，
             # 现有下面的 rv 复用分支原样生效(免新写第二处分发)。
             if ctx.get("_share_group") and sc not in primary_cache:
-                _cp = self._counterpart(ctx["wp"])  # 对应项目名(str)或 None
+                # 对应项目：条件称样取命中规则(含键=显式，空=禁用回读；无键=回退方法级)；非条件取方法级
+                if _cond and "_counterpart" in it:
+                    _cp = it["_counterpart"]
+                else:
+                    _cp = self._counterpart(ctx["wp"])
                 if _cp:
                     _rb = self._counterpart_weighing(sc, _cp, log)
                     if _rb:
