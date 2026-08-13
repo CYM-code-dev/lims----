@@ -1461,9 +1461,12 @@ class WeighingTab:
         if mode == "conditional":
             self.weighing_rules_frame.pack(fill='x', pady=5)  # 不 expand：与可折叠助手一致，收起释放空间
         if mode == "record":
-            # 称量记录模式 - 两个区域都禁用
+            # 称量记录模式 - 称样量取自记录文件；min/max、换算与处理区禁用，
+            # 仅「小数位数」可编辑(按其补回末尾0，匹配天平 2/3/4 位精度；
+            # 运行时 SequenceMaster 已按 decimal_places 格式化)
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
+            self.decimal_entry.configure(state="normal")
         elif mode == "random":
             # 随机数生成模式 - 随机数区域启用，处理区域禁用
             self.set_frame_state(self.random_frame, "normal")

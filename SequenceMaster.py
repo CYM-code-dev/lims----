@@ -579,6 +579,8 @@ def _plan_submission_batches(query_rules, items, max_items=_MAX_BATCH_ITEMS):
         mode = str(rule.get("input_method") or "方法").strip()
         ms = str(rule.get("max_select") or "").strip()
         rule_max = int(ms) if ms.isdigit() else 0
+        # 样品模式用用户 max_select 作每批条目上限(以硬上限为地板)；方法模式仍走硬上限
+        item_cap = min(rule_max, max_items) if (mode == "样品" and rule_max > 0) else max_items
         if multi_method:
             rule_items = [it for it in remaining if it.get("_qr_idx") == i]
         else:
@@ -622,9 +624,9 @@ def _plan_submission_batches(query_rules, items, max_items=_MAX_BATCH_ITEMS):
                         for sb in slices:
                             sb_set = set(sb)
                             batch = [it for it in d_items if it.get("sample_code", "") in sb_set]
-                            # 单批录入条数硬上限：超 max_items 再切片，每片独立实验编号
-                            chunks = ([batch[i:i + max_items] for i in range(0, len(batch), max_items)]
-                                      if len(batch) > max_items else [batch])
+                            # 单批录入条数上限：样品模式尊重用户 max_select(以硬上限为地板)，其余用硬上限；超限切片各出新编号
+                            chunks = ([batch[i:i + item_cap] for i in range(0, len(batch), item_cap)]
+                                      if len(batch) > item_cap else [batch])
                             for ch in chunks:
                                 plan.append({
                                     "switch_mid": mid,
@@ -2804,17 +2806,29 @@ class SequenceMaster:
                 desc = ((_wm.get(sample_codes[0]) or {}).get("desc") or "")
         # 首个可查样品的项目即可解析本行全部子方法(设备是方法级)
         projects = None
+        _reason = "未登记样品中未查到(可能受理超30天/编号不符/已登记)"
         for sc in sample_codes:
             try:
                 _ps = self.api.query_samples_by_conditions(sample_code=sc, exact_match=True, log_func=log)
+                if not _ps:
+                    # 未登记查不到 → 试已登记，区分"样品已登记"
+                    _done = self.api.query_samples_by_conditions(
+                        sample_code=sc, exact_match=True, log_func=log,
+                        check_in_status="CHECK_IN_STATUS_ALREADY")
+                    if _done and self._filter_projects_by_method(_done, row, lambda *a, **k: None)[0]:
+                        _reason = "样品已登记(设备查询仅查未登记样品)"
+                    continue
                 _ps, ferr = self._filter_projects_by_method(_ps, row, log)
-                if not ferr and _ps:
+                if ferr:
+                    _reason = f"方法未匹配项目：{ferr}"
+                    continue
+                if _ps:
                     projects = _ps
                     break
             except Exception as e:
                 log(f"设备查询：查询样品异常({sc}): {e}")
         if not projects:
-            log("设备查询：样品不可查或方法未匹配项目，回退手动输入")
+            log(f"设备查询：{_reason}，回退手动输入")
             return None
         method_ids = []
         for p in projects:
@@ -4350,11 +4364,16 @@ class SequenceMaster:
         except ValueError:
             _start_d = None
         if _start_d is not None:
-            _accs = []  # [(sample_code, accept_date)]
+            _accs = []  # [(sample_code, accept_date)] 每样品一条（同样品多项目共享受理日）
+            _acc_seen = set()
             for _it in batch_items:
+                _sc = _it.get("sample_code")
+                if _sc in _acc_seen:
+                    continue
                 _ad, _ = _accept_date_of((_it.get("project") or {}).get("_raw"))
                 if _ad:
-                    _accs.append((_it.get("sample_code"), _ad))
+                    _acc_seen.add(_sc)
+                    _accs.append((_sc, _ad))
             _latest = max([_d for _, _d in _accs], default=_start_d)  # 批内最晚受理日
             if _latest > _start_d:
                 _orig = experiment_data["startTime"]
@@ -5413,7 +5432,12 @@ class SequenceMaster:
                 self._append_log(f"未录入样品（{len(skipped)} 个）：")
                 for sc, reason in skipped:
                     self._append_log(f"  - {sc}：{reason}")
-        early = [t for r in rows_ok for t in r.get("early_analysis", [])]
+        # 同一样品可能跨多批(如 item_cap 切片)各记一条 → 按 sample_code 去重，每样品显示一行
+        early, _seen = [], set()
+        for _t in [t for r in rows_ok for t in r.get("early_analysis", [])]:
+            if _t[0] not in _seen:
+                _seen.add(_t[0])
+                early.append(_t)
         if early:
             self._append_log(f"时间调整：{len(early)} 个样品分析时间早于受理时间，startTime 已提到受理日（服务端005校验）：")
             for sc, orig, new, acc in early:
@@ -5694,6 +5718,14 @@ def _selfcheck():
     p2 = _plan_submission_batches(rules_s, items)
     assert [(b["switch_mid"], b["items"][0]["sample_code"]) for b in p2] \
         == [("4678", "S1"), ("4678", "S2"), ("4679", "S1"), ("4679", "S2")], p2
+
+    # 样品模式 max_select=2(按条目)：1样品5项目 → 每样品片再按条目切 [2,2,1]，三批均 force_new
+    _one_s = [{"sample_code": "S1", "projectName": f"P{i}", "switch_mid": "4678",
+               "project": {"projectId": f"S1-P{i}", "projectName": f"P{i}"}} for i in range(5)]
+    p5 = _plan_submission_batches([{"project": "", "input_method": "样品", "max_select": "2"}], _one_s)
+    assert [len(b["items"]) for b in p5] == [2, 2, 1], [len(b["items"]) for b in p5]
+    assert all(b["force_new"] for b in p5), p5
+    assert sum(len(b["items"]) for b in p5) == 5, p5
 
     # 方法模式 max_select=1(按行)：苯规则限 1 → 拆2批，两批 force_new=True；总和规则不限 → 合1批
     rules_max = [{"project": "苯", "input_method": "方法", "max_select": "1"},
