@@ -2730,82 +2730,103 @@ class SequenceMaster:
     def _row_sample_codes(self, row, log):
         """本行全部样品编号(去重保序)。单样品走 _resolve_spectrum_pdf；
         多PDF目录按称样记录∩谱图展开(_resolve_samples)。同行样品方法可能不同，
-        设备查询需逐个匹配行方法后再取设备，故返回全部而非仅首个。"""
+        设备查询需逐个匹配行方法后再取设备，故返回全部而非仅首个。
+        返回 (codes, reason)：reason 非空=未能解析出样品的原因(供设备查询诊断)。"""
         _, sc = self._resolve_spectrum_pdf(row, log)
         if sc:
-            return [sc]
+            return [sc], None
         rec_path = (row.get("weighing_path") or "").strip()
         if not (rec_path and os.path.isfile(rec_path)):
-            return []
-        wmap, _ = _read_weighing_records(rec_path)
+            return [], f"称样记录路径无效或文件不存在({rec_path or '空'})"
+        wmap, werr = _read_weighing_records(rec_path)
+        if werr:
+            return [], werr
         if wmap:
             _wp = self._read_weighing_params(row.get("method_file"))
             wmap = _merge_parallel_groups(wmap, (_wp or {}).get("non_parallel_suffixes"))
-        samples, _ = self._resolve_samples(row, wmap, log)
+        samples, serr = self._resolve_samples(row, wmap, log)
         codes = []
         for s in samples or []:
             c = s[0] if isinstance(s, (list, tuple)) else s
             if c and c not in codes:
                 codes.append(c)
-        return codes
+        if not codes:
+            return [], serr or "称样记录与谱图目录无交集样品"
+        return codes, None
 
     def _row_first_sample_code(self, row, log):
         """取本行任一样品编号(设备列表/温湿度房间都是方法级，任一样品即可解析方法)。"""
-        codes = self._row_sample_codes(row, log)
+        codes, _ = self._row_sample_codes(row, log)
         return codes[0] if codes else None
 
     def _resolve_equipment_choices(self, row, log):
-        """本行报验单的主检设备可选编号(设备选择器用)。
-        样品→项目→ocMultipleChoicePage(报验单级，与网页端/手动录入界面一致)。
-        同行样品方法可能不同，逐个匹配行方法文件，用首个匹配的样品查设备；
-        返回去重保序的 [编号,...]；失败返回 None。"""
-        # 报验单级候选(ocMultipleChoicePage)
-        sample_codes = self._row_sample_codes(row, log)
-        pid = None
-        matched_sc = None
-        last_reason = None
-        for sc in sample_codes or []:
+        """本行【子方法】主检设备可选编号(设备选择器用)。
+        - switch_rules 方法：复刻提交的 project_name+desc→to_id 路由(_match_switch_rule)，逐个
+          get_detection_equipment(子方法id) 取检测设备。getOcExperiment/ocMultipleChoicePage 只给切换前
+          主方法设备(如 PAE 给 1168 而非 4480/4596)，故 switch 方法必须走这条。
+        - 无 switch_rules：_resolve_equipment_config(提交同源，方法级设备)。
+        返回去重保序 [编号,...]；失败返回 None。"""
+        sample_codes, _ = self._row_sample_codes(row, log)
+        if not sample_codes:
+            log("设备查询：未取到子方法设备——本行无可登记样品")
+            return None
+        method_file = row.get("method_file") or ""
+        switch_rules = self._read_switch_rules(method_file)
+
+        def _codes_from_raw(raw_data, codes):
+            for eq in raw_data or []:
+                if (eq.get("usedCategory") or "").strip() != "检测设备":
+                    continue
+                men = (eq.get("mainEquipmentNames") or "").strip()
+                code = men.split(",")[0].strip() if men else ""  # "编号,名称" → 编号
+                if not code:  # 与 _override_equipment._code_of 口径一致，保证提交能命中
+                    code = (eq.get("no") or eq.get("code") or eq.get("equipmentCode")
+                            or eq.get("equipmentNo") or eq.get("number") or eq.get("billCode") or "").strip()
+                if code and code not in codes:
+                    codes.append(code)
+            return codes
+
+        if not switch_rules:
+            eq_cfg = self._resolve_equipment_config(row, log)
+            if not eq_cfg:
+                log("设备查询：未取到方法设备(样品不可查或方法未配置检测设备)，回退手动输入")
+                return None
+            return _codes_from_raw(eq_cfg.get("raw_data"), []) or None
+
+        # switch_rules：按目标子方法取设备。desc(switch_rules.desc 匹配用)取自称样记录首个样品描述。
+        desc = ""
+        rec_path = (row.get("weighing_path") or "").strip()
+        if rec_path and os.path.isfile(rec_path):
+            _wm, _ = _read_weighing_records(rec_path)
+            if _wm:
+                _wp = self._read_weighing_params(method_file)
+                _wm = _merge_parallel_groups(_wm, (_wp or {}).get("non_parallel_suffixes"))
+                desc = ((_wm.get(sample_codes[0]) or {}).get("desc") or "")
+        # 首个可查样品的项目即可解析本行全部子方法(设备是方法级)
+        projects = None
+        for sc in sample_codes:
             try:
-                projects = self.api.query_samples_by_conditions(
-                    sample_code=sc, exact_match=True, log_func=log)
-                projects, ferr = self._filter_projects_by_method(projects, row, log)
-                if ferr or not projects:
-                    last_reason = f"{sc}: {ferr or '无匹配项目'}"
-                    continue
-                pid = projects[0].get("projectId")
-                if not pid:
-                    last_reason = f"{sc}: 无 projectId"
-                    continue
-                matched_sc = sc
-                break
+                _ps = self.api.query_samples_by_conditions(sample_code=sc, exact_match=True, log_func=log)
+                _ps, ferr = self._filter_projects_by_method(_ps, row, log)
+                if not ferr and _ps:
+                    projects = _ps
+                    break
             except Exception as e:
-                last_reason = f"{sc}: 查询异常 {e}"
-                log(f"查询设备可选列表异常({sc}): {e}")
-                continue
-        if not pid:
-            log(f"设备查询：遍历 {len(sample_codes or [])} 个样品均未匹配方法项目(最后 {last_reason})，回退手动输入")
+                log(f"设备查询：查询样品异常({sc}): {e}")
+        if not projects:
+            log("设备查询：样品不可查或方法未匹配项目，回退手动输入")
             return None
-        try:
-            choices = self.api.get_main_equipment_choices(pid, log)
-        except Exception as e:
-            log(f"查询设备可选列表异常({matched_sc}): {e}")
+        method_ids = []
+        for p in projects:
+            mid = _match_switch_rule(switch_rules, p.get("projectName", ""), [], desc)
+            if mid and mid not in method_ids:
+                method_ids.append(mid)
+        if not method_ids:
+            log("设备查询：switch_rules 未命中目标子方法(project_name/desc 不符)，回退手动输入")
             return None
-        if not choices:
-            log(f"设备查询：样品 {matched_sc} 方法未配置主检设备(ocMultipleChoicePage 返回空)，回退手动输入")
-            return None
-        # 提编号
         codes = []
-        for it in choices:
-            raw = it.get("raw") or {}
-            men = (raw.get("mainEquipmentNames") or "").strip()
-            code = men.split(",")[0].strip() if men else ""  # "编号,名称" → 编号
-            if not code:  # 无 mainEquipmentNames 时取编号字段，避免把"编号 名称"整体当编号(否则提交校验匹配不上)
-                code = (raw.get("no") or raw.get("code") or raw.get("equipmentCode")
-                        or raw.get("equipmentNo") or raw.get("number") or raw.get("billCode") or "").strip()
-            if not code:
-                code = (it.get("label") or "").split(",")[0].strip()
-            if code and code not in codes:
-                codes.append(code)
+        for mid in method_ids:
+            codes = _codes_from_raw((self.api.get_detection_equipment(mid, log) or {}).get("raw_data"), codes)
         return codes or None
 
     def _resolve_equipment_config(self, row, log):
@@ -4517,7 +4538,7 @@ class SequenceMaster:
             return None, sc
         if len(pdfs) == 1:
             return pdfs[0], os.path.splitext(os.path.basename(pdfs[0]))[0].split("-", 1)[0]
-        log(f"目录有 {len(pdfs)} 个PDF且未填样品编号，无法确定(请一行一PDF或先填sample_code)")
+        log(f"谱图目录含 {len(pdfs)} 个PDF，改由称样记录∩谱图展开样品(多样品，无需手填编号)")
         return None, ""
 
     def _read_query_rules(self, method_file):
