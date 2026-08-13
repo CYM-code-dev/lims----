@@ -489,6 +489,22 @@ def _mass_field_by_project(records, pid_to_sample, pmasses_by_sample,
     return out
 
 
+def _vol_field_by_project(records, pid_to_sample, pvol_by_sample, vol_code):
+    """定容体积字段列表(对齐 ocAnalysisRecordList)：样品有解析体积(称样记录斜杠后段)则取
+    pvol_by_sample[样品][平行]；该样品无解析体积时保留记录已存值 r[vol_code](免覆盖手填/默认值)。"""
+    parallel_of, _ = _parallel_indices(records)
+    out = []
+    for g, r in enumerate(records or []):
+        sc = pid_to_sample.get(str(r.get("projectId")), "")
+        vols = pvol_by_sample.get(sc)
+        if vols:
+            par = parallel_of.get(g, 0)
+            out.append(_Box(vols[par] if par < len(vols) else vols[-1]))
+        else:
+            out.append(_Box(r.get(vol_code) if vol_code else ""))
+    return out
+
+
 def _project_match(project_name, project_val):
     """单条 query rule 的 project 匹配：rule.project 空=全中；含 * 用 fnmatch；否则精确相等。"""
     pname = (project_name or "").strip()
@@ -943,9 +959,21 @@ def _parse_weigh_time(v):
     return None
 
 
+def _split_mass_vol(raw):
+    """称样量单元格按斜杠拆出定容体积："0.39/10.00" -> ("0.39", "10.00")；无斜杠返回 (原值去空白, None)。
+    体积段保留原样字符串(含末尾0，如 10.00)，不转 float 以免吞0。"""
+    s = "" if raw is None else str(raw).strip()
+    if "/" not in s:
+        return s, None
+    parts = s.split("/")
+    vol = parts[1].strip() if len(parts) > 1 else ""
+    return parts[0].strip(), (vol or None)
+
+
 def _read_weighing_records(path):
-    """读取称量记录(xlsx 或 csv)：返回 ({样品编号: {masses:[float...], time, desc}}, err)。
-    行序即平行序；time/desc 取该样品首行(称样时间/试样描述)。表头按列名定位，缺失按 A/B/C/D 兜底。"""
+    """读取称量记录(xlsx 或 csv)：返回 ({样品编号: {masses:[float...], volumes:[str...], time, desc}}, err)。
+    行序即平行序；time/desc 取该样品首行(称样时间/试样描述)。表头按列名定位，缺失按 A/B/C/D 兜底。
+    称样量单元格形如 "0.39/10.00" 时，斜杠前=称样量、后=定容体积(原样串)。"""
     try:
         if str(path).lower().endswith(".csv"):
             rows = None
@@ -985,14 +1013,17 @@ def _read_weighing_records(path):
         code = r[code_col] if code_col < len(r) else None
         if code is None or str(code).strip() == "":
             continue
-        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "time": None, "desc": ""})
+        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "volumes": [], "time": None, "desc": ""})
         # 称样量可能为空(random 模式称样量随机生成，excel 仅记录编号/试样描述)；有值才追加
         mass = r[mass_col] if mass_col < len(r) else None
         added = False
-        if mass is not None:
+        _ms, _vs = _split_mass_vol(mass)
+        if _ms != "":
             try:
-                entry["masses"].append(float(mass))
+                entry["masses"].append(float(_ms))
                 added = True
+                if _vs:  # "0.39/10.00" -> 体积段(原样串，保留末尾0)按行序入 volumes
+                    entry["volumes"].append(_vs)
             except (TypeError, ValueError):
                 pass
         entry["cells"].append((_ri + 1, not added))  # 回写用：(1-based表行号, 该格是否空)
@@ -4189,6 +4220,7 @@ class SequenceMaster:
                       _pname_filter.get(it["project"].get("projectName", ""), "")
                       for it in batch_items}
         pmasses_by_sample, marker_masses_by_sample, desc_by_sample = {}, {}, {}
+        pvol_by_sample = {}  # 定容体积(称样记录斜杠后段)：{样品: [体积串(按平行)]}
         _eff_by_sample = {}  # 样品→称样方式(回写仅对 random 生效)
         _sp = (row.get("spectrum_path") or "").strip()
 
@@ -4199,6 +4231,11 @@ class SequenceMaster:
             eff = (it.get("_wmode") or "") if _cond else base_wmode  # 条件称样按样品命中；否则整批统一
             _eff_by_sample[sc] = eff
             samp = (ctx["wmap"] or {}).get(sc) or {}
+            # 定容体积：称样量单元格 "0.39/10.00" 斜杠后段(原样串，保留末尾0)；与称样方式无关，按平行数展开
+            _vols = samp.get("volumes") or []
+            if _vols:
+                _npv = _n_par_by_sample.get(sc, 1)
+                pvol_by_sample[sc] = [str(_vols[i]) if i < len(_vols) else str(_vols[-1]) for i in range(_npv)]
             # ponytail: 跨序列共享——运行级缓存未命中、对应方法已在 LIMS 登记时，回读称样量塞缓存，
             # 现有下面的 rv 复用分支原样生效(免新写第二处分发)。
             if ctx.get("_share_group") and sc not in primary_cache:
@@ -4293,6 +4330,16 @@ class SequenceMaster:
                 log(f"称样量({base_wmode}) {mass_col.get('columeName', '')} 跨{len(pmasses_by_sample)}样品")
         elif not _skip_mass:
             log(f"称样量({base_wmode}) 未找到称量记录列(isWeighing=1)，跳过称样量写入")
+        # 定容体积列：列名取自「稀释备注设置 定容体积列名」；把称样记录斜杠后段填入(供 LIMS 记录与稀释备注读取)
+        _vol_name = (ctx.get("dilution_volume_column") or "").strip()
+        if _vol_name and pvol_by_sample:
+            _vol_col = _find_column_by_name(dynamic_columns, _vol_name)
+            if _vol_col is not None:
+                _vcode = _vol_col.get("columeCode", "")
+                host.data_fields[_vcode] = _vol_field_by_project(records, pid_to_sample, pvol_by_sample, _vcode)
+                log(f"定容体积 <- 称样记录(斜杠后段) 列「{_vol_col.get('columeName', '')}」跨{len(pvol_by_sample)}样品")
+            else:
+                log(f"定容体积列「{_vol_name}」未找到，跳过定容体积写入")
         _fill_desc_column(records, desc_by_sample)
         first_sc = batch_items[0]["sample_code"] if batch_items else ""
         analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
@@ -5962,6 +6009,14 @@ def _selfcheck():
     assert len(_r3) == 1 and 1.9 <= float(_r3[0]) <= 2.2
     _pr_x4 = {"type": "换算处理", "factor": 4, "decimal_places": 4}              # prule 换算路径
     assert _random_masses(["0.2751"], 1, _pr_x4, _wp_r, 4) == ["1.1004"]
+
+    # _split_mass_vol：称样量单元格 "0.39/10.00" 斜杠前=称样量、后=定容体积(原样串保留末尾0)。
+    # 回归：天平/定容体积末尾0不被 float 吞掉，无斜杠单元格行为不变。
+    assert _split_mass_vol("0.39/10.00") == ("0.39", "10.00")   # 斜杠拆分，体积保留末尾0
+    assert _split_mass_vol("0.39") == ("0.39", None)            # 无斜杠=纯称样量
+    assert _split_mass_vol("0.39/") == ("0.39", None)           # 斜杠后空=无体积
+    assert _split_mass_vol(" 0.5 / 25.0 ") == ("0.5", "25.0")   # 去空白
+    assert _split_mass_vol(None) == ("", None)                  # 空单元格
     print("selfcheck OK")
 
 
