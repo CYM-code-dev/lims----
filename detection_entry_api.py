@@ -1558,6 +1558,17 @@ class DetectionAPI:
             if _hit(f"{base}/detectionManager/manager/sample/pageObj",
                     {**sp, "sampleReceiveStatus": "SAMPLE_RECEIVE_STATUS_NO_INVENTORY_STATUS_ALREADY"}):
                 return "未收样"
+            # 3.5) 状态枚举兜底：无过滤按报验编号查 pageObj，读 processStatus 精确归类
+            # sampleReceiveStatus 枚举组合不稳(如 NO_INVENTORY_STATUS_ALREADY 只命中部分未收样样品)，
+            # 其余未收样样品会漏判→误报"不存在"；processStatus 是 LIMS 返回的权威状态文案。
+            r = sess.get(f"{base}/detectionManager/manager/sample/pageObj",
+                         params=sp, headers=headers, verify=False, timeout=60)
+            if r.status_code == 200:
+                _vl = (r.json().get('resultData') or {}).get('voList') or []
+                if _vl:
+                    _ps = str(_vl[0].get('processStatus') or '').strip()
+                    if _ps:
+                        return _ps
         except Exception as e:
             if log_func:
                 log_func(f"[诊断异常] {type(e).__name__}: {str(e)[:200]}")

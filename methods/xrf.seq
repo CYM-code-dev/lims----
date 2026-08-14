@@ -1,10 +1,10 @@
 sequence_data:
 - id: 1
-  weighing_path: D:/下载文件/钉钉/模板 - 8-12.xlsx
+  weighing_path: ''
   method_file: D:/Agent/lims数据登记/methods/XRF-总.mtd
-  spectrum_path: D:/下载文件/钉钉/0813
+  spectrum_path: D:/下载文件/钉钉/260260814
   temperature: '22'
-  humidity: '58'
+  humidity: '56'
 column_widths:
 - 50
 - 260
