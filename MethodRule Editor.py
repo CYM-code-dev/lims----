@@ -321,6 +321,14 @@ class QueryTab:
         ttkb.Button(input_frame, text="添加", command=add_exclusion_rule, bootstyle="secondary").grid(row=0, column=4, padx=5, pady=3,
                                                                               sticky='e')
 
+        # 匹配语义提示（与 _exclusion_match/_project_match 一致：精确全名 / *通配*）
+        excl_hint = ttk.Frame(main_frame)
+        excl_hint.pack(fill='x', pady=(0, 5))
+        ttk.Label(excl_hint,
+                  text="（项目：留空=任意；含 * 按通配匹配，否则精确匹配全名——用 *关键字* 可按包含排除，"
+                       "如 *蒽* 会排除 蒽油/苯并[a]蒽 等所有含\"蒽\"的项目。检测方法：留空=任意，否则按标准号宽松匹配。两者均留空=排除全部）",
+                  foreground="gray", wraplength=840).pack(anchor='w')
+
         # 排除项目列表
         list_frame = ttk.LabelFrame(main_frame, text="已添加的排除项目", padding=5)
         list_frame.pack(fill='both', expand=True, pady=(0, 5))

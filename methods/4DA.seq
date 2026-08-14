@@ -1,10 +1,16 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/0811-RC/副本称量记录.xlsx
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/称量记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/4大.mtd
-  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/0811-RC
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/0812-RC
+  temperature: '22'
+  humidity: '65'
+- id: 2
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/称量记录.xlsx
+  method_file: D:/Agent/lims数据登记/methods/4大.mtd
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/无机/实验数据/ICP-500MAX/2026/08/0813-RC
   temperature: '20'
-  humidity: '59'
+  humidity: '50'
 column_widths:
 - 50
 - 260

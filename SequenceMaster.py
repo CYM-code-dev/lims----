@@ -1773,7 +1773,11 @@ class SelectableRow:
     STATUS_STYLE = {
         "待运行": ("white", "#888888"),
         "运行中": ("#dbeafe", "#2563eb"),
+        "暂存成功": ("#ccfbf1", "#0d9488"),   # Phase 1 已暂存待签名(青)
+        "签名中": ("#dbeafe", "#2563eb"),     # Phase 2 签名中(蓝)
         "成功":   ("#dcfce7", "#16a34a"),
+        "完成":   ("#dcfce7", "#16a34a"),      # Phase 2 签名完成(绿)
+        "签名失败": ("#fee2e2", "#dc2626"),    # 签名失败(已暂存,见日志手动签名/重跑)
         "失败":   ("#fee2e2", "#dc2626"),
         "跳过":   ("#f5f5f5", "#9ca3af"),
         "中止":   ("#fef3c7", "#d97706"),
@@ -3612,6 +3616,15 @@ class SequenceMaster:
         if _last and time.time() - _last < 1.0:
             time.sleep(1.0 - (time.time() - _last) + 0.15)
 
+        # 各待签行先标"签名中"；按行计批数，本行批全签完即定终态"完成"(全成功)/"签名失败"(有失败,已暂存)
+        _pend_by_row, _done_by_row, _row_ok = {}, {}, {}
+        for p in self._pending_signs:
+            _pend_by_row[p["idx"]] = _pend_by_row.get(p["idx"], 0) + 1
+            if p["idx"] not in _done_by_row:
+                _done_by_row[p["idx"]] = 0
+                _row_ok[p["idx"]] = True
+                self._ui_q.put(("status", (p["idx"], "签名中", "")))
+
         def _sign_one(p):
             if self._stop.is_set():
                 return p, False, "用户中止(已暂存)"
@@ -3630,6 +3643,13 @@ class SequenceMaster:
                     self._log(f"[行{p['idx'] + 1}] 签名成功 实验编号 {p['real_code']}")
                 else:
                     self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存）实验编号 {p['real_code']}：{reason} — 可手动签名或重跑")
+                    _row_ok[p["idx"]] = False
+                _done_by_row[p["idx"]] += 1
+                if _done_by_row[p["idx"]] == _pend_by_row[p["idx"]]:
+                    _ok = _row_ok[p["idx"]]
+                    self._ui_q.put(("status", (p["idx"],
+                        "完成" if _ok else "签名失败",
+                        "" if _ok else "签名失败(已暂存)，见日志可手动签名或重跑")))
         self._sign_results.sort(key=lambda s: s["idx"])
 
     def _run_one_row(self, idx, weighing_caches=None):
@@ -3959,7 +3979,9 @@ class SequenceMaster:
             codes.append(code)
 
         real_code = " / ".join(codes)
-        self._ui_q.put(("status", (idx, "成功", "")))
+        # 勾选提交签名的方法：Phase 1 暂存完成标"暂存成功"(Phase 2 再转"签名中"→"完成")；否则即"成功"
+        _staged = any(p["idx"] == idx for p in self._pending_signs)
+        self._ui_q.put(("status", (idx, "暂存成功" if _staged else "成功", "")))
         self._ui_q.put(("rowdata", (idx, {
             "experiment_code": real_code,
             "samples_total": len(samples),
@@ -5460,8 +5482,8 @@ class SequenceMaster:
     def _on_run_done(self):
         self._set_running(False)
         self._confirm_done.set()
-        ok = sum(1 for r in self.sequence_data if r.get("status") == "成功")
-        fail = sum(1 for r in self.sequence_data if r.get("status") == "失败")
+        ok = sum(1 for r in self.sequence_data if r.get("status") in ("成功", "完成"))
+        fail = sum(1 for r in self.sequence_data if r.get("status") in ("失败", "签名失败"))
         abort = sum(1 for r in self.sequence_data if r.get("status") == "中止")
         total = ok + fail + abort
         self._append_log("==== 序列运行结束 ====")
@@ -5477,7 +5499,7 @@ class SequenceMaster:
                 for _s in _s_fail:
                     self._append_log(f"  - 行{_s['idx'] + 1} 实验编号 {_s['code']}：{_s['reason']}")
         # 汇总：各成功行样品合并情况(跨行合计)，格式对齐单行「成功，… 个样品参与合并」
-        rows_ok = [r for r in self.sequence_data if r.get("status") == "成功"]
+        rows_ok = [r for r in self.sequence_data if r.get("status") in ("成功", "完成")]
         tot = sum(r.get("samples_total", 0) for r in rows_ok)
         merged = sum(r.get("samples_merged", 0) for r in rows_ok)
         if tot:
