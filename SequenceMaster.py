@@ -758,6 +758,15 @@ def _strip_parallel_suffix(code):
     return (m.group(1) + m.group(2)) if m else (code or "")
 
 
+def _stem_sample_code(path):
+    """从谱图文件名取样品号主体：去扩展名后取开头连续字母数字，
+    自动剥掉 _报告 等非标准后缀(下划线/中文/- 分隔)，对齐服务端 sampleCode(报验编号+小号)。
+    样品号规范为纯字母数字，遇首个非字母数字即截断；不符则回退原 split('-') 口径。"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'[A-Za-z0-9]+', stem)
+    return m.group(0) if m else stem.split("-", 1)[0]
+
+
 class _ParallelWMap(dict):
     """称量记录 dict：.get 按样品编号容错查找。
     称样记录的 A/B 平行常省略 3 位小号(写 报验编号+字母，如 TN26070729A/B)，合并后 key=报验编号
@@ -968,6 +977,14 @@ def _split_mass_vol(raw):
     parts = s.split("/")
     vol = parts[1].strip() if len(parts) > 1 else ""
     return parts[0].strip(), (vol or None)
+
+
+def _is_metal_sample(desc, masses=None):
+    """金属样品(固体直测)：desc 含「金属」(排除「非金属」)且无实数称样量。
+    这类样品不称样(称样量记 '/')、无对应编号谱图(免上传免谱图检查)。
+    录了称样量的金属(真称样)按普通样品处理，返回 False。"""
+    d = desc or ""
+    return "金属" in d and "非金属" not in d and not (masses or [])
 
 
 def _read_weighing_records(path):
@@ -4263,6 +4280,14 @@ class SequenceMaster:
             eff = (it.get("_wmode") or "") if _cond else base_wmode  # 条件称样按样品命中；否则整批统一
             _eff_by_sample[sc] = eff
             samp = (ctx["wmap"] or {}).get(sc) or {}
+            # 金属样品(固体直测)：不称样、称样量记 "/"，跳过平行数校验
+            if _is_metal_sample(samp.get("desc"), samp.get("masses")):
+                _desc = samp.get("desc") or ""
+                pmasses_by_sample[sc] = ["/"] * _n_par_by_sample.get(sc, 1)
+                desc_by_sample[sc] = _desc
+                primary_cache[sc] = {"masses": pmasses_by_sample[sc], "marker_masses": {}, "desc": _desc}
+                log(f"样品 {sc} 试样描述=金属，称样量记 '/' (不称样)")
+                continue
             # 定容体积：称样量单元格 "0.39/10.00" 斜杠后段(原样串，保留末尾0)；与称样方式无关，按平行数展开
             _vols = samp.get("volumes") or []
             if _vols:
@@ -4561,7 +4586,7 @@ class SequenceMaster:
                 # 行无样品编号时优先用 PDF 内容 `样品 :` 字段(文件名号可能与内容不一致)
                 from report_parser import extract_content_sample_ids
                 cids = extract_content_sample_ids(sp)
-                code = cids[0] if cids else os.path.splitext(os.path.basename(sp))[0].split("-", 1)[0]
+                code = cids[0] if cids else _stem_sample_code(sp)
             return [(code, [sp])], None
         pdfs = sorted(glob.glob(os.path.join(sp, "*.pdf"))) if os.path.isdir(sp) else []
         if not pdfs:
@@ -4573,7 +4598,7 @@ class SequenceMaster:
             row["sample_code"] = ""
             sc = ""
         if len(pdfs) == 1:
-            code = os.path.splitext(os.path.basename(pdfs[0]))[0].split("-", 1)[0]
+            code = _stem_sample_code(pdfs[0])
             return [(code, [pdfs[0]])], None
         # 多PDF + 未填样品编号 → 用称样记录编号 ∩ 目录PDF 展开(只有两边都有的编号才参与录入)
         if not wmap:
@@ -4581,7 +4606,7 @@ class SequenceMaster:
                 # 无称样记录默认模式：目录内每个编号(按文件名前缀去平行小号)各成一样品，全部参与录入
                 _by_code = {}
                 for _p in pdfs:
-                    _c = os.path.splitext(os.path.basename(_p))[0].split("-", 1)[0]
+                    _c = _stem_sample_code(_p)
                     _by_code.setdefault(_c, []).append(_p)
                 return [(_c, _ps) for _c, _ps in _by_code.items()], None
             return [], "目录有多个PDF且未填样品编号，请在「称样记录路径」填称样记录excel(按 excel∩谱图 展开)"
@@ -4596,8 +4621,12 @@ class SequenceMaster:
                        if _code_belongs_sample(
                            os.path.splitext(os.path.basename(p))[0].split("-", 1)[0], code, key)
                        or any(_code_belongs_sample(cid, code, key) for cid in content_index.get(p, ()))]
+            _desc = (entry or {}).get("desc") or ""
             if matched:
-                cands.append((code, (entry or {}).get("desc") or "", matched))
+                cands.append((code, _desc, matched))
+            elif _is_metal_sample(_desc, (entry or {}).get("masses")):
+                # 金属样品(固体直测)无对应编号谱图：纳入录入但不上传谱图
+                cands.append((code, _desc, []))
         if not cands:
             return [], "称样记录中的样品编号在谱图目录内均无匹配PDF"
         # 混目录分流：方法 switch_rules 含 desc 时，只保留试样描述命中本方法的样品
@@ -5040,10 +5069,10 @@ class SequenceMaster:
         def _value_for_record(rec, slot):
             item = pid_to_item.get(str(rec.get("projectId")))
             if not item:
-                return "", False
+                return "", False, "记录projectId无对应样品项目"
             parsed = parsed_by_sample.get(item.get("sample_code"))
             if not parsed:
-                return "", False  # 该样品 PDF 缺失/解析失败 → 留空
+                return "", False, ""  # 该样品 PDF 缺失/解析失败 → 留空(已单独告警)
             samples, diluted_compounds, _headers = parsed
             # 取该平行槽样品；槽超界(平行数<样品数，如 N=1 而报告有 A/B)则取首个
             compounds = samples[slot][1] if slot < len(samples) else samples[0][1]
@@ -5053,31 +5082,38 @@ class SequenceMaster:
                                      else diluted_compounds[0]) if diluted_compounds else None
             det_pid = item["project"].get("detectionProjectId")
             if not det_pid:
-                return "", False
+                return "", False, "样品项目无detectionProjectId"
             if det_pid not in alias_cache:
                 alias, _detail = self.api.get_project_alias(det_pid, log)
                 alias_cache[det_pid] = alias or ""
             alias = alias_cache.get(det_pid)
             if not alias:
-                return "", False
+                return "", False, f"项目别名为空(detectionProjectId={det_pid})"
             try:
                 results = evaluate_alias(alias, compounds, diluted_compounds=diluted_compounds)
-            except Exception:
-                return "", False
+            except Exception as e:
+                return "", False, f"别名求值异常({e})"
             if not results:
-                return "", False
+                return "", False, "别名解析出0段"
             if comp_col_code:  # 多组分：按记录组分名匹配段(组分名取自记录该列值)
                 comp_name = str(rec.get(comp_col_code) or "").strip()
                 if comp_name:
                     seg = next((r for r in results if r.get("lims_component") == comp_name), None)
                     if seg is not None:
-                        return seg.get("value", ""), bool(seg.get('raw', {}).get('diluted'))
+                        return seg.get("value", ""), bool(seg.get('raw', {}).get('diluted')), ""
             seg0 = results[0]
-            return seg0.get("value", ""), bool(seg0.get('raw', {}).get('diluted'))  # 无组分列(PAHs)：单段即该化合物浓度
+            # 无组分列(PAHs)：单段即该化合物浓度；组分列未命中也回落首段
+            return seg0.get("value", ""), bool(seg0.get('raw', {}).get('diluted')), ""
 
         rec_values = [_value_for_record(r, parallel_of.get(g, 0)) for g, r in enumerate(records)]
-        values = [v for v, _d in rec_values]
-        diluted_flags = [_d for _v, _d in rec_values]
+        values = [v for v, _d, _r in rec_values]
+        diluted_flags = [_d for _v, _d, _r in rec_values]
+        _reasons = {}
+        for _v, _d, _r in rec_values:
+            if not _v and _r:
+                _reasons[_r] = _reasons.get(_r, 0) + 1
+        if _reasons:
+            log("报告解析: 未回填原因分布 " + ", ".join(f"{k}×{n}" for k, n in _reasons.items()))
         host.data_fields[res_col] = [_Box(v) for v in values]
         # 稀释列：超线性(稀释)记录填倍数，其余填 1（LIMS 据稀释列×结果自算）
         dil_col = next((c.get("columeCode") for c in (dynamic_columns or [])
@@ -5257,7 +5293,7 @@ class SequenceMaster:
                 _pn_part = f"项目名不符(规则={project_vals}，项目名={_pnames})"
                 _detail = f" 其中 {len(_std_hit)} 个项目标准号已命中，但 {_sub_part + '；' if _sub_part else ''}{_pn_part}。"
             return None, (f"方法文件指定的方法不在此样品项目中。"
-                          f"样品实际方法: {', '.join(stdnos)}。{_detail}请检查录入方法文件。")
+                          f"样品实际方法: {', '.join(stdnos)}。{_detail}")
 
         # 方法文件未指定方法：仅当样品只含单一方法时才可用全部(再按 project 过滤)
         if len(stdnos) <= 1:
@@ -5389,6 +5425,8 @@ class SequenceMaster:
             known = sorted({s for s in reqs if s}, key=len, reverse=True)
             from report_parser import _DILUTION_RE  # 剥 -NNX 稀释后缀，避免稀释报告自成平行组被强求各后缀齐全
             for sc, _pdfs in samples:
+                if not _pdfs:
+                    continue  # 金属样品(固体直测)无谱图，免检样品级谱图
                 base = _strip_parallel_suffix(sc).lower()  # 报验号(去平行小号 001)
                 head = re.compile(re.escape(base) + r"(\d{3})?(.*)$")
                 # 拆每个文件为 (平行字母, 后缀)：先扣已知后缀，剩余单字母 = 平行字母
@@ -6049,6 +6087,14 @@ def _selfcheck():
     assert _split_mass_vol("0.39/") == ("0.39", None)           # 斜杠后空=无体积
     assert _split_mass_vol(" 0.5 / 25.0 ") == ("0.5", "25.0")   # 去空白
     assert _split_mass_vol(None) == ("", None)                  # 空单元格
+    # 金属样品不称样：称样量单元格 "/" → _split_mass_vol 得空 → 触发 desc=金属 记 "/" 跳过平行校验。
+    assert _split_mass_vol("/") == ("", None)                   # 单斜杠=空称样量(金属不称样)
+    # _is_metal_sample：金属(固体直测)不称样、不需谱图；排除「非金属」，录了称样量则按真实值
+    assert _is_metal_sample("金属", [])                         # 金属无称样量→记 '/' 且免谱图
+    assert _is_metal_sample("金属件", [])                       # 含「金属」子串亦命中
+    assert not _is_metal_sample("非金属", [])                   # 非金属(聚合物)不命中
+    assert not _is_metal_sample("金属", [0.5])                  # 金属但录了称样量→用真实值
+    assert not _is_metal_sample("塑料", [])                     # 非金属描述不命中
     print("selfcheck OK")
 
 

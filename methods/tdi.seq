@@ -3,8 +3,8 @@ sequence_data:
   weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/TDI/称量记录1.xlsx
   method_file: D:/Agent/lims数据登记/methods/TDI.mtd
   spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/TDI
-  temperature: '22'
-  humidity: '50'
+  temperature: '23'
+  humidity: '52'
 column_widths:
 - 50
 - 260

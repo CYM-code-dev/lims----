@@ -1,14 +1,14 @@
 sequence_data:
 - id: 1
-  weighing_path: D:/下载文件/钉钉/仪器036/称样记录.xlsx
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/20260814-PD/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE固体.mtd
-  spectrum_path: D:/下载文件/钉钉/仪器036
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/20260814-PD
   temperature: '25'
   humidity: '60'
 - id: 2
-  weighing_path: D:/下载文件/钉钉/仪器036/称样记录.xlsx
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/20260814-PD/称样记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/跑道PAE液体.mtd
-  spectrum_path: D:/下载文件/钉钉/仪器036
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/20260814-PD
   temperature: '25'
   humidity: '60'
 column_widths:
