@@ -1815,31 +1815,16 @@ class SelectableRow:
             self.status_label.configure(text=text, bg=bg, fg=fg)
 
     def on_weighing_button_click(self):
-        """称样记录路径按钮点击事件"""
-        if self.selection_manager.is_cell_selected(self.index, 1):
-            # 如果单元格被选中，进入编辑模式
-            self.cells[1].start_editing()
-        else:
-            # 否则执行原来的路径选择功能
-            self.on_path_select(self.index)
+        """称样记录路径按钮：打开文件选择器(双击单元格可手动编辑/清空)"""
+        self.on_path_select(self.index)
 
     def on_method_button_click(self):
-        """方法文件按钮点击事件"""
-        if self.selection_manager.is_cell_selected(self.index, 2):
-            # 如果单元格被选中，进入编辑模式
-            self.cells[2].start_editing()
-        else:
-            # 否则执行原来的路径选择功能
-            self.on_method_select(self.index)
+        """方法文件按钮：打开文件选择器(双击单元格可手动编辑/清空)"""
+        self.on_method_select(self.index)
 
     def on_spectrum_button_click(self):
-        """谱图文件路径按钮点击事件"""
-        if self.selection_manager.is_cell_selected(self.index, 5):
-            # 如果单元格被选中，进入编辑模式
-            self.cells[5].start_editing()
-        else:
-            # 否则执行原来的路径选择功能
-            self.on_spectrum_select(self.index)
+        """谱图文件路径按钮：打开文件选择器(双击单元格可手动编辑/清空)"""
+        self.on_spectrum_select(self.index)
 
     def on_equipment_button_click(self):
         """设备列按钮：打开设备多选选择器（单元格值绑 equipment）"""
@@ -2030,6 +2015,7 @@ class SequenceMaster:
         self.root.bind('<KeyRelease-Shift_L>', self.on_shift_release)
         self.root.bind('<KeyRelease-Shift_R>', self.on_shift_release)
         self.root.bind('<Escape>', self.clear_selection)
+        self.root.bind('<Delete>', self.on_delete_key)
 
         # 绑定全局点击事件，用于退出编辑模式
         self.root.bind('<Button-1>', self.on_global_click)
@@ -2457,6 +2443,32 @@ class SequenceMaster:
         self.selection_manager.clear_all_selection()
         self.refresh_table()
         self.status_var.set("已清除选择")
+        return "break"
+
+    def on_delete_key(self, event=None):
+        """Delete 键：清空选中单元格(或选中行)的数据值(序号列除外)；编辑中交由输入框删字符"""
+        for rw in self.row_widgets:
+            for cell in rw.cells:
+                if getattr(cell, "editing", False):
+                    return  # 输入框编辑中，让 Delete 正常删字符，不清空单元格
+        targets = set(self.selection_manager.selected_cells)  # (row, col)
+        for r in self.selection_manager.selected_rows:  # 整行选中 → 该行所有数据列
+            if 0 <= r < len(self.row_widgets):
+                for c in range(1, len(self.row_widgets[r].cells)):
+                    targets.add((r, c))
+        if not targets:
+            return
+        n = 0
+        for (row, col) in targets:
+            if col == 0 or not (0 <= row < len(self.row_widgets)):
+                continue
+            cell = self.row_widgets[row].cells[col]
+            if cell and not getattr(cell, "destroyed", False):
+                cell.set_value("")
+                n += 1
+        if n:
+            self.refresh_table()
+            self.status_var.set(f"已清空 {n} 个单元格")
         return "break"
 
     def handle_cell_select(self, row, col, event):
@@ -3427,13 +3439,14 @@ class SequenceMaster:
             messagebox.showerror("错误", f"加载失败: {str(e)}")
 
     def edit_method(self):
-        """方法编辑入口：取序列里最上面的有方法的行，打开方法编辑器"""
-        target = None
-        for row in self.sequence_data:
-            mf = row.get("method_file")
-            if mf:
-                target = mf
-                break
+        """方法编辑入口：打开当前选中行的方法；未选中行则回落到序列最上面的有方法的行"""
+        rows = ({r for r, c in self.selection_manager.selected_cells}
+                | set(self.selection_manager.selected_rows))
+        if rows:
+            r = min(rows)
+            target = self.sequence_data[r].get("method_file") if 0 <= r < len(self.sequence_data) else None
+        else:
+            target = next((row.get("method_file") for row in self.sequence_data if row.get("method_file")), None)
         self._open_method_editor(target)
 
     def _open_method_editor(self, file_path=None):
