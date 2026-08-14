@@ -869,7 +869,7 @@ class DetectionEntrySystem:
                 dilution_factor = _dilution_factor(dil_path)
             plan = []
             for spec in project_specs:
-                alias, detail = self.api.get_project_alias(spec['detectionProjectId'], self.log)
+                alias, detail = self.api.get_project_alias(spec['detectionProjectId'], self.log, spec['projectName'])
                 if not alias:
                     self.log(f"项目 {spec['projectName']} 别名取不到({detail})，跳过")
                     continue

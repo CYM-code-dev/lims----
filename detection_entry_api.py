@@ -37,6 +37,7 @@ class DetectionAPI:
         self.method_id_to_standard_no = {}
         self._std_no_name_to_id = self._load_std_no_name_cache()  # standardNoName -> methodId，持久化跨进程复用
         self.cached_solution_types = None
+        self._alias_by_name = {}  # projectName -> 项目别名；同名跨方法/批次复用，避免重复兄弟查询
 
         # 实验编号缓存
         self.experiment_code_cache = {}  # 缓存已生成的实验编号
@@ -1856,7 +1857,7 @@ class DetectionAPI:
             "ocChoicePage", "称样设备", sample_project_id, {}, log_func,
         )
 
-    def get_project_alias(self, detection_project_id, log_func=None):
+    def get_project_alias(self, detection_project_id, log_func=None, project_name=None):
         """取项目别名（谱图数据采集的解析规则串）。
 
         对应网页 检测标准管理→项目→属性 的 detectionProjectProperty/detailByProject，
@@ -1885,7 +1886,18 @@ class DetectionAPI:
                 result = response.json()
                 if result.get('success'):
                     alias = (result.get('resultData') or {}).get('otherName') or ''
-                    return alias, ('空' if not alias else 'ok')
+                    if alias:
+                        return alias, 'ok'
+                    # otherName 空：别名可能配在同名另一条检测项目定义上 → 按名找兄弟回退
+                    # (见记忆 lims-duplicate-detection-project-alias)。按名缓存，整运行只查一次。
+                    if project_name:
+                        alias = self._alias_by_name.get(project_name)
+                        if alias is None:
+                            alias = self._lookup_alias_by_name(project_name, detection_project_id, log_func) or ''
+                            self._alias_by_name[project_name] = alias
+                        if alias:
+                            return alias, f"同名兄弟回退({project_name})"
+                    return '', '空'
                 detail = f"success=false: {str(result)[:150]}"
                 if log_func:
                     log_func(detail)
@@ -1899,6 +1911,70 @@ class DetectionAPI:
             if log_func:
                 log_func(f"取项目别名 {detail}")
             return '', detail
+
+    def _lookup_alias_by_name(self, project_name, exclude_id=None, log_func=None):
+        """按项目名找同名检测项目定义，逐条 detailByProject 取 otherName，返回首个非空别名。
+        回退场景：detailByProject?id=X 返回 otherName 空，但别名配在同名另一条检测项目定义上
+        (见记忆 lims-duplicate-detection-project-alias)。走 detectionProject/pageObj?keyword=<项目名> 取
+        同名 id 列表(此前会话实测)，客户端再按名精确匹配后逐条 detailByProject。
+        注意：同名两条的别名规则值可能不同，借用会按兄弟的规则算——日志留痕可追溯。"""
+        if not project_name:
+            return ''
+        try:
+            params = {
+                'keyword': project_name,       # 项目名过滤(此前会话实测 pageObj 用 keyword)
+                '_search': 'false',
+                'nd': str(int(time.time() * 1000)),
+                'pageSize': '50',
+                'pageNo': '1',
+                'pid': self.get_user_pid(),
+                'pname': self.get_user_pname(),
+                'loginId': self.get_user_login_id(),
+            }
+            response = self.login_system.session.get(
+                f'{self.login_system.base_url}/detectionManager/manager/detectionProject/pageObj',
+                params=params,
+                headers={
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Referer': f'{self.login_system.base_url}/web/testStandardMgt.html?menuId=294',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                verify=False, timeout=20,
+            )
+            if response.status_code != 200:
+                if log_func:
+                    log_func(f"同名兄弟查询 HTTP {response.status_code}(detectionProject/pageObj)")
+                return ''
+            result = response.json()
+            if not result.get('success'):
+                if log_func:
+                    log_func(f"同名兄弟查询 success=false({str(result)[:120]})")
+                return ''
+            rd = result.get('resultData')
+            items = (rd.get('voList') if isinstance(rd, dict) else rd) or []
+            if len(items) > 50:   # 安全阀：过滤未生效会返回海量记录，不逐条查(避免请求风暴)
+                if log_func:
+                    log_func(f"同名兄弟查询返回 {len(items)} 条(疑似 keyword 过滤未生效)，跳过逐条取别名")
+                return ''
+            target = project_name.strip()
+            for it in items:
+                iname = str(it.get('name') or it.get('detectionProjectName')
+                            or it.get('decideProjectName') or '').strip()
+                if iname != target:        # 客户端按名精确匹配(兜底服务端过滤字段不符)
+                    continue
+                sid = it.get('id') or it.get('detectionProjectId')
+                if not sid or str(sid) == str(exclude_id):
+                    continue
+                alias, _ = self.get_project_alias(sid, log_func)  # 不传 project_name → 不回环
+                if alias:
+                    if log_func:
+                        log_func(f"项目别名借用: {project_name} <- 同名 detectionProjectId={sid}")
+                    return alias
+            return ''
+        except Exception as e:
+            if log_func:
+                log_func(f"同名兄弟查询异常: {e}")
+            return ''
 
     def save_main_equipment(self, experiment_id, items, log_func=None):
         """提交主检设备到 ocExperiment/saveMainEqubment（测试）。

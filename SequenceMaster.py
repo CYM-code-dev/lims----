@@ -805,6 +805,17 @@ def _base_and_letter(code):
     return m.group(1), m.group(2)
 
 
+def _marker_seg_index(slot, samples, marker):
+    """标记项目按标记字母(如 'M')在 samples=[(sid, compounds), ...] 中定位段索引；
+    无标记或匹配不到则回落 slot(平行槽)。用于浓度回填与称样量列同源——标记样(如 5mm以内)
+    取标记段而非平行槽(A/B)。"""
+    if marker:
+        for i, (sid, _c) in enumerate(samples):
+            if _base_and_letter(sid)[1].upper() == marker.upper():
+                return i
+    return slot
+
+
 def _code_belongs_sample(any_code, code, key):
     """any_code(谱图文件名stem 或 PDF内容样品号) 是否归属样品 code(wmap合并后基编号)。
     按小号匹配，避免 startswith(key) 把同报验号的其它小号全吃进：
@@ -5064,6 +5075,14 @@ class SequenceMaster:
 
         parallel_of, _n_par = _parallel_indices(records)  # 每条记录的平行槽(用 serialNumber)
 
+        # 标记路由(与称样量列 _mass_field_by_project 同源)：projectId -> 谱图filter字母(如 'M')。
+        # 标记项目(如「5mm以内」)的浓度应取标记段(M)，而非平行槽(A/B)——与称样量同源。
+        _pname_filter = {r["project"]: r["filter"]
+                         for r in (self._read_spectrum_filter_rules(ctx.get("method_file")) or [])}
+        pid_filter = {str(it["project"].get("projectId")):
+                      _pname_filter.get(it["project"].get("projectName", ""), "")
+                      for it in batch_items}
+
         # 告警：报告样品段数 > 该样品平行槽(=称样量数) → 多余段(如 B)被静默丢弃
         # 平行数取自称样量个数(见 _submit_batch _par_by)，称样量不足时扩不出对应平行槽，
         # _value_for_record 槽超界回落 samples[0] → 报告里 A/B 的 B 被丢。这里让它可见。
@@ -5087,17 +5106,20 @@ class SequenceMaster:
             if not parsed:
                 return "", False, ""  # 该样品 PDF 缺失/解析失败 → 留空(已单独告警)
             samples, diluted_compounds, _headers = parsed
-            # 取该平行槽样品；槽超界(平行数<样品数，如 N=1 而报告有 A/B)则取首个
-            compounds = samples[slot][1] if slot < len(samples) else samples[0][1]
-            # 稀释源按平行槽取(dil_pdf 多样品 A-10X/B-10X 各对其槽)；单 dict(内容稀释)或 None 原样
+            # 取段：标记项目(pid_filter=字母如 M)按标记字母取段(与称样量列同源)；否则取平行槽。
+            # 槽超界(平行数<样品数，如 N=1 而报告有 A/B)则取首个。
+            _seg_idx = _marker_seg_index(slot, samples,
+                                         pid_filter.get(str(rec.get("projectId")), ""))
+            compounds = samples[_seg_idx][1] if _seg_idx < len(samples) else samples[0][1]
+            # 稀释源按所取段对齐(dil_pdf 多样品 A-10X/B-10X 各对其段)；单 dict(内容稀释)或 None 原样
             if isinstance(diluted_compounds, list):
-                diluted_compounds = (diluted_compounds[slot] if slot < len(diluted_compounds)
+                diluted_compounds = (diluted_compounds[_seg_idx] if _seg_idx < len(diluted_compounds)
                                      else diluted_compounds[0]) if diluted_compounds else None
             det_pid = item["project"].get("detectionProjectId")
             if not det_pid:
                 return "", False, "样品项目无detectionProjectId"
             if det_pid not in alias_cache:
-                alias, _detail = self.api.get_project_alias(det_pid, log)
+                alias, _detail = self.api.get_project_alias(det_pid, log, item["project"].get("projectName"))
                 alias_cache[det_pid] = alias or ""
             alias = alias_cache.get(det_pid)
             if not alias:
@@ -5892,6 +5914,12 @@ def _selfcheck():
     # 无 serialNumber 回退：按 projectId 枚举
     po2, n2 = _parallel_indices([{"projectId": "P1"}, {"projectId": "P1"}])
     assert n2 == 2 and po2 == {0: 0, 1: 1}, (n2, po2)
+
+    # _marker_seg_index：标记项目按标记字母取段(M段而非平行槽)，普通项目走 slot，匹配不到回落
+    _segs = [('TN26080581001A', {}), ('TN26080581001B', {}), ('TN26080581001M', {})]
+    assert _marker_seg_index(0, _segs, '') == 0 and _marker_seg_index(1, _segs, '') == 1
+    assert all(_marker_seg_index(s, _segs, 'M') == 2 for s in (0, 1, 2))
+    assert _marker_seg_index(1, _segs, 'X') == 1 and _marker_seg_index(0, _segs, None) == 0
 
     # _pdf_parallel_count：random/无称样记录模式，平行数由文件名 A/B 推断(扣已知后缀 T/TS)
     _suf = {"", "t", "ts"}
