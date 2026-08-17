@@ -3711,7 +3711,7 @@ class SequenceMaster:
                 if ok:
                     self._log(f"[行{p['idx'] + 1}] 签名成功 实验编号 {p['real_code']}")
                 else:
-                    self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存）实验编号 {p['real_code']}：{reason} — 可手动签名或重跑")
+                    self._log(f"[行{p['idx'] + 1}] 签名失败（已暂存，谱图未绑）实验编号 {p['real_code']}：{reason} — 建议重跑（或手动签名并补绑谱图）")
                     _row_ok[p["idx"]] = False
                 _done_by_row[p["idx"]] += 1
                 if _done_by_row[p["idx"]] == _pend_by_row[p["idx"]]:
@@ -4609,7 +4609,10 @@ class SequenceMaster:
                     fid_info[fid]["pids"].append(pid)
         spec_list = [{"fileId": fid, "fileName": v["fileName"], "projectId": ",".join(v["pids"])}
                      for fid, v in fid_info.items()]
-        if spec_list:
+        _require_sign = bool((self._read_other_params(ctx.get("method_file") or "") or {}).get("require_signature"))
+        # 签名批谱图只在签名载荷带：save+submit 都带会在签名 UPDATE 时重复绑定(20260817 两批实测每 PDF×2)。
+        # 暂存不带，失败模式落在暂存稿(重跑即修复)，不污染已签名记录。
+        if spec_list and not _require_sign:
             experiment_data["fileIds"] = ",".join(str(fid) for fid in fid_info)
             experiment_data["spectrumJsonList"] = json.dumps(spec_list)
         # ponytail: 服务端实验编号=lqy+秒级时间戳，同秒多批撞号(本地 experimentCode 被忽略)。
@@ -4619,7 +4622,6 @@ class SequenceMaster:
         if _last and _now - _last < 1.0:
             time.sleep(1.0 - (_now - _last) + 0.15)
         self._last_exp_submit_ts = time.time()
-        _require_sign = bool((self._read_other_params(ctx.get("method_file") or "") or {}).get("require_signature"))
         self._check_abort(idx)  # 提交前最后关口：配置都就绪，用户中止则不发起主提交(最重请求)立即跳出
         # Phase 1：恒走暂存(saveOcExperiment)。勾选提交签名时，签名(submitOcExperiment)留到全部暂存后统一做(_sign_all_pending)。
         log("暂存实验数据 (saveOcExperiment) ...")
@@ -4675,6 +4677,10 @@ class SequenceMaster:
                 experiment_data["experimentCode"] = real_code
             if experiment_id:
                 experiment_data["id"] = experiment_id
+            if spec_list:
+                # 谱图随签名载荷提交(暂存未带，见上方谱图注入说明)——最终恰好绑定一次
+                experiment_data["fileIds"] = ",".join(str(fid) for fid in fid_info)
+                experiment_data["spectrumJsonList"] = json.dumps(spec_list)
             self._pending_signs.append({
                 "experiment_data": experiment_data, "method_name": actual_method_name,
                 "idx": idx, "real_code": real_code, "first_pid": first_pid,
