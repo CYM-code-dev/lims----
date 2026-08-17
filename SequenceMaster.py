@@ -3653,7 +3653,7 @@ class SequenceMaster:
 
     def _sign_all_pending(self):
         """Phase 2：对已暂存批次【并行】调 submitOcExperiment 提交签名/推进工作流(两步式)。
-        各批实验编号已在 Phase 1 取定(不同记录、互不撞号)，故可并行——session 并发安全同 _query_samples_parallel。
+        各批实验编号已在 Phase 1 取定，并行处理；但发出需错峰≥1s(服务端编号按秒生成，同秒撞号)。
         每批独立：某批签名失败不影响其它批；失败批数据已暂存(可手动签名/重跑)。
         中止：_sign_one 起始查 _stop，未起的批跳过；已发出的 HTTP 不可中断会跑完(签名即目的，无害)。
         ponytail: 固定6线程；串行23批≈7min(submitOcExperiment 推进工作流，大批~30s)，6并行压到~2min。
@@ -3674,12 +3674,32 @@ class SequenceMaster:
                 _row_ok[p["idx"]] = True
                 self._ui_q.put(("status", (p["idx"], "签名中", "")))
 
+        # 服务端编号=前缀+秒级时间戳，同秒并行签名会撞号(20260817 两批同获 wjy...135356)。
+        # 错峰≥1s只保证"发出"不同秒，服务端处理仍可能同秒——根防靠签名载荷带记录 id 更新(见 _submit_batch)。
+        _sign_gate = threading.Lock()
+        _sign_last_ts = [0.0]
+
         def _sign_one(p):
             if self._stop.is_set():
                 return p, False, "用户中止(已暂存)"
+            with _sign_gate:
+                _wait = 1.0 - (time.monotonic() - _sign_last_ts[0])
+                if _wait > 0:
+                    time.sleep(_wait + 0.15)
+                _sign_last_ts[0] = time.monotonic()
             self._log(f"[行{p['idx'] + 1}] 提交签名 (submitOcExperiment) 实验编号 {p['real_code']} ...")
             ok, reason = self.api.submit_experiment_data(
                 p["experiment_data"], p["method_name"], self._log, require_signature=True)
+            if ok and p.get("first_pid"):
+                # 签名后回读确认编号未变；若服务端仍另立新编号，汇总/状态列用真实编号
+                try:
+                    cfg = self.api.get_experiment_config(p["first_pid"], "", "", "", self._log)
+                    final = self.api.extract_experiment_code(cfg, p["real_code"]) if isinstance(cfg, dict) else ""
+                    if final and final != p["real_code"]:
+                        self._log(f"[行{p['idx'] + 1}] 签名后编号变更: {p['real_code']} → {final}（LIMS 请用新编号检索）")
+                        p["real_code"] = final
+                except Exception as e:
+                    self._log(f"[行{p['idx'] + 1}] 签名后编号确认失败: {e}")
             return p, ok, reason
 
         _workers = min(6, len(self._pending_signs) or 1)
@@ -4647,10 +4667,17 @@ class SequenceMaster:
                 return False, ""
 
         if _require_sign:
-            # 入队 Phase 2 签名：experiment_data 暂存后不再变更(fileIds/spectrumJsonList 提交前已写定)，可原样复用提交
+            # 签名载荷须带暂存记录的 id + 服务端编号：save/submit 载荷无 id 时服务端按新记录处理、
+            # 按服务端时钟重生成编号（网页前端暂存后刷新表单再提交，id+编号都在）。
+            # 只同步编号不够(20260817 实测 135343 仍被改为 135356)，须带 id 才是"更新本条"。
+            if real_code != experiment_code:
+                log(f"签名载荷实验编号同步: {experiment_code} → {real_code}")
+                experiment_data["experimentCode"] = real_code
+            if experiment_id:
+                experiment_data["id"] = experiment_id
             self._pending_signs.append({
                 "experiment_data": experiment_data, "method_name": actual_method_name,
-                "idx": idx, "real_code": real_code,
+                "idx": idx, "real_code": real_code, "first_pid": first_pid,
             })
         log(f"本批完成，实验编号 {real_code}")
         return True, real_code
