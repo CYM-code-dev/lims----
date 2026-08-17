@@ -2831,11 +2831,6 @@ class SequenceMaster:
             return [], serr or "称样记录与谱图目录无交集样品"
         return codes, None
 
-    def _row_first_sample_code(self, row, log):
-        """取本行任一样品编号(设备列表/温湿度房间都是方法级，任一样品即可解析方法)。"""
-        codes, _ = self._row_sample_codes(row, log)
-        return codes[0] if codes else None
-
     def _resolve_equipment_choices(self, row, log):
         """本行【子方法】主检设备可选编号(设备选择器用)。
         - switch_rules 方法：复刻提交的 project_name+desc→to_id 路由(_match_switch_rule)，逐个
@@ -2864,7 +2859,7 @@ class SequenceMaster:
             return codes
 
         if not switch_rules:
-            eq_cfg = self._resolve_equipment_config(row, log)
+            eq_cfg = self._resolve_equipment_config(row, log, sample_codes)
             if not eq_cfg:
                 log("设备查询：未取到方法设备(样品不可查或方法未配置检测设备)，回退手动输入")
                 return None
@@ -2918,34 +2913,46 @@ class SequenceMaster:
             codes = _codes_from_raw((self.api.get_detection_equipment(mid, log) or {}).get("raw_data"), codes)
         return codes or None
 
-    def _resolve_equipment_config(self, row, log):
-        """查询 LIMS 取该行方法的完整 equipment_config(含 raw_data 全部检测设备)。
-        样品→方法→get_all_configs→equipment；按 sample_code 缓存(_env_eq_cfg_cache)。
-        需登录且行有样品(谱图)。失败/无样品返回 None。"""
-        sample_code = self._row_first_sample_code(row, log)
-        if not sample_code:
-            return None
+    def _resolve_equipment_config(self, row, log, sample_codes=None):
+        """查询 LIMS 取本行方法(任一可查样品)的检测设备配置(含 raw_data)。
+        同行样品可能分属不同标准(混标批，如 GB 36246 与 GB 18583)，逐样品尝试至命中；
+        命中后按子方法ID(decideProjectMethodId)逐个取设备并合并——getOcExperiment 混子方法
+        报"方法不同"，设备查询绕开它只走 selectByDetectionMethodId(与 switch 分支同源)。
+        按 sample_code 缓存(_env_eq_cfg_cache)。失败/无样品返回 None。"""
+        if sample_codes is None:
+            sample_codes, _ = self._row_sample_codes(row, log)
         cache = self._env_eq_cfg_cache
-        if sample_code in cache:
-            return cache[sample_code]
         eq_cfg = None
-        try:
-            projects = self.api.query_samples_by_conditions(
-                sample_code=sample_code, exact_match=True, log_func=log)
-            if projects:
+        probed = []
+        for sample_code in sample_codes:
+            if sample_code in cache:
+                if cache[sample_code]:
+                    return cache[sample_code]
+                continue   # 缓存的负结果：跳过，继续找下一个样品(混标批后段可能命中)
+            probed.append(sample_code)
+            try:
+                projects = self.api.query_samples_by_conditions(
+                    sample_code=sample_code, exact_match=True, log_func=log)
+                if not projects:
+                    continue
                 projects, ferr = self._filter_projects_by_method(projects, row, log)
-                if projects and not ferr:
-                    sample_id = projects[0].get("sampleId")
-                    sp_ids = ",".join(str(p["projectId"]) for p in projects if p.get("projectId"))
-                    method_name = projects[0].get("standardNo") or ""
-                    initial = self.api.get_experiment_config(sp_ids, method_name, "", sample_id, log)
-                    method_id = (initial.get("ocMethodSettings", {}) or {}).get("methodId")
-                    pnames = [p.get("projectName", "") for p in projects]
-                    all_cfg = self.api.get_all_configs(sp_ids, method_name, "", sample_id, log, method_id, pnames)
-                    eq_cfg = (all_cfg or {}).get("equipment") or None
-        except Exception as e:
-            log(f"查询方法设备列表异常({sample_code}): {e}")
-        cache[sample_code] = eq_cfg
+                if ferr:
+                    log(f"设备查询({sample_code})：{ferr}")
+                    continue
+                raw, seen = [], set()   # ponytail: 同批子方法设备高度重合，靠消费端 _codes_from_raw 去重
+                for p in projects or []:
+                    mid = p.get("decideProjectMethodId")
+                    if not mid or str(mid) in seen:
+                        continue
+                    seen.add(str(mid))
+                    raw.extend((self.api.get_detection_equipment(mid, log) or {}).get("raw_data") or [])
+                if raw:
+                    eq_cfg = {"raw_data": raw}
+                    break
+            except Exception as e:
+                log(f"查询方法设备列表异常({sample_code}): {e}")
+        for c in probed:
+            cache[c] = eq_cfg
         return eq_cfg
 
     def _override_equipment(self, equipment_config, device_field):
@@ -3596,6 +3603,7 @@ class SequenceMaster:
         """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q。
         循环按当前行数动态推进：运行期间新增的行(append 到末尾)会在当行结束后自动纳入运行。"""
         self._method_projects_cache.clear()  # 每次运行重建方法查询缓存(运行中样品已登记会使旧池过期)
+        self._run_merged_by_paths = {}  # {(称样路径,谱图路径): {已录入样品}}：同批混标分工行跳过已登记复核用
         self._pending_signs = []   # Phase 2 待签名批：勾选提交签名的方法暂存后入队，全部暂存完成再统一签名
         self._sign_results = []    # Phase 2 签名结果(供 _on_run_done 汇总)：[{idx,code,ok,reason}]
         weighing_caches = {}  # {组名: {sample_code: {masses,desc}}} 跨行共享称样量(称样量共享组)
@@ -3832,26 +3840,46 @@ class SequenceMaster:
         all_items = []  # [{project, sample_code, sample_id, pdf_paths}, ...]
         n_skip = 0
         skipped_samples = []  # [(code, reason), ...]
+        merged_samples = []  # [code, ...] 本行成功合并的样品，供跨行汇总：他行已录入≠真未录入(混标批)
+        mismatched = []  # 方法过滤失败的样品：已登记复核延后批量并行(逐样品串行=N×RTT，混标批26个≈25s)
         for si, (sc, pdf_paths) in enumerate(samples):
             if self._aborted(idx):
                 return "abort"
             if len(samples) > 1:
                 log(f"=== 样品 {si + 1}/{len(samples)}：{sc} ===")
-            items, serr = self._collect_sample_projects(idx, row, sc, pdf_paths, ctx, log, projects_by_sample)
+            items, serr = self._collect_sample_projects(idx, row, sc, pdf_paths, ctx, log,
+                                                         projects_by_sample, mismatched)
             if serr:
                 log(f"警告[{sc}]: {serr}，跳过该样品")
                 n_skip += 1
                 skipped_samples.append((sc, serr))
                 continue
             all_items.extend(items)
+            merged_samples.append(sc)
+        # 同称样记录+同谱图目录的行才是同批混标分工：他行已录入的样品不可能是漏查的
+        # 已登记样品，复核可跳过；路径不同属不同批次(样品撞号≠已处理)，不共享
+        _pk = ((row.get("weighing_path") or "").strip(), (row.get("spectrum_path") or "").strip())
+        self._run_merged_by_paths.setdefault(_pk, set()).update(merged_samples)
+        if mismatched:
+            _pend = [sc for sc in mismatched if sc not in self._run_merged_by_paths[_pk]]
+            if _pend:
+                # 批量复核已登记(并行)：方法过滤失败可能因项目已登记(未登记查询不返回)，命中细化为"已登记"
+                _done = self._query_samples_parallel(_pend, log, days=window_days,
+                                                     check_in_status="CHECK_IN_STATUS_ALREADY")
+                _mset = set(_pend)
+                for i, (sc, _reason) in enumerate(skipped_samples):
+                    if sc in _mset and _done.get(sc):
+                        _filt, _ = self._filter_projects_by_method(_done[sc], row, lambda *a, **k: None)
+                        if _filt:
+                            skipped_samples[i] = (sc, "已登记")
         if not all_items:
             self._ui_q.put(("status", (idx, "失败", "无可用样品项目")))
             self._ui_q.put(("rowdata", (idx, {"skipped_list": list(skipped_samples)})))
             log("失败: 所有样品均无可录入项目")
             if skipped_samples:
                 log(f"各样品未录入原因（{len(skipped_samples)} 个）：")
-                for sc, reason in skipped_samples:
-                    log(f"  - {sc}：{reason}")
+                for ln in self._fmt_skipped(skipped_samples):
+                    log(ln)
             return "fail"
 
         # 清空旧实验暂存与谱图(等价前端清空: cancleOcExperiment 连带删除旧谱图)；
@@ -4027,6 +4055,7 @@ class SequenceMaster:
             "experiment_code": real_code,
             "samples_total": len(samples),
             "samples_merged": len(samples) - n_skip,
+            "merged_list": merged_samples,  # [code, ...] 本行成功合并样品，供 _on_run_done 跨行去重
             "skipped_list": list(skipped_samples),  # [(code, reason), ...] 供 _on_run_done 跨行汇总
             "early_analysis": ctx.get("_early_analysis", []),  # [(code,分析日,受理日)] 分析时间<受理时间，供运行报告汇总
         })))
@@ -4034,15 +4063,38 @@ class SequenceMaster:
         log(f"成功，{len(samples) - n_skip}/{len(samples)} 个样品参与合并，实验编号 {real_code}{extra}")
         if skipped_samples:
             log(f"未录入样品（{len(skipped_samples)} 个）：")
-            for sc, reason in skipped_samples:
-                log(f"  - {sc}：{reason}")
+            for ln in self._fmt_skipped(skipped_samples):
+                log(ln)
         return "ok"
 
-    def _collect_sample_projects(self, idx, row, sample_code, pdf_paths, ctx, log, projects_by_sample=None):
+    def _fmt_skipped(self, skipped):
+        """未录入样品清单 → 日志行列表。同因归组：混标批非本行标准的样品原因全同，逐条列26行纯噪音。"""
+        by = {}
+        for sc, reason in skipped:
+            by.setdefault(reason, []).append(sc)
+        lines = []
+        for reason, codes in by.items():
+            cs = "、".join(codes[:6]) + (f" 等{len(codes)}个" if len(codes) > 6 else "")
+            lines.append(f"  - {reason}（{cs}）")
+        return lines
+
+    def _cross_row_summary(self, rows_ok):
+        """跨行样品合并汇总。返回 (合并数, 样品总数, 真未录入, 他行已录入)。
+        样品数按编号去重(多行/多批同一样品只算一次)；skipped 剔除他行 merged_list 已含的编号
+        (混标批：GB 36246 行未录入的样品恰是 18583 行录入的，属分工不是缺录)。"""
+        merged_codes = {sc for r in rows_ok for sc in r.get("merged_list", [])}
+        skipped_all = [(sc, reason) for r in rows_ok for (sc, reason) in r.get("skipped_list", [])]
+        skipped = [e for e in skipped_all if e[0] not in merged_codes]
+        cross = sorted({e[0] for e in skipped_all if e[0] in merged_codes})
+        return len(merged_codes), len(merged_codes | {sc for sc, _ in skipped_all}), skipped, cross
+
+    def _collect_sample_projects(self, idx, row, sample_code, pdf_paths, ctx, log, projects_by_sample=None,
+                                 mismatched=None):
         """阶段A：查询样品 + 按方法过滤（谱图上传推迟到清空旧数据之后，避免重跑重复上传）。
         返回 (items, err)。items = [{project, sample_code, sample_id, pdf_paths}, ...]。
         err 非空表示该样品不可用(查不到/无匹配项目)，调用方跳过该样品。
-        projects_by_sample: 批量查询缓存 {sampleCode: [project...]}，提供则不再逐样品查 LIMS(省往返)。"""
+        projects_by_sample: 批量查询缓存 {sampleCode: [project...]}，提供则不再逐样品查 LIMS(省往返)。
+        mismatched: 列表；方法过滤失败的样品编号 append 进去，由调用方批量并行复核已登记。"""
         _days = (ctx or {}).get("date_window_days", 30)  # 与方法池/逐样品共用同一窗口
         _key = _detection_no_of(sample_code)  # 报验编号(字母+8位)
 
@@ -4075,17 +4127,10 @@ class SequenceMaster:
         projects, ferr = self._filter_projects_by_method(projects, row, log)
         if ferr:
             # 方法过滤失败：可能该样品的这些项目已登记(在 ALREADY 列表，未登记查询不返回)。
-            # 复用同一过滤逻辑查 ALREADY 列表，命中则报"已登记"，避免误报"方法不在此样品中"。
-            try:
-                _done = [p for p in self.api.query_samples_by_conditions(
-                    sample_code=sample_code, exact_match=True, log_func=log, days=_days,
-                    check_in_status="CHECK_IN_STATUS_ALREADY") if _mine(p)]
-                if _done:
-                    _filt, _ferr2 = self._filter_projects_by_method(_done, row, lambda *a, **k: None)
-                    if _filt:
-                        return [], "已登记"
-            except Exception:
-                pass
+            # 复核 ALREADY 列表命中则应报"已登记"——但逐样品串行复核=N×RTT(混标批26个≈25s)，
+            # 改由调用方收集 mismatched 后 _query_samples_parallel 批量并行复核，语义不变。
+            if mismatched is not None:
+                mismatched.append(sample_code)
             return [], ferr
         if not projects:
             return [], "该样品下没有匹配方法文件的项目"
@@ -4808,9 +4853,11 @@ class SequenceMaster:
                     pooled.append(dict(p))
         return pooled
 
-    def _query_samples_parallel(self, sample_codes, log, max_workers=6, days=30):
+    def _query_samples_parallel(self, sample_codes, log, max_workers=6, days=30,
+                                check_in_status="CHECK_IN_STATUS_NO"):
         """并行按报验编号精确查(I/O 密集)，返回 {sampleCode: [project...]}。
         days: 受理日期窗口(天)，默认30；与方法池共用 date_window_days 配置，按方法文件收窄/放宽。
+        check_in_status: 查未登记(默认)或已登记(CHECK_IN_STATUS_ALREADY，已登记复核用)。
         单样品异常不影响其余。worker 内静默，日志由调用方汇总。
 
         报验编号去重：精确查的服务端 keyword 本就是报验编号(_detection_no_of)，样品号=报验编号+小号，
@@ -4835,7 +4882,8 @@ class SequenceMaster:
         def _one(dno):
             try:
                 return dno, self.api.query_samples_by_conditions(
-                    sample_code=dno, exact_match=True, log_func=None, days=days) or []
+                    sample_code=dno, exact_match=True, log_func=None, days=days,
+                    check_in_status=check_in_status) or []
             except Exception:
                 return dno, []  # ponytail: 单报验编号失败静默，调用方按空结果跳过
 
@@ -5589,19 +5637,22 @@ class SequenceMaster:
                 self._append_log(f"签名失败（已暂存，请手动签名或重跑）{len(_s_fail)} 批：")
                 for _s in _s_fail:
                     self._append_log(f"  - 行{_s['idx'] + 1} 实验编号 {_s['code']}：{_s['reason']}")
-        # 汇总：各成功行样品合并情况(跨行合计)，格式对齐单行「成功，… 个样品参与合并」
+        # 汇总：各成功行样品合并情况(跨行去重)，格式对齐单行「成功，… 个样品参与合并」。
+        # 混标批多行分工：本行未录入的样品可能已由其他行录入，不算真跳过
         rows_ok = [r for r in self.sequence_data if r.get("status") in ("成功", "完成")]
-        tot = sum(r.get("samples_total", 0) for r in rows_ok)
-        merged = sum(r.get("samples_merged", 0) for r in rows_ok)
+        merged_n, tot, skipped, cross = self._cross_row_summary(rows_ok)
         if tot:
             codes_all = [r.get("experiment_code") for r in rows_ok if r.get("experiment_code")]
-            skipped = [(sc, reason) for r in rows_ok for (sc, reason) in r.get("skipped_list", [])]
             extra = f"，跳过 {len(skipped)} 个样品" if skipped else ""
-            self._append_log(f"汇总：{merged}/{tot} 个样品参与合并，实验编号 {' / '.join(codes_all)}{extra}")
+            if skipped and cross:  # 全成功时不加尾巴(merged/tot 已说明一切)，括号只对账行级跳过记录
+                extra += f"（行内跳过的 {len(cross)} 个样品已由其他行录入）"
+            note = "（跨行去重）" if len(rows_ok) > 1 else ""
+            self._append_log(f"汇总：{merged_n}/{tot} 个样品参与合并{note}，"
+                             f"实验编号 {' / '.join(codes_all)}{extra}")
             if skipped:
                 self._append_log(f"未录入样品（{len(skipped)} 个）：")
-                for sc, reason in skipped:
-                    self._append_log(f"  - {sc}：{reason}")
+                for ln in self._fmt_skipped(skipped):
+                    self._append_log(ln)
         # 同一样品可能跨多批(如 item_cap 切片)各记一条 → 按 sample_code 去重，每样品显示一行
         early, _seen = [], set()
         for _t in [t for r in rows_ok for t in r.get("early_analysis", [])]:
