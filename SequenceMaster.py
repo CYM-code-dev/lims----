@@ -4044,16 +4044,32 @@ class SequenceMaster:
         err 非空表示该样品不可用(查不到/无匹配项目)，调用方跳过该样品。
         projects_by_sample: 批量查询缓存 {sampleCode: [project...]}，提供则不再逐样品查 LIMS(省往返)。"""
         _days = (ctx or {}).get("date_window_days", 30)  # 与方法池/逐样品共用同一窗口
+        _key = _detection_no_of(sample_code)  # 报验编号(字母+8位)
+
+        def _mine(p):  # 归属判定：报验编号级编号(无小号)代表001，勿把同报验号其它小号当本样品
+            return _code_belongs_sample(p.get("sampleCode"), sample_code, _key)
+
         if projects_by_sample is not None:
-            projects = list(projects_by_sample.get(sample_code) or [])
+            # 池键是 LIMS 全码，行内编号可能是报验编号级 → 按归属规则匹配(报验编号级→001)；
+            # 同一项目可能两处各存一份(方法池按全码键、并行查询按行内编号键)，按 projectId 去重防重复提交
+            projects, _pids = [], set()
+            for ps in projects_by_sample.values():
+                for p in ps:
+                    if not _mine(p):
+                        continue
+                    _pid = p.get("projectId")
+                    if _pid in _pids:
+                        continue
+                    _pids.add(_pid)
+                    projects.append(p)
             if not projects:  # 方法池未含该样品(方法关键字与服务端索引不一致)，精确查询兜底，防漏查
                 log(f"方法池未含 {sample_code}，精确查询兜底 ...")
-                projects = self.api.query_samples_by_conditions(
-                    sample_code=sample_code, exact_match=True, log_func=log, days=_days)
+                projects = [p for p in self.api.query_samples_by_conditions(
+                    sample_code=sample_code, exact_match=True, log_func=log, days=_days) if _mine(p)]
         else:
             log(f"查询样品 {sample_code} ...")
-            projects = self.api.query_samples_by_conditions(
-                sample_code=sample_code, exact_match=True, log_func=log, days=_days)
+            projects = [p for p in self.api.query_samples_by_conditions(
+                sample_code=sample_code, exact_match=True, log_func=log, days=_days) if _mine(p)]
         if not projects:
             return [], self.api.diagnose_missing_sample(sample_code, log, days=_days)
         projects, ferr = self._filter_projects_by_method(projects, row, log)
@@ -4061,9 +4077,9 @@ class SequenceMaster:
             # 方法过滤失败：可能该样品的这些项目已登记(在 ALREADY 列表，未登记查询不返回)。
             # 复用同一过滤逻辑查 ALREADY 列表，命中则报"已登记"，避免误报"方法不在此样品中"。
             try:
-                _done = self.api.query_samples_by_conditions(
+                _done = [p for p in self.api.query_samples_by_conditions(
                     sample_code=sample_code, exact_match=True, log_func=log, days=_days,
-                    check_in_status="CHECK_IN_STATUS_ALREADY")
+                    check_in_status="CHECK_IN_STATUS_ALREADY") if _mine(p)]
                 if _done:
                     _filt, _ferr2 = self._filter_projects_by_method(_done, row, lambda *a, **k: None)
                     if _filt:
@@ -4828,7 +4844,9 @@ class SequenceMaster:
                 if not plist:
                     continue
                 for code in codes_by_dno[dno]:
-                    matched = [p for p in plist if p.get("sampleCode") == code]
+                    # 分发按归属规则匹配：报验编号级编号(称样/谱图只写报验编号)代表001，
+                    # 不能拿 LIMS 全码(报验编号+小号)与行内编号直接 == 比较(否则 0 命中全落串行兜底)
+                    matched = [p for p in plist if _code_belongs_sample(p.get("sampleCode"), code, dno)]
                     if matched:
                         out[code] = matched
         return out

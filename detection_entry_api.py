@@ -1395,7 +1395,9 @@ class DetectionAPI:
                                     log_func=None, exact_match=False, days=30, check_in_status="CHECK_IN_STATUS_NO"):
         """通过多个条件查询样品信息 - 支持精确匹配和模糊查询
         days: 受理日期窗口(天)，默认30；方法池查询可按方法文件配置收窄提速，逐样品精确查保持30(系统可查上限)。
-        check_in_status: CHECK_IN_STATUS_NO(未登记，默认) / CHECK_IN_STATUS_ALREADY(已登记)。"""
+        check_in_status: CHECK_IN_STATUS_NO(未登记，默认) / CHECK_IN_STATUS_ALREADY(已登记)。
+        精确模式+完整样品号(报验编号+小号)：只返回该样品记录，未命中返回空(不再回退整个报验编号全集)；
+        报验编号级/模糊查询仍返回全集(并行分发路径契约)。"""
         if not self.login_system.current_user:
             return []
 
@@ -1508,6 +1510,12 @@ class DetectionAPI:
                 else:
                     break
 
+            # 精确模式+完整样品号：只认该样品自己的项目。翻完全部分页仍未早退，说明服务端没有
+            # 该样品(如已登记进 ALREADY 列表)，原样返回整个报验编号全集会让调用方把兄弟样品
+            # (含无谱图编号)的项目当成本样品的——谱图全量错绑(XRF 0813 兜底吞下 2797 条)。
+            # 报验编号级查询(并行分发路径)不受影响：sample_code==报验编号 时仍返回全集。
+            if exact_match and sample_code and sample_code != _detection_no_of(sample_code):
+                return [p for p in all_projects if p.get('sampleCode') == sample_code]
             return all_projects
 
         except Exception as e:
