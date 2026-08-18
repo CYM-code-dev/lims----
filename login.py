@@ -30,6 +30,7 @@ class MultiUserLoginSystem:
         self.current_user = None
         self.current_pid = None  # 登录后由「获取用户详情」接口缓存，供会话校验/保活使用
         self.current_realname = None  # 登录后由「获取用户详情」接口缓存的真实姓名，供状态栏显示
+        self.current_org_id = None  # 登录后由「获取用户详情」接口缓存的所属实验室 orgId(查询机构过滤用)
 
         # 使用智能路径查找
         self.users_file = os.path.join(paths.data_dir(), "users_config.json")
@@ -417,6 +418,7 @@ class MultiUserLoginSystem:
                     merged.update(part)
             if merged:
                 self.current_realname = self._extract_realname(merged)
+                self.current_org_id = merged.get("orgId")  # 所属实验室(查询机构过滤用，见 DetectionAPI._current_org_id)
                 return self._extract_pid(merged)
             return ""
         except Exception as e:

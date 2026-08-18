@@ -1391,13 +1391,55 @@ class DetectionAPI:
                 log_func(f"getOcCompareShowData 异常: {e}")
             return []
 
+    def _current_org_id(self, log_func=None):
+        """当前登录账号所在实验室 orgId(用户详情 userInfo.orgId)。按用户缓存；
+        登录流程已缓存(login_system.current_org_id)则直接用；取不到返回 None=查询不带机构过滤。"""
+        ls = self.login_system
+        user = getattr(ls, "current_user", None)
+        if getattr(self, "_org_cache_user", None) == user and getattr(self, "_org_cache_id", None) is not None:
+            return self._org_cache_id
+        oid = getattr(ls, "current_org_id", None)
+        if oid is None:
+            try:
+                r = ls.session.get(f"{ls.base_url}/detectionManager/core/users/info",
+                                   verify=False, timeout=30)
+                if r.status_code == 200:
+                    result = (r.json() or {}).get("resultData") or {}
+                    merged = {}
+                    for k in ("userInfo", "userExtInfo"):
+                        if isinstance(result.get(k), dict):
+                            merged.update(result[k])
+                    oid = merged.get("orgId")
+            except Exception as e:
+                if log_func:
+                    log_func(f"[机构] 获取用户实验室失败: {type(e).__name__}: {e}")
+        if oid is not None:
+            self._org_cache_user, self._org_cache_id = user, str(oid)
+            return str(oid)
+        return None
+
     def query_samples_by_conditions(self, sample_code=None, project_name=None, method_name=None, retest_checked=False,
-                                    log_func=None, exact_match=False, days=30, check_in_status="CHECK_IN_STATUS_NO"):
+                                    log_func=None, exact_match=False, days=30, check_in_status="CHECK_IN_STATUS_NO",
+                                    _org="default"):
         """通过多个条件查询样品信息 - 支持精确匹配和模糊查询
         days: 受理日期窗口(天)，默认30；方法池查询可按方法文件配置收窄提速，逐样品精确查保持30(系统可查上限)。
         check_in_status: CHECK_IN_STATUS_NO(未登记，默认) / CHECK_IN_STATUS_ALREADY(已登记)。
         精确模式+完整样品号(报验编号+小号)：只返回该样品记录，未命中返回空(不再回退整个报验编号全集)；
-        报验编号级/模糊查询仍返回全集(并行分发路径契约)。"""
+        报验编号级/模糊查询仍返回全集(并行分发路径契约)。
+        _org: "default"=按当前登录账号所在实验室查，空结果再扩到全实验室重查(内部递归)；
+              None=不过滤(全实验室)；其他值=指定机构 id 直查。"""
+        if _org == "default":
+            own = self._current_org_id(log_func)
+            res = self.query_samples_by_conditions(
+                sample_code, project_name, method_name, retest_checked, log_func,
+                exact_match, days, check_in_status, _org=own)
+            if res or own is None:
+                return res
+            if log_func:
+                log_func(f"[机构] 本实验室(org={own})无结果，扩到全实验室重查")
+            return self.query_samples_by_conditions(
+                sample_code, project_name, method_name, retest_checked, log_func,
+                exact_match, days, check_in_status, _org=None)
         if not self.login_system.current_user:
             return []
 
@@ -1421,7 +1463,6 @@ class DetectionAPI:
                     "acceptStartDate": one_month_ago.strftime("%Y-%m-%d"),
                     "acceptEndDate": today.strftime("%Y-%m-%d"),
                     "checkInStatus": check_in_status,
-                    "decideProjectOrgId": "23",
                     "sampleStatus": "one",
                     "pid": self.get_user_pid(),
                     "pname": self.get_user_pname(),
@@ -1440,6 +1481,12 @@ class DetectionAPI:
                         params["decideProjectName"] = project_name
                     if method_name:
                         params["decideProjectMethodName"] = method_name
+
+                # 机构过滤：_org 非空时下发(默认=当前账号实验室，见 _org 参数说明)。
+                # 报验编号全库唯一，全实验室重查不带机构即可命中他室样品
+                # (实测 TS26081242 属 35=食品接触材料实验室，org=23 查 0 条；逗号多机构 HTTP 500)
+                if _org:
+                    params["decideProjectOrgId"] = str(_org)
 
                 if retest_checked:
                     params["cancelRetesting"] = "1"
@@ -1546,14 +1593,17 @@ class DetectionAPI:
 
         try:
             # 1) 项目已登记：重查录入端点，checkInStatus 用 ALREADY(非 YES——抓包确认已登记列表页用此枚举)
+            # 机构同主查询：先本实验室、空再全实验室(keyword=报验编号已唯一)
             today = datetime.now()
             window_ago = today - timedelta(days=days)
-            if _hit(f"{base}/detectionManager/manager/resultCheckIn/pagePCObjAndSample",
-                    {**common, "_search": "false", "nd": int(time.time() * 1000),
-                     "pageSize": 30, "pageNo": 1, "sampleStatus": "one", "decideProjectOrgId": "23",
-                     "acceptStartDate": window_ago.strftime("%Y-%m-%d"),
-                     "acceptEndDate": today.strftime("%Y-%m-%d"),
-                     "checkInStatus": "CHECK_IN_STATUS_ALREADY", "keyword": dno}):
+            _q1 = {**common, "_search": "false", "nd": int(time.time() * 1000),
+                   "pageSize": 30, "pageNo": 1, "sampleStatus": "one",
+                   "acceptStartDate": window_ago.strftime("%Y-%m-%d"),
+                   "acceptEndDate": today.strftime("%Y-%m-%d"),
+                   "checkInStatus": "CHECK_IN_STATUS_ALREADY", "keyword": dno}
+            _org = self._current_org_id()
+            _u1 = f"{base}/detectionManager/manager/resultCheckIn/pagePCObjAndSample"
+            if ((_org and _hit(_u1, {**_q1, "decideProjectOrgId": _org})) or _hit(_u1, _q1)):
                 return "已登记"
             # 制样/收样端点公共参数(按抓包：makeSampleMarkNames=A，keyword=报验编号)
             sp = {"_search": "false", "nd": int(time.time() * 1000), "pageSize": 30, "pageNo": 1,

@@ -878,12 +878,16 @@ def _merge_parallel_groups(wmap, non_parallel_suffixes=()):
         if not g["marker"] and len(par_codes) == 1:
             out[par_codes[0]] = wmap[par_codes[0]]  # 普通样品原样
             continue
-        masses, cells = [], []
+        masses, cells, remarks, extra = [], [], [], {}
         for c in par_codes:
             src = wmap[c] or {}
             masses.extend(src.get("masses") or [])
             cells.extend(src.get("cells") or [])
-        entry = {"masses": masses, "cells": cells, "time": g["time"], "desc": g["desc"]}
+            remarks.extend(src.get("remarks") or [])
+            for h, vs in (src.get("extra") or {}).items():
+                extra.setdefault(h, []).extend(vs)
+        entry = {"masses": masses, "cells": cells, "remarks": remarks, "extra": extra,
+                 "time": g["time"], "desc": g["desc"]}
         if any((wmap[c] or {}).get("force_parse") for c in par_codes):
             entry["force_parse"] = True  # E列「解析」标记随平行合并保留(任一平行行标即生效)
         if g["marker"]:
@@ -1007,10 +1011,20 @@ def _is_metal_sample(desc, masses=None):
     return "金属" in d and "非金属" not in d and not (masses or [])
 
 
+def _cell_str(v):
+    """Excel 数值格转串：整数浮点去 .0(110.0→'110')，其余 strip 原样。"""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
 def _read_weighing_records(path):
-    """读取称量记录(xlsx 或 csv)：返回 ({样品编号: {masses:[float...], volumes:[str...], time, desc}}, err)。
+    """读取称量记录(xlsx 或 csv)：返回 ({样品编号: {masses:[float...], volumes:[str...], time, desc,
+    remarks:[str...], extra:{表头:[值...]}}, err)。
     行序即平行序；time/desc 取该样品首行(称样时间/试样描述)。表头按列名定位，缺失按 A/B/C/D 兜底。
-    称样量单元格形如 "0.39/10.00" 时，斜杠前=称样量、后=定容体积(原样串)。"""
+    称样量单元格形如 "0.39/10.00" 时，斜杠前=称样量、后=定容体积(原样串)。
+    remarks=备注列(非空按行序)；extra=保留列之外的所有列(如 浸泡面积/浸泡体积，按表头分组、
+    非空按行序；空格不收=沿用上行值)。"""
     try:
         if str(path).lower().endswith(".csv"):
             rows = None
@@ -1029,6 +1043,7 @@ def _read_weighing_records(path):
             if ws is None:
                 return None, "称量记录无工作表"
             rows = list(ws.iter_rows(values_only=True))
+            wb.close()  # read_only 句柄不关会锁文件(Windows 下回写/删除失败)
     except Exception as e:
         return None, f"读取称量记录失败: {e}"
     header = [str(c or "").strip() for c in rows[0]] if rows else []
@@ -1042,6 +1057,15 @@ def _read_weighing_records(path):
     code_col, mass_col = find("样品编号", 1), find("称样量", 2)
     time_col, desc_col = find("称样时间", 0), find("试样描述", 3)
     parse_col = find("解析", 4)  # E列：强制解析标记
+    remark_col = find("备注", -1)
+    # 称样量兜底守卫：无「称样量」表头时兜底列(D)若是有名同名列(如 浸泡面积s (cm2))，
+    # 其数值会被误当称样量读，弃用兜底(老式全空表头文件不受影响)
+    if not any("称样量" in h for h in header) and mass_col < len(header) and header[mass_col]:
+        mass_col = None
+    # 同名列通道：保留列之外的所有非空表头列(行序即平行序)
+    _reserved = {c for c in (code_col, mass_col, time_col, desc_col, parse_col, remark_col)
+                 if c is not None and c >= 0}
+    extra_cols = [(i, h) for i, h in enumerate(header) if h and i not in _reserved]
     m = {}
     last_time = None  # 称样时间向下填充：仅每组首行填日期，空单元格继承上一个非空值
     for _ri, r in enumerate(rows[1:], 1):
@@ -1050,9 +1074,10 @@ def _read_weighing_records(path):
         code = r[code_col] if code_col < len(r) else None
         if code is None or str(code).strip() == "":
             continue
-        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "volumes": [], "time": None, "desc": ""})
+        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "volumes": [],
+                                                 "time": None, "desc": "", "remarks": [], "extra": {}})
         # 称样量可能为空(random 模式称样量随机生成，excel 仅记录编号/试样描述)；有值才追加
-        mass = r[mass_col] if mass_col < len(r) else None
+        mass = r[mass_col] if mass_col is not None and mass_col < len(r) else None
         added = False
         _ms, _vs = _split_mass_vol(mass)
         if _ms != "":
@@ -1077,6 +1102,16 @@ def _read_weighing_records(path):
             pv = r[parse_col]
             if pv is not None and str(pv).strip():
                 entry["force_parse"] = True
+        # 备注列 + 同名列(浸泡面积/浸泡体积等)：非空按行序收，空格不收=沿用上行值
+        if 0 <= remark_col < len(r):
+            rv = r[remark_col]
+            if rv is not None and str(rv).strip():
+                entry["remarks"].append(str(rv).strip())
+        for ci, ch in extra_cols:
+            if ci < len(r):
+                ev = r[ci]
+                if ev is not None and str(ev).strip():
+                    entry["extra"].setdefault(ch, []).append(_cell_str(ev))
     return m, None
 
 
@@ -3549,7 +3584,8 @@ class SequenceMaster:
             return
         start_idx = sr - 1
         invalid = [i + 1 for i, r in enumerate(self.sequence_data) if i >= start_idx
-                   and (not r["method_file"] or not r["spectrum_path"])]
+                   and (not r["method_file"]
+                        or (not r["spectrum_path"] and not self._method_no_spectrum(r["method_file"])))]
         if invalid:
             self.status_var.set(f"提示: 第 {', '.join(map(str, invalid))} 行缺少方法文件或谱图路径")
             return
@@ -4597,6 +4633,42 @@ class SequenceMaster:
             else:
                 log(f"定容体积列「{_vol_name}」未找到，跳过定容体积写入")
         _fill_desc_column(records, desc_by_sample)
+
+        # 称量记录同名列填充：Excel 表头(_norm_cn 归一)匹配 LIMS 动态列名 → 按样品×平行填入。
+        # 一行=合并列语义(实验1/2共用)；两行=各行各值(空格沿用上行)；无值保留记录原值(_vol_field_by_project)。
+        # 已有专用通道的列(称样量/试样信息·描述/定容体积)不参与。
+        _extra_hdrs = {}  # 归一表头 -> 原表头
+        for _e in (ctx.get("wmap") or {}).values():
+            for _h in ((_e or {}).get("extra") or {}):
+                _extra_hdrs.setdefault(_norm_cn(_h), _h)
+        if _extra_hdrs:
+            _skip_codes = {mass_code} if mass_code else set()
+            _ic = _find_column_by_name(dynamic_columns, "试样信息", "试样描述")
+            if _ic is not None:
+                _skip_codes.add(_ic.get("columeCode", ""))
+            if _vol_name:
+                _vc = _find_column_by_name(dynamic_columns, _vol_name)
+                if _vc is not None:
+                    _skip_codes.add(_vc.get("columeCode", ""))
+            _matched = set()
+            for col in dynamic_columns:
+                _code, _cn = col.get("columeCode", ""), _norm_cn(col.get("columeName", ""))
+                if not _cn or _code in _skip_codes or _cn not in _extra_hdrs:
+                    continue
+                _hdr = _extra_hdrs[_cn]
+                _vals = {}  # 键=完整样品编号(供 _vol_field_by_project 精确查)；wmap.get 按编号容错(短报验编号)
+                for sc in batch_samples:
+                    _v = (((ctx.get("wmap") or {}).get(sc) or {}).get("extra") or {}).get(_hdr)
+                    if _v:
+                        _vals[sc] = _v
+                if not _vals:
+                    continue
+                host.data_fields[_code] = _vol_field_by_project(records, pid_to_sample, _vals, _code)
+                _matched.add(_cn)
+                log(f"称量记录同名列「{col.get('columeName', '')}」<- Excel「{_hdr}」已填 {len(_vals)} 样品")
+            for _cn, _h in _extra_hdrs.items():
+                if _cn not in _matched:
+                    log(f"称量记录列「{_h}」未匹配到动态列(列名↔参数名不符)，未填")
         first_sc = batch_items[0]["sample_code"] if batch_items else ""
         analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
 
@@ -4628,6 +4700,33 @@ class SequenceMaster:
         log("构建并提交 ...")
         experiment_data = build_grouped_experiment_data(host, batch_projects, experiment_code, actual_method_name, experiment_process_override=lab_proc or None)
         log(f"[设备] 提交称样设备对象: {experiment_data.get('weighingEquipment')}")
+        # 备注 <- 称量记录备注列：按记录覆写 remark/sampleRemarkContent(实验1/2=行1/2，空格沿用上行)。
+        # 仅覆写 Excel 里填了备注的样品；无备注样品保留 build 原值(如稀释备注)。键=完整样品编号(wmap.get 容错)。
+        _rem_by_sample = {}
+        for sc in batch_samples:
+            _rms = (((ctx.get("wmap") or {}).get(sc) or {}).get("remarks") or [])
+            if _rms:
+                _rem_by_sample[sc] = _rms
+        if _rem_by_sample:
+            try:
+                _recs = json.loads(experiment_data.get("ocAnalysisRecordSaveList") or "[]")
+                _n = 0
+                for _r in _recs:
+                    _rms = _rem_by_sample.get(pid_to_sample.get(str(_r.get("projectId")), ""))
+                    if not _rms:
+                        continue
+                    try:
+                        _par = int(_r.get("serialNumber") or 1) - 1
+                    except (TypeError, ValueError):
+                        _par = 0
+                    _rem = _rms[_par] if 0 <= _par < len(_rms) else _rms[-1]
+                    _r["remark"] = _rem
+                    _r["sampleRemarkContent"] = _rem
+                    _n += 1
+                experiment_data["ocAnalysisRecordSaveList"] = json.dumps(_recs, ensure_ascii=False)
+                log(f"备注 <- 称量记录备注列: 覆写 {_n} 条记录({len(_rem_by_sample)} 样品)")
+            except (ValueError, TypeError) as e:
+                log(f"称量记录备注覆写失败: {e}")
         if lab_proc:
             log(f"实验过程(experimentProcess) <- 条件规则: {lab_proc}")
         # 称量记录「称样时间」→ 覆盖实验分析开始时间 startTime；无有效称样时间则开始时间=结束时间
@@ -4801,6 +4900,14 @@ class SequenceMaster:
                 code = cids[0] if cids else _stem_sample_code(sp)
             return [(code, [sp])], None
         pdfs = sorted(glob.glob(os.path.join(sp, "*.pdf"))) if os.path.isdir(sp) else []
+        # 无需谱图方法：谱图路径可空——样品取自称量记录全部编号(无 PDF 要上传)；
+        # sc 是隐藏自动回填残留(不可编辑)，不作为单样品依据
+        if not pdfs and self._method_no_spectrum(row.get("method_file")):
+            codes = list(wmap or [])
+            if codes:
+                log(f"无需谱图: 称量记录展开 {len(codes)} 个样品(无PDF)")
+                return [(c, []) for c in codes], None
+            return [], "无需谱图: 未设谱图路径且称量记录无编号(或未设称量记录)"
         if not pdfs:
             return [], "谱图路径无效或目录内无PDF"
         # 目录=多样品意图。sample_code 是隐藏的自动回填字段(前端无单元格、不可编辑)，
@@ -5612,6 +5719,16 @@ class SequenceMaster:
         try:
             y = load_method(method_file)
             return bool((y.get("spectrum_upload_settings") or {}).get("clear_spectrum"))
+        except Exception:
+            return False
+
+    def _method_no_spectrum(self, method_file):
+        """读方法文件 spectrum_upload_settings.upload_mode==no_spectrum(无需谱图)；异常返回 False。"""
+        if not method_file:
+            return False
+        try:
+            y = load_method(method_file)
+            return str((y.get("spectrum_upload_settings") or {}).get("upload_mode") or "") == "no_spectrum"
         except Exception:
             return False
 
