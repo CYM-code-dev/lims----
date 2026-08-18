@@ -2212,7 +2212,8 @@ class DetectionAPI:
         import json
         try:
             with open(self._std_no_name_cache_path(), "w", encoding="utf-8") as f:
-                json.dump(self._std_no_name_to_id, f, ensure_ascii=False)
+                # 只持久化正命中；None 负缓存(当日窗口查无)留在进程内，避免跨天变陈旧
+                json.dump({k: v for k, v in self._std_no_name_to_id.items() if v}, f, ensure_ascii=False)
         except Exception:
             pass
 
@@ -2264,6 +2265,7 @@ class DetectionAPI:
                             self._std_no_name_to_id[key] = mid
                             self._save_std_no_name_cache()
                             return mid
+            self._std_no_name_to_id[key] = None  # 负缓存：窗口内查无此子方法，本进程不再逐样品重查
             return None
         except Exception as e:
             if log_func:

@@ -6,7 +6,6 @@ import ttkbootstrap as ttkb  # 档1: 现代主题(sandstone-light)，ttk 控件�
 from method_file import load_method, save_method
 import os
 import paths
-import random
 
 
 def _make_large_cb_style(scale=1.3):
@@ -1128,10 +1127,9 @@ class WeighingTab:
         self.app = app
         self.processing_rules = []
         self.weighing_rules = []  # 条件称样规则：[{filename,project_name,desc,weighing_mode}]
+        self.random_rules = []    # 条件随机范围：[{filename,project_name,method,desc,min_value,max_value}]
         self.weighing_params = {
             "decimal_places": "",
-            "min_value": "",
-            "max_value": "",
             "conversion_factor": "",
             "result_decimal_places": "",
             "weighing_mode": "random",
@@ -1250,39 +1248,21 @@ class WeighingTab:
 
     def create_all_weighing_modes(self, parent):
         """创建所有称样量模式的内容区域"""
-        # 随机数生成模式
-        self.random_frame = ttk.LabelFrame(parent, text="随机数生成模式", padding=5)
-        self.random_frame.pack(fill='x', pady=5)
-
-        # 参数设置区域
-        param_frame = ttk.Frame(self.random_frame)
-        param_frame.pack(fill='x', pady=2)
-
-        # 小数位数 - 默认为空
-        decimal_frame = ttk.Frame(param_frame)
-        decimal_frame.pack(fill='x', pady=2)
-
-        ttk.Label(decimal_frame, text="小数位数:").pack(side='left', padx=(0, 5))
+        # 随机数生成模式（可折叠）：范围按条件随机范围规则，小数位/回写为全局设置
+        self.random_frame, rb = self._make_collapsible(parent, "随机数生成模式", expanded=True)
+        settings = ttk.Frame(rb)
+        settings.pack(fill='x', pady=2)
+        # 小数位数：record/pdf 模式称量格式化共用；random 模式为规则未覆盖时的兜底
+        ttk.Label(settings, text="小数位数:").pack(side='left', padx=(0, 3))
         self.decimal_places = tk.StringVar(value="")
-        self.decimal_entry = ttk.Entry(decimal_frame, textvariable=self.decimal_places, width=5)
-        self.decimal_entry.pack(side='left', padx=(0, 5))  # 添加这行
-
-        # 最小值 - 默认为空
-        ttk.Label(decimal_frame, text="最小值:").pack(side='left', padx=(0, 5))
-        self.min_value = tk.StringVar(value="")
-        self.min_entry = ttk.Entry(decimal_frame, textvariable=self.min_value, width=8)
-        self.min_entry.pack(side='left', padx=(0, 5))  # 添加这行
-
-        # 最大值 - 默认为空
-        ttk.Label(decimal_frame, text="最大值:").pack(side='left', padx=(0, 5))
-        self.max_value = tk.StringVar(value="")
-        self.max_entry = ttk.Entry(decimal_frame, textvariable=self.max_value, width=8)
-        self.max_entry.pack(side='left', padx=(0, 5))  # 添加这行
-
-        # 回写称量记录Excel：random 模式生成的称样量回填到称样量空格（序列运行时），与小数位同行
+        self.decimal_entry = ttk.Entry(settings, textvariable=self.decimal_places, width=5)
+        self.decimal_entry.pack(side='left', padx=(0, 12))
+        # 回写称量记录Excel：random 模式生成的称样量回填到称样量空格（序列运行时，全局开关）
         self.writeback_excel = tk.BooleanVar(value=False)
-        ttk.Checkbutton(decimal_frame, text=" 回写称量记录Excel",
+        ttk.Checkbutton(settings, text=" 回写称量记录Excel",
                         variable=self.writeback_excel, style=self.app.large_cb_style).pack(side='left', padx=(10, 0))
+
+        self.create_random_rules_section(rb)
 
         # 称量记录处理模式（标题可点击折叠/展开）
         self.process_frame, process_body = self._make_collapsible(parent, "称量记录处理模式", expanded=True)
@@ -1469,18 +1449,15 @@ class WeighingTab:
         if mode == "conditional":
             self.weighing_rules_frame.pack(fill='x', pady=5)  # 不 expand：与可折叠助手一致，收起释放空间
         if mode == "record":
-            # 称量记录模式 - 称样量取自记录文件；min/max、换算与处理区禁用，
-            # 仅「小数位数」可编辑(按其补回末尾0，匹配天平 2/3/4 位精度；
-            # 运行时 SequenceMaster 已按 decimal_places 格式化)
+            # 称量记录模式 - 称样量取自记录文件；规则表与处理区禁用，
+            # 仅「小数位数」可编辑(按其补回末尾0，匹配天平 2/3/4 位精度)
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
             self.decimal_entry.configure(state="normal")
         elif mode == "random":
-            # 随机数生成模式 - 随机数区域启用，处理区域禁用
+            # 随机数生成模式 - 随机数区域(含条件随机范围规则表)启用，处理区域禁用
             self.set_frame_state(self.random_frame, "normal")
             self.set_frame_state(self.process_frame, "disabled")
-            # 自动生成随机数
-            self.generate_random_numbers()
         elif mode == "process":
             # 处理模式 - 随机数区域禁用，处理区域启用
             self.set_frame_state(self.random_frame, "disabled")
@@ -1490,7 +1467,7 @@ class WeighingTab:
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
         elif mode == "pdf":
-            # PDF报告 - 称样量取自报告(样品初始质量)；仅「小数位数」可编辑(按其保留末尾0，如0.3100)，min/max 与处理区禁用
+            # PDF报告 - 称样量取自报告(样品初始质量)，仅「小数位数」可编辑(按其保留末尾0，如0.3100)，规则表与处理区禁用
             self.set_frame_state(self.random_frame, "disabled")
             self.set_frame_state(self.process_frame, "disabled")
             self.decimal_entry.configure(state="normal")
@@ -1519,35 +1496,6 @@ class WeighingTab:
             # 递归设置子组件状态
             for child in widget.winfo_children():
                 self.set_widget_state(child, state)
-
-    def generate_random_numbers(self):
-        """生成随机数"""
-        try:
-            # 处理空值，使用默认值
-            decimal_places_str = self.decimal_places.get()
-            min_val_str = self.min_value.get()
-            max_val_str = self.max_value.get()
-
-            decimal_places = int(decimal_places_str) if decimal_places_str else 2
-            min_val = float(min_val_str) if min_val_str else 0.1
-            max_val = float(max_val_str) if max_val_str else 1.0
-
-            if min_val >= max_val:
-                return  # 不显示错误消息，只是不生成
-
-            # 生成10个随机数
-            random_numbers = []
-            for _ in range(10):
-                num = random.uniform(min_val, max_val)
-                formatted_num = f"{num:.{decimal_places}f}"
-                random_numbers.append(formatted_num)
-
-            # 显示随机数
-            result_text = "\n".join(random_numbers)
-            # 这里可以添加显示逻辑，例如更新标签或文本框
-
-        except Exception:
-            pass  # 静默处理错误
 
     def add_processing_rule(self):
         """添加或更新处理规则"""
@@ -1678,14 +1626,14 @@ class WeighingTab:
         # 表格
         wr_list = ttk.Frame(wr_body)
         wr_list.pack(fill='both', expand=True, pady=3)
-        wcols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "称样方式", "对应项目")
+        wcols = ("序号", "文件名", "项目名", "试样描述", "称样方式", "对应项目")
         self.wr_tree = ttk.Treeview(wr_list, columns=wcols, show="headings", height=3)
         for c in wcols:
             self.wr_tree.heading(c, text=c, anchor='w')
         self.wr_tree.column("序号", width=40, anchor='w')
-        self.wr_tree.column("文件名关键词", width=90, anchor='w')
-        self.wr_tree.column("项目名关键词", width=110, anchor='w')
-        self.wr_tree.column("试样描述关键词", width=110, anchor='w')
+        self.wr_tree.column("文件名", width=90, anchor='w')
+        self.wr_tree.column("项目名", width=110, anchor='w')
+        self.wr_tree.column("试样描述", width=110, anchor='w')
         self.wr_tree.column("称样方式", width=120, anchor='w')
         self.wr_tree.column("对应项目", width=120, anchor='w')
         self.wr_tree.pack(side='left', fill='both', expand=True)
@@ -1833,6 +1781,160 @@ class WeighingTab:
         entry.bind("<FocusOut>", save_edit)
         entry.bind("<Escape>", cancel_edit)
 
+    def create_random_rules_section(self, rb):
+        """条件随机范围规则表（随机数生成模式内）：
+        按 文件名/项目名/检测方法/试样描述 关键字命中 → 用该行最小/最大值。
+        关键字空=不限；首条命中即用；检测方法为包含匹配(直接写 18583/36246 或全称均可)。"""
+        rr_body = rb
+        rr_kw = ttk.Frame(rr_body)
+        rr_kw.pack(fill='x', pady=2)
+        ttk.Label(rr_kw, text="文件名:").pack(side='left', padx=(0, 3))
+        self.rr_filename_var = tk.StringVar()
+        ttk.Entry(rr_kw, textvariable=self.rr_filename_var, width=10).pack(side='left', padx=(0, 6))
+        ttk.Label(rr_kw, text="项目名:").pack(side='left', padx=(0, 3))
+        self.rr_project_var = tk.StringVar()
+        ttk.Entry(rr_kw, textvariable=self.rr_project_var, width=14).pack(side='left', padx=(0, 6))
+        ttk.Label(rr_kw, text="检测方法:").pack(side='left', padx=(0, 3))
+        self.rr_method_var = tk.StringVar()
+        ttk.Entry(rr_kw, textvariable=self.rr_method_var, width=16).pack(side='left', padx=(0, 6))
+        ttk.Label(rr_kw, text="试样描述:").pack(side='left', padx=(0, 3))
+        self.rr_desc_var = tk.StringVar()
+        ttk.Entry(rr_kw, textvariable=self.rr_desc_var, width=14).pack(side='left', padx=(0, 6))
+        rr_input = ttk.Frame(rr_body)
+        rr_input.pack(fill='x', pady=2)
+        ttk.Label(rr_input, text="最小值:").pack(side='left', padx=(0, 3))
+        self.rr_min_var = tk.StringVar()
+        ttk.Entry(rr_input, textvariable=self.rr_min_var, width=8).pack(side='left', padx=(0, 6))
+        ttk.Label(rr_input, text="最大值:").pack(side='left', padx=(0, 3))
+        self.rr_max_var = tk.StringVar()
+        ttk.Entry(rr_input, textvariable=self.rr_max_var, width=8).pack(side='left', padx=(0, 6))
+        ttkb.Button(rr_input, text="添加", command=self.add_random_rule, bootstyle="secondary").pack(side='left', padx=(10, 0))
+        rr_list = ttk.Frame(rr_body)
+        rr_list.pack(fill='both', expand=True, pady=3)
+        rcols = ("序号", "文件名", "项目名", "检测方法", "试样描述", "最小值", "最大值")
+        self.rr_tree = ttk.Treeview(rr_list, columns=rcols, show="headings", height=3)
+        for c in rcols:
+            self.rr_tree.heading(c, text=c, anchor='w')
+        self.rr_tree.column("序号", width=40, anchor='w')
+        self.rr_tree.column("文件名", width=80, anchor='w')
+        self.rr_tree.column("项目名", width=100, anchor='w')
+        self.rr_tree.column("检测方法", width=130, anchor='w')
+        self.rr_tree.column("试样描述", width=100, anchor='w')
+        self.rr_tree.column("最小值", width=50, anchor='w')
+        self.rr_tree.column("最大值", width=50, anchor='w')
+        self.rr_tree.pack(side='left', fill='both', expand=True)
+        rr_scroll = ttk.Scrollbar(rr_list, orient="vertical", command=self.rr_tree.yview)
+        rr_scroll.pack(side='right', fill='y')
+        self.rr_tree.configure(yscrollcommand=rr_scroll.set)
+        self.rr_tree.bind("<Double-1>", self.on_random_rule_double_click)
+        rr_btn = ttk.Frame(rr_body)
+        rr_btn.pack(fill='x', pady=2)
+        ttkb.Button(rr_btn, text="删除选中", command=self.delete_random_rule, bootstyle="danger").pack(side='left', padx=2)
+        ttkb.Button(rr_btn, text="上移", command=lambda: self.move_random_rule(-1), bootstyle="secondary").pack(side='left', padx=2)
+        ttkb.Button(rr_btn, text="下移", command=lambda: self.move_random_rule(1), bootstyle="secondary").pack(side='left', padx=2)
+
+    # ---------- 条件随机范围 CRUD ----------
+
+    def add_random_rule(self):
+        """添加一条条件随机范围规则（最小/最大至少填一个；小数位/回写用顶部模式行全局设置）"""
+        rule = {
+            "filename": self.rr_filename_var.get().strip(),
+            "project_name": self.rr_project_var.get().strip(),
+            "method": self.rr_method_var.get().strip(),
+            "desc": self.rr_desc_var.get().strip(),
+            "min_value": self.rr_min_var.get().strip(),
+            "max_value": self.rr_max_var.get().strip()
+        }
+        if not rule["min_value"] and not rule["max_value"]:
+            messagebox.showwarning("输入错误", "最小值/最大值至少填一个")
+            return
+        self.random_rules.append(rule)
+        self.refresh_random_rules_tree()
+        for v in (self.rr_filename_var, self.rr_project_var, self.rr_method_var,
+                  self.rr_desc_var, self.rr_min_var, self.rr_max_var):
+            v.set("")
+        self.app.mark_modified()
+
+    def delete_random_rule(self):
+        """删除选中的条件随机范围规则"""
+        sel = self.rr_tree.selection()
+        if not sel:
+            messagebox.showwarning("选择错误", "请先选择要删除的规则")
+            return
+        idx = int(sel[0]) - 1
+        if 0 <= idx < len(self.random_rules):
+            del self.random_rules[idx]
+            self.refresh_random_rules_tree()
+            self.app.mark_modified()
+
+    def move_random_rule(self, delta):
+        """上移(delta=-1)或下移(delta=1)选中的规则（顺序即优先级）"""
+        sel = self.rr_tree.selection()
+        if not sel:
+            return
+        i = int(sel[0]) - 1
+        j = i + delta
+        if not (0 <= i < len(self.random_rules) and 0 <= j < len(self.random_rules)):
+            return
+        self.random_rules[i], self.random_rules[j] = self.random_rules[j], self.random_rules[i]
+        self.refresh_random_rules_tree()
+        for item in self.rr_tree.get_children():
+            if int(item) == j + 1:
+                self.rr_tree.selection_set(item)
+                break
+        self.app.mark_modified()
+
+    def refresh_random_rules_tree(self):
+        """重建条件随机范围规则表格"""
+        for item in self.rr_tree.get_children():
+            self.rr_tree.delete(item)
+        for i, r in enumerate(self.random_rules):
+            self.rr_tree.insert("", "end", iid=str(i + 1),
+                                values=(str(i + 1), r.get("filename", ""), r.get("project_name", ""),
+                                        r.get("method", ""), r.get("desc", ""),
+                                        r.get("min_value", ""), r.get("max_value", "")))
+
+    def on_random_rule_double_click(self, event):
+        """双击条件随机范围单元格就地编辑（全部用 Entry）"""
+        sel = self.rr_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        column_index = int(self.rr_tree.identify_column(event.x).replace('#', '')) - 1
+        col_key = {1: "filename", 2: "project_name", 3: "method", 4: "desc",
+                   5: "min_value", 6: "max_value"}.get(column_index)
+        if col_key is None:  # 序号列或越界
+            return
+        current_values = self.rr_tree.item(item, 'values')
+        current_value = current_values[column_index]
+        x, y, width, height = self.rr_tree.bbox(item, self.rr_tree.identify_column(event.x))
+
+        entry = ttk.Entry(self.rr_tree)
+        entry.place(x=x, y=y - 4, width=width, height=height + 8)
+        entry.insert(0, current_value)
+        entry.focus_set()
+
+        def save_edit(event=None):
+            if not entry.winfo_exists():
+                return
+            new_value = entry.get()
+            new_values = list(current_values)
+            new_values[column_index] = new_value
+            self.rr_tree.item(item, values=new_values)
+            idx = int(item) - 1
+            if 0 <= idx < len(self.random_rules):
+                self.random_rules[idx][col_key] = new_value
+            self.app.mark_modified()
+            entry.destroy()
+
+        def cancel_edit(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+        entry.bind("<Escape>", cancel_edit)
+
     def get_rules_and_params(self):
         """获取处理规则和称样量参数"""
         # 非平行样标记后缀：逗号分隔(中英文) → 大写字母列表
@@ -1840,8 +1942,6 @@ class WeighingTab:
         # 更新称样量参数
         self.weighing_params = {
             "decimal_places": self.decimal_places.get(),
-            "min_value": self.min_value.get(),
-            "max_value": self.max_value.get(),
             "conversion_factor": self.conversion_factor.get(),
             "result_decimal_places": self.result_decimal_places.get(),
             "weighing_mode": self.weighing_mode.get(),
@@ -1850,7 +1950,8 @@ class WeighingTab:
             "counterpart": self.counterpart_project.get().strip(),
             "single_weighing": self.single_weighing.get(),
             "writeback_excel": self.writeback_excel.get(),
-            "weighing_rules": self.weighing_rules
+            "weighing_rules": self.weighing_rules,
+            "random_rules": self.random_rules
         }
 
         return {
@@ -1865,8 +1966,6 @@ class WeighingTab:
 
         # 设置称样量参数
         self.decimal_places.set(weighing_params.get("decimal_places", ""))
-        self.min_value.set(weighing_params.get("min_value", ""))
-        self.max_value.set(weighing_params.get("max_value", ""))
         self.conversion_factor.set(weighing_params.get("conversion_factor", ""))
         self.result_decimal_places.set(weighing_params.get("result_decimal_places", ""))
         self.non_parallel_suffixes.set(
@@ -1879,6 +1978,11 @@ class WeighingTab:
         # 条件称样规则
         self.weighing_rules = list(weighing_params.get("weighing_rules") or [])
         self.refresh_weighing_rules_tree()
+        # 条件随机范围(白名单重建，剔除历史版本的 decimal_places/writeback_excel 等残留键)
+        self.random_rules = [{k: r.get(k, "") for k in
+                              ("filename", "project_name", "method", "desc", "min_value", "max_value")}
+                             for r in (weighing_params.get("random_rules") or [])]
+        self.refresh_random_rules_tree()
 
         # 设置称样量模式
         saved_weighing_mode = weighing_params.get("weighing_mode", "random")
@@ -2972,14 +3076,14 @@ class OtherParamsTab:
         # 表格
         sr_list = ttk.Frame(self.standard_rules_frame)
         sr_list.pack(fill='both', expand=True, pady=3)
-        scols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "配制序号")
+        scols = ("序号", "文件名", "项目名", "试样描述", "配制序号")
         self.sr_tree = ttk.Treeview(sr_list, columns=scols, show="headings", height=3)
         for c in scols:
             self.sr_tree.heading(c, text=c, anchor='w')
         self.sr_tree.column("序号", width=8, anchor='w')
-        self.sr_tree.column("文件名关键词", width=70, anchor='w')
-        self.sr_tree.column("项目名关键词", width=80, anchor='w')
-        self.sr_tree.column("试样描述关键词", width=80, anchor='w')
+        self.sr_tree.column("文件名", width=70, anchor='w')
+        self.sr_tree.column("项目名", width=80, anchor='w')
+        self.sr_tree.column("试样描述", width=80, anchor='w')
         self.sr_tree.column("配制序号", width=520, anchor='w')
         self.sr_tree.pack(side='left', fill='both', expand=True)
         sr_scroll = ttk.Scrollbar(sr_list, orient="vertical", command=self.sr_tree.yview)
@@ -3070,14 +3174,14 @@ class OtherParamsTab:
         # 表格
         er_list = ttk.Frame(self.equipment_rules_frame)
         er_list.pack(fill='both', expand=True, pady=3)
-        cols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "设备编号")
+        cols = ("序号", "文件名", "项目名", "试样描述", "设备编号")
         self.er_tree = ttk.Treeview(er_list, columns=cols, show="headings", height=3)
         for c in cols:
             self.er_tree.heading(c, text=c, anchor='w')
         self.er_tree.column("序号", width=8, anchor='w')
-        self.er_tree.column("文件名关键词", width=70, anchor='w')
-        self.er_tree.column("项目名关键词", width=80, anchor='w')
-        self.er_tree.column("试样描述关键词", width=80, anchor='w')
+        self.er_tree.column("文件名", width=70, anchor='w')
+        self.er_tree.column("项目名", width=80, anchor='w')
+        self.er_tree.column("试样描述", width=80, anchor='w')
         self.er_tree.column("设备编号", width=520, anchor='w')
         self.er_tree.pack(side='left', fill='both', expand=True)
         er_scroll = ttk.Scrollbar(er_list, orient="vertical", command=self.er_tree.yview)
@@ -3697,14 +3801,14 @@ class OtherParamsTab:
         ttkb.Button(lp_input, text="添加", command=self.add_lab_proc_rule, bootstyle="secondary").pack(side='left')
         lp_list = ttk.Frame(self.lab_proc_frame)
         lp_list.pack(fill='both', expand=True, pady=3)
-        cols = ("序号", "文件名关键词", "项目名关键词", "试样描述关键词", "试验过程")
+        cols = ("序号", "文件名", "项目名", "试样描述", "试验过程")
         self.lp_tree = ttk.Treeview(lp_list, columns=cols, show="headings", height=3)
         for c in cols:
             self.lp_tree.heading(c, text=c, anchor='w')
         self.lp_tree.column("序号", width=8, anchor='w')
-        self.lp_tree.column("文件名关键词", width=70, anchor='w')
-        self.lp_tree.column("项目名关键词", width=80, anchor='w')
-        self.lp_tree.column("试样描述关键词", width=80, anchor='w')
+        self.lp_tree.column("文件名", width=70, anchor='w')
+        self.lp_tree.column("项目名", width=80, anchor='w')
+        self.lp_tree.column("试样描述", width=80, anchor='w')
         self.lp_tree.column("试验过程", width=300, anchor='w')
         self.lp_tree.pack(side='left', fill='both', expand=True)
         lp_scroll = ttk.Scrollbar(lp_list, orient="vertical", command=self.lp_tree.yview)

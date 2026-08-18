@@ -1,10 +1,10 @@
 sequence_data:
 - id: 1
-  weighing_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/日常PAHS/称量记录1.xlsx
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/日常PAHS/称量记录1.xlsx
   method_file: D:/Agent/lims数据登记/methods/afps.mtd
-  spectrum_path: //files.cirs-ck.com/轻工公盘/有机/测试数据/日常PAHS
-  temperature: '22'
-  humidity: '55'
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/日常PAHS
+  temperature: '24'
+  humidity: '56'
 column_widths:
 - 50
 - 260

@@ -679,29 +679,33 @@ def _split_device_codes(field):
 
 def _match_switch_rule(switch_rules, project_name, pdf_paths, desc=""):
     """统一规则匹配（纯函数，可单测）。
-    规则各非空条件均需满足(AND): project_name 精确/wildcard匹配(空=任意项目)、
+    规则各非空条件均需满足(AND): project_name 关键字包含于项目名(空=任意项目)、
     filename 关键字出现在某谱图PDF文件名(空=任意文件)、desc 关键字(逗号OR/分号AND)
-    出现在样品"试样描述"(空=任意描述)。多规则命中取首条，均不命中返回 ''。
-    三项匹配均大小写不敏感。"""
+    出现在样品"试样描述"(空=任意描述)。多规则命中取 project_name 关键字最长者
+    (防短关键字遮蔽：如「苯」会抢先命中「甲苯、二甲苯及乙苯总和」，须让长关键字赢)，
+    同长取首条；均不命中返回 ''。三项匹配均大小写不敏感。"""
     bases = [os.path.basename(p).lower() for p in (pdf_paths or []) if p]
     pn = (project_name or "").strip()
+    best = None  # (关键字长度, 规则)
     for r in switch_rules or []:
         rp = str(r.get("project_name") or "").strip()
-        if rp and not _project_match(pn, rp):
+        if rp and rp.lower() not in pn.lower():
             continue
         fk = str(r.get("filename") or "").strip().lower()
         if fk and not any(fk in b for b in bases):
             continue
         if not _kw_match(r.get("desc"), desc):
             continue
-        return str(r.get("to_id") or "").strip()
-    return ""
+        if best is None or len(rp) > best[0]:
+            best = (len(rp), r)
+    return str(best[1].get("to_id") or "").strip() if best else ""
 
 
-def _match_conditional_rule(rules, project_name, pdf_paths, desc=""):
-    """条件规则匹配（纯函数）：project_name/filename/desc 三条件 AND，空=不限；多规则命中取首条。
-    desc 关键字：逗号=OR(任一)，分号=AND(均需命中)。返回命中的规则 dict，均不命中返回 None。
-    供条件设备/条件实验过程等共用。"""
+def _match_conditional_rule(rules, project_name, pdf_paths, desc="", method_name=""):
+    """条件规则匹配（纯函数）：project_name/filename/desc/method 四条件 AND，空=不限；多规则命中取首条。
+    desc 关键字：逗号=OR(任一)，分号=AND(均需命中)。method(检测方法)：关键字双向包含
+    (写 18583/36246 或全称 GB 36246-2018 6.15.2 均可命中)。返回命中的规则 dict，均不命中返回 None。
+    供条件设备/条件实验过程/条件随机范围等共用。"""
     bases = [os.path.basename(p).lower() for p in (pdf_paths or []) if p]
     pn = (project_name or "").strip()
     for r in rules or []:
@@ -713,6 +717,11 @@ def _match_conditional_rule(rules, project_name, pdf_paths, desc=""):
             continue
         if not _kw_match(r.get("desc"), desc):
             continue
+        mk = str(r.get("method") or "").strip().lower()
+        if mk:
+            mn = (method_name or "").strip().lower()
+            if not mn or (mk not in mn and mn not in mk):  # 方法名缺失≠不限，关键词不命中
+                continue
         return r
     return None
 
@@ -2174,10 +2183,11 @@ class SequenceMaster:
         edit_menu.add_command(label="清空", command=self.clear_all)
         menubar.add_cascade(label="编辑", menu=edit_menu)
 
-        # 工具菜单：编辑方法 / 导出日志
+        # 工具菜单：编辑方法 / 下载称样记录模板 / 导出日志
         tool_menu = tk.Menu(menubar, tearoff=False, **menu_opts)
         tool_menu.add_command(label="编辑方法", command=self.edit_method)
         tool_menu.add_separator()
+        tool_menu.add_command(label="下载称样记录模板", command=self.download_weighing_template)
         tool_menu.add_command(label="导出日志", command=self._export_log)
         tool_menu.add_command(label="清空日志", command=self.clear_log)
         menubar.add_cascade(label="工具", menu=tool_menu)
@@ -2832,12 +2842,12 @@ class SequenceMaster:
         return codes, None
 
     def _resolve_equipment_choices(self, row, log):
-        """本行【子方法】主检设备可选编号(设备选择器用)。
+        """本行【子方法】主检设备可选 (编号, 名称) 对(设备选择器显示用)。
         - switch_rules 方法：复刻提交的 project_name+desc→to_id 路由(_match_switch_rule)，逐个
           get_detection_equipment(子方法id) 取检测设备。getOcExperiment/ocMultipleChoicePage 只给切换前
           主方法设备(如 PAE 给 1168 而非 4480/4596)，故 switch 方法必须走这条。
         - 无 switch_rules：_resolve_equipment_config(提交同源，方法级设备)。
-        返回去重保序 [编号,...]；失败返回 None。"""
+        返回去重保序 [(编号, 名称), ...]；失败返回 None。"""
         sample_codes, _ = self._row_sample_codes(row, log)
         if not sample_codes:
             log("设备查询：未取到子方法设备——本行无可登记样品")
@@ -2845,25 +2855,29 @@ class SequenceMaster:
         method_file = row.get("method_file") or ""
         switch_rules = self._read_switch_rules(method_file)
 
-        def _codes_from_raw(raw_data, codes):
+        def _pairs_from_raw(raw_data, pairs):
             for eq in raw_data or []:
                 if (eq.get("usedCategory") or "").strip() != "检测设备":
                     continue
                 men = (eq.get("mainEquipmentNames") or "").strip()
-                code = men.split(",")[0].strip() if men else ""  # "编号,名称" → 编号
+                _parts = [x.strip() for x in men.split(",")] if men else []
+                code = _parts[0] if _parts else ""
+                name = _parts[1] if len(_parts) > 1 else ""
                 if not code:  # 与 _override_equipment._code_of 口径一致，保证提交能命中
                     code = (eq.get("no") or eq.get("code") or eq.get("equipmentCode")
                             or eq.get("equipmentNo") or eq.get("number") or eq.get("billCode") or "").strip()
-                if code and code not in codes:
-                    codes.append(code)
-            return codes
+                if not name:
+                    name = (eq.get("name") or eq.get("equipmentName") or "").strip()
+                if code and code not in {c for c, _n in pairs}:
+                    pairs.append((code, name))
+            return pairs
 
         if not switch_rules:
             eq_cfg = self._resolve_equipment_config(row, log, sample_codes)
             if not eq_cfg:
                 log("设备查询：未取到方法设备(样品不可查或方法未配置检测设备)，回退手动输入")
                 return None
-            return _codes_from_raw(eq_cfg.get("raw_data"), []) or None
+            return _pairs_from_raw(eq_cfg.get("raw_data"), []) or None
 
         # switch_rules：按目标子方法取设备。desc(switch_rules.desc 匹配用)取自称样记录首个样品描述。
         desc = ""
@@ -2908,10 +2922,10 @@ class SequenceMaster:
         if not method_ids:
             log("设备查询：switch_rules 未命中目标子方法(project_name/desc 不符)，回退手动输入")
             return None
-        codes = []
+        pairs = []
         for mid in method_ids:
-            codes = _codes_from_raw((self.api.get_detection_equipment(mid, log) or {}).get("raw_data"), codes)
-        return codes or None
+            pairs = _pairs_from_raw((self.api.get_detection_equipment(mid, log) or {}).get("raw_data"), pairs)
+        return pairs or None
 
     def _resolve_equipment_config(self, row, log, sample_codes=None):
         """查询 LIMS 取本行方法(任一可查样品)的检测设备配置(含 raw_data)。
@@ -3079,7 +3093,7 @@ class SequenceMaster:
             self.status_var.set(f"第 {row_index + 1} 行谱图文件路径已设置")
 
     def select_equipment(self, row_index):
-        """打开设备选择：能取到方法设备列表则勾选(只显示编号)；取不到(如样品方法未切换/不可查)
+        """打开设备选择：能取到方法设备列表则勾选(显示 编号 名称)；取不到(如样品方法未切换/不可查)
         则回退手动输入(; 分隔)。结果写回行 equipment。"""
         if not (0 <= row_index < len(self.sequence_data)):
             return
@@ -3110,7 +3124,8 @@ class SequenceMaster:
         self.status_var.set(f"第 {row_index + 1} 行设备已设置: {row['equipment'] or '(默认)'}")
 
     def _open_equipment_picker(self, row_index, items, checked):
-        """模态勾选对话框(只显示编号)。确定返回选中编号列表(按列表顺序)；取消返回 None。"""
+        """模态勾选对话框(显示 编号 名称)。确定返回选中编号列表(按列表顺序)；取消返回 None。
+        items: [(编号, 名称), ...]"""
         win = ttkb.Toplevel(self.root)  # 主题 Toplevel，与主界面风格一致
         win.title(f"选择设备 - 第 {row_index + 1} 行")
         win.transient(self.root)
@@ -3143,7 +3158,7 @@ class SequenceMaster:
         body = ttkb.Frame(win)
         body.pack(fill="both", expand=True, padx=12, pady=(12, 4))
         _bg = ttkb.Style().colors.bg
-        canvas = tk.Canvas(body, highlightthickness=0, width=320, bg=_bg)
+        canvas = tk.Canvas(body, highlightthickness=0, width=560, bg=_bg)
         sb = ttkb.Scrollbar(body, orient="vertical", command=canvas.yview)
         inner = ttkb.Frame(canvas)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -3153,13 +3168,14 @@ class SequenceMaster:
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         checked = set(checked or [])
-        for code in items:
+        for code, name in items:
             v = tk.BooleanVar(value=(code in checked))
-            ttk.Checkbutton(inner, text=code, variable=v, style=cb_style).pack(fill="x", padx=8, pady=5)
+            ttk.Checkbutton(inner, text=f"{code}　{name}" if name else code,
+                            variable=v, style=cb_style).pack(fill="x", padx=8, pady=5)
             cvars.append((code, v))
         win.update_idletasks()
-        win.geometry(f"360x{min(980, 160 + len(items) * 54)}")
-        win.minsize(320, 360)
+        win.geometry(f"600x{min(980, 160 + len(items) * 54)}")
+        win.minsize(500, 360)
         win.update_idletasks()  # 确保 winfo 反映实际尺寸后再算居中
         rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
         x = rx + (self.root.winfo_width() - win.winfo_width()) // 2
@@ -3599,6 +3615,63 @@ class SequenceMaster:
         self.tb_abort.configure(state='normal' if running else 'disabled')
         self.status_var.set("运行中..." if running else "就绪")
 
+    def _preflight_receive_make_check(self, start_idx):
+        """worker 线程：行循环前预检未收样/未制样样品（枚举复刻 _run_one_row，查不到的逐个诊断）。
+        命中则弹窗"是否继续录入"（正文列样品编号，同 _fmt_skipped 格式），选否返回 False 不启动录入。"""
+        log = lambda m: self._log(f"预检: {m}")
+        codes = {}  # {sample_code: window_days}，同编号首见为准
+        for i in range(start_idx, len(self.sequence_data)):
+            row = self.sequence_data[i]
+            mf = row.get("method_file") or ""
+            wp = self._read_weighing_params(mf)
+            wmode = (wp.get("weighing_mode") or "").strip() if wp else ""
+            rec_path = (row.get("weighing_path") or "").strip()
+            _sup_def, _, _ = self._method_default_desc(mf)
+            defaults_no_record = bool(_sup_def and not rec_path)
+            wmap = None
+            _needs_record = wmode in ("record", "process")
+            if wmode == "conditional":
+                _needs_record = any(str((r or {}).get("weighing_mode") or "") in ("record", "process")
+                                    for r in (wp.get("weighing_rules") or []))
+            if _needs_record:
+                if not rec_path or not os.path.isfile(rec_path):
+                    continue  # 缺称量记录，行运行时自会报失败，预检不拦
+                wmap, _ = _read_weighing_records(rec_path)
+            elif rec_path and os.path.isfile(rec_path):
+                wmap, _ = _read_weighing_records(rec_path)
+            if wmap:
+                wmap = _merge_parallel_groups(wmap, (wp or {}).get("non_parallel_suffixes"))
+            samples, _ = self._resolve_samples(row, wmap, lambda *a: None,
+                                               defaults_no_record=defaults_no_record)
+            if not samples:
+                continue  # 无法解析的行留给运行报错
+            days = self._read_date_window_days(mf)
+            for sc, _pdfs in samples:
+                codes.setdefault(sc, days)
+        if not codes:
+            return True
+        log(f"{len(codes)} 个样品检查收样/制样状态 ...")
+        by_days = {}  # 不同方法文件窗口可能不同，按窗口分组查
+        for sc, d in codes.items():
+            by_days.setdefault(d, []).append(sc)
+        hits = []  # [(code, reason)]
+        for d, scs in by_days.items():
+            fetched = self._query_samples_parallel(scs, lambda *a: None, days=d)
+            for sc in scs:
+                if fetched.get(sc):
+                    continue
+                reason = self.api.diagnose_missing_sample(sc, log, days=d)
+                if reason in ("未收样", "未制样"):
+                    hits.append((sc, reason))
+        if not hits:
+            log(f"完成，{len(codes)} 个样品收样/制样状态正常")
+            return True
+        body = "\n".join(self._fmt_skipped(hits))
+        ok = self._ask_yes_no("未收样/未制样提醒",
+                              f"以下样品未收样或未制样，是否继续录入？\n\n{body}")
+        log(f"{'继续录入' if ok else '用户选择不录入'}（未收样/未制样 {len(hits)} 个）")
+        return ok
+
     def _run_worker(self, start_idx=0):
         """worker 线程：从 start_idx 起逐行执行，所有 UI 更新经 _ui_q。
         循环按当前行数动态推进：运行期间新增的行(append 到末尾)会在当行结束后自动纳入运行。"""
@@ -3606,6 +3679,10 @@ class SequenceMaster:
         self._run_merged_by_paths = {}  # {(称样路径,谱图路径): {已录入样品}}：同批混标分工行跳过已登记复核用
         self._pending_signs = []   # Phase 2 待签名批：勾选提交签名的方法暂存后入队，全部暂存完成再统一签名
         self._sign_results = []    # Phase 2 签名结果(供 _on_run_done 汇总)：[{idx,code,ok,reason}]
+        if not self._preflight_receive_make_check(start_idx):
+            self._log("用户中止序列（预检未通过）")
+            self._ui_q.put(("done", None))
+            return
         weighing_caches = {}  # {组名: {sample_code: {masses,desc}}} 跨行共享称样量(称样量共享组)
         idx = start_idx
         while idx < len(self.sequence_data):
@@ -3813,6 +3890,7 @@ class SequenceMaster:
         ctx = {
             "configure_order": configure_order, "wp": wp, "wmode": wmode, "wmap": wmap,
             "weighing_rules": (wp.get("weighing_rules") or []) if wmode == "conditional" else [],
+            "random_rules": wp.get("random_rules") or [],  # 条件随机范围：random 模式按关键字覆盖 min/max
             "fixed_params": _ops.get("fixed_params") or [], "method_file": row.get("method_file") or "",
             "standard_type": (row.get("standard_type") or "").strip(),
             "standard_rules": (row.get("_standard_rules") or _ops.get("standard_rules") or []),
@@ -4031,6 +4109,18 @@ class SequenceMaster:
                     log(f"[{it['sample_code']}] 命中称样规则 → {it['_wmode']}（项目:{pname}）")
                 else:
                     log(f"[{it['sample_code']}] 未命中称样规则（项目:{pname}），将跳过该样品称样")
+            # 条件随机范围：按 random_rules 为样品覆盖随机 min/max
+            # （random 模式与条件称样命中 random 均生效；method 条件匹配项目 standardNo，纯关键字包含）
+            if ctx.get("random_rules"):
+                rr = _match_conditional_rule(ctx["random_rules"], pname, it.get("pdf_paths") or [], desc,
+                                             (it.get("project") or {}).get("standardNo") or "")
+                if rr:
+                    _ovr = {k: rr[k] for k in ("min_value", "max_value")
+                            if str(rr.get(k) or "").strip() != ""}
+                    if _ovr:
+                        it["_random_range"] = _ovr
+                    log(f"[{it['sample_code']}] 命中随机范围规则 → "
+                        f"[{_ovr.get('min_value', '全局')}, {_ovr.get('max_value', '全局')}]")
 
         rules = self._read_query_rules(method_file)
         plan = _plan_submission_batches(rules, all_items)
@@ -4233,7 +4323,9 @@ class SequenceMaster:
         _pdfs_by_sc = {}
         for _it in batch_items:
             _pdfs_by_sc.setdefault(_it["sample_code"], []).extend(_it.get("pdf_paths") or [])
-        for _sc in dict.fromkeys(it["sample_code"] for it in batch_items):
+        for _sc in dict.fromkeys(it["sample_code"] for it in batch_items
+                                 if not _is_sum_project((it["project"] or {}).get("projectName", ""))):
+            # 总和项目不随称样平行扩展：报告值只报一个，扩成多条平行会多录(如 AB 报告 4项/15项之和)
             _mm = ((ctx["wmap"] or {}).get(_sc) or {}).get("masses") or []
             _n = len(_mm)
             if _n <= 1 and _known_suf:  # 称量记录未编码平行数 → 由文件名 A/B 推断
@@ -4421,7 +4513,9 @@ class SequenceMaster:
             if eff == "random":
                 # 平行数取本样品的(与 record/process 一致)，混批下不因他样多平行而丢弃本样记录值
                 _n_par = _n_par_by_sample.get(sc, 1)
-                pmasses_by_sample[sc] = _random_masses(samp.get("masses") or [], _n_par, _prule, wp, _mdp,
+                # 条件随机范围：命中规则覆盖 min/max(可单边覆盖)，未命中用方法级全局
+                _rwp = {**wp, **it.get("_random_range")} if it.get("_random_range") else wp
+                pmasses_by_sample[sc] = _random_masses(samp.get("masses") or [], _n_par, _prule, _rwp, _mdp,
                                                         single=bool(wp.get("single_weighing")))
                 desc_by_sample[sc] = samp.get("desc") or ""
             elif eff in ("record", "process"):
@@ -4475,7 +4569,7 @@ class SequenceMaster:
                                  "marker_masses": dict(marker_masses_by_sample.get(sc) or {}),
                                  "desc": desc_by_sample[sc]}
 
-        # random 模式回写称量记录 Excel(开关 wp.writeback_excel)：把生成的称样量回填到称样量空格
+        # random 模式回写称量记录 Excel(全局开关 wp.writeback_excel)：把生成的称样量回填到称样量空格
         if wp.get("writeback_excel"):
             _writeback_weighing_excel(row.get("weighing_path"), pmasses_by_sample, _eff_by_sample, ctx.get("wmap"), log)
 
@@ -5625,6 +5719,15 @@ class SequenceMaster:
         self._confirm_done.wait()
         return self._confirm_result
 
+    def _ask_yes_no(self, title, msg):
+        """worker 线程：请求主线程弹 askyesno 并阻塞。返回 True=是；
+        中止时 _confirm_result='abort'(truthy≠True) → 视为否"""
+        self._confirm_done.clear()
+        self._confirm_result = None
+        self._ui_q.put(("askyesno", (title, msg)))
+        self._confirm_done.wait()
+        return self._confirm_result is True
+
     def _drain_ui_queue(self):
         """主线程：轮询 worker 消息并更新 UI"""
         try:
@@ -5645,6 +5748,10 @@ class SequenceMaster:
                         self.sequence_data[idx].update(extras)
                 elif kind == "prompt":
                     self._build_confirm_dialog(payload)
+                elif kind == "askyesno":
+                    title, msg = payload
+                    self._confirm_result = messagebox.askyesno(title, msg)
+                    self._confirm_done.set()
                 elif kind == "done":
                     self._on_run_done()
         except queue.Empty:
@@ -5735,6 +5842,33 @@ class SequenceMaster:
         self.log_text.configure(state='normal')
         self.log_text.delete('1.0', 'end')
         self.log_text.configure(state='disabled')
+
+    def download_weighing_template(self):
+        """工具菜单：下载称量记录模板(列结构与 _read_weighing_records 解析一致，含示例行)"""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="保存称量记录模板",
+            initialfile="称量记录模板.xlsx", defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx")])
+        if not path:
+            return
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "称量记录"
+            ws.append(["称样时间", "样品编号", "试样描述", "称样量", "解析", "备注"])
+            _d = date(2026, 8, 13)  # 称样时间只到日(与实际称量记录一致)
+            ws.append([_d, "TN26080726001M", "红色颗粒", 0.5448, "解析", "M=标记样；解析列填「解析」=强制解析"])
+            ws.append([_d, "TN26080726001A", "红色颗粒", 0.5274, None, "A/B=平行样，行序即平行序"])
+            ws.append([_d, "TN26080726001B", "红色颗粒", "0.39/10.00", None, "斜杠后=定容体积"])
+            ws.append([_d, "TN26080726002A", "胶水", None, None, "称样量留空=随机生成后回写"])
+            for col, w in zip("ABCDEF", (18, 16, 10, 11, 6, 34)):
+                ws.column_dimensions[col].width = w
+            wb.save(path)
+        except Exception as e:
+            messagebox.showerror("下载失败", f"保存模板失败: {e}", parent=self.root)
+            return
+        self._log(f"称量记录模板已保存: {path}")
+        self.status_var.set(f"模板已保存: {os.path.basename(path)}")
 
     def _export_log(self):
         """导出运行日志为 txt 文件"""
@@ -6033,22 +6167,27 @@ def _selfcheck():
         ["TN26070729001.pdf", "TN26070729001T.pdf", "TN26070729001TS.pdf"], _suf) == 1
 
     # _match_switch_rule：统一规则 project_name + filename + desc 匹配(desc 默认空=不限)
-    # project_name 使用 wildcard 匹配(与 _project_match 同口径)
-    fr = [{"to_id": "4481", "filename": "K", "project_name": "*DEHP*"},
-          {"to_id": "4482", "filename": "K", "project_name": "*DNOP*"}]
+    # project_name 为包含匹配(纯关键字，无通配符)
+    fr = [{"to_id": "4481", "filename": "K", "project_name": "DEHP"},
+          {"to_id": "4482", "filename": "K", "project_name": "DNOP"}]
     # 命中：DNOP + 文件名含 K -> 4482（大小写不敏感）
     assert _match_switch_rule(fr, "DNOP", ["D:/sp/K-001.pdf"]) == "4482"
     # 不命中：DBP 无名称规则 -> ''
     assert _match_switch_rule(fr, "DBP", ["D:/sp/K-001.pdf"]) == ""
     # 不命中：DNOP 但文件名不含 K -> ''
     assert _match_switch_rule(fr, "DNOP", ["D:/sp/001.pdf"]) == ""
-    # project_name wildcard 包含于 LIMS 长项目名 -> 路由到各自 to_id
+    # project_name 关键字包含于 LIMS 长项目名 -> 路由到各自 to_id
     assert _match_switch_rule(fr, "3种邻苯二甲酸酯类化合物（DBP、BBP、DEHP）总和", ["K-001.pdf"]) == "4481"
     assert _match_switch_rule(fr, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["K-001.pdf"]) == "4482"
-    # 精确匹配：无通配符时需完全相等
+    # 关键字包含即可命中（长项目名亦路由）
     fr_exact = [{"to_id": "9901", "filename": "X", "project_name": "DNOP"}]
     assert _match_switch_rule(fr_exact, "DNOP", ["X-001.pdf"]) == "9901"
-    assert _match_switch_rule(fr_exact, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["X-001.pdf"]) == ""
+    assert _match_switch_rule(fr_exact, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["X-001.pdf"]) == "9901"
+    # 短关键字不遮蔽长关键字：苯 vs 甲苯、二甲苯及乙苯总和，各自路由到自己的 to_id
+    fr_shadow = [{"to_id": "4678", "project_name": "苯"},
+                 {"to_id": "4679", "project_name": "甲苯、二甲苯及乙苯总和"}]
+    assert _match_switch_rule(fr_shadow, "苯", []) == "4678"
+    assert _match_switch_rule(fr_shadow, "甲苯、二甲苯及乙苯总和", []) == "4679"
 
     # 统一规则 + 试样描述(desc)：文件名与描述均非空时需同时命中(AND)；任一为空=不限
     mr = [{"to_id": "5501", "filename": "K", "desc": "苯,甲苯"}]
@@ -6222,6 +6361,23 @@ def _selfcheck():
     assert len(_r3) == 1 and 1.9 <= float(_r3[0]) <= 2.2
     _pr_x4 = {"type": "换算处理", "factor": 4, "decimal_places": 4}              # prule 换算路径
     assert _random_masses(["0.2751"], 1, _pr_x4, _wp_r, 4) == ["1.1004"]
+    # 条件随机范围：random 模式按 random_rules(试样描述/检测方法等关键字)覆盖全局 min/max
+    _wp_rule = {"min_value": 0.5, "max_value": 0.8, "decimal_places": 3}
+    _r4 = _random_masses([], 5, None, _wp_rule, 4)
+    assert len(_r4) == 5 and all(0.5 <= float(v) <= 0.8 and len(v.split(".")[1]) == 3 for v in _r4)
+    _rr_rules = [{"desc": "液体", "min_value": "0.5", "max_value": "0.8"},
+                 {"method": "18583", "min_value": "1.2", "max_value": "1.5"}]
+    _rr = _match_conditional_rule(_rr_rules, "项目", [], "固体样品A", "GB 18583-2008 附录C")
+    _ovr = {k: _rr[k] for k in ("min_value", "max_value") if str((_rr or {}).get(k) or "").strip() != ""}
+    assert _ovr == {"min_value": "1.2", "max_value": "1.5"}                     # 关键字 18583 包含命中
+    assert _match_conditional_rule(_rr_rules, "项目", [], "", "GB 36246-2018 6.15.2") is None  # 方法不符→不命中
+    assert _match_conditional_rule([{"method": "36246", "min_value": "2", "max_value": "3"}],
+                                   "项目", [], "", "GB 36246-2018 6.15.2") is not None         # 关键字 36246 命中
+    assert _match_conditional_rule([{"method": "GB 36246-2018 6.15.2", "min_value": "2", "max_value": "3"}],
+                                   "项目", [], "", "GB 36246-2018 6.15.2") is not None         # 全称直接命中
+    _r5 = _random_masses([], 4, None, {**_wp_r, **_ovr}, 4)                     # 覆盖后走全局 dp
+    assert len(_r5) == 4 and all(1.2 <= float(v) <= 1.5 for v in _r5)
+    assert _match_conditional_rule(_rr_rules, "项目", [], "气体", "") is None   # 未命中→全局范围
 
     # _split_mass_vol：称样量单元格 "0.39/10.00" 斜杠前=称样量、后=定容体积(原样串保留末尾0)。
     # 回归：天平/定容体积末尾0不被 float 吞掉，无斜杠单元格行为不变。

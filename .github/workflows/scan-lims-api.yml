@@ -1,0 +1,61 @@
+name: Scan LIMS API
+
+on:
+  push:
+    branches: [main, main-1]
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Scan for new LIMS endpoints
+        id: scan
+        env:
+          APIFOX_API_KEY: afxp_d213b4FGYKwP7aSUGNZmEeXHfEzXZF9yOHRR
+          PROJECT_ID: "8238274"
+        run: |
+          python scripts/lims_api_scanner.py --json > /tmp/scan_result.json 2>/dev/null
+          echo "Scan result:"
+          cat /tmp/scan_result.json
+          COUNT=$(python -c "import json; print(len(json.load(open('/tmp/scan_result.json'))))")
+          echo "New endpoints found: $COUNT"
+          if [ "$COUNT" != "0" ]; then
+            echo "has_new=true" >> $GITHUB_OUTPUT
+            cp /tmp/scan_result.json /tmp/endpoints.txt
+          else
+            echo "has_new=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Issue for new endpoints
+        if: steps.scan.outputs.has_new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -c "
+          import json, subprocess
+          with open('/tmp/endpoints.txt', 'r') as f:
+              endpoints = json.load(f)
+          title = 'Found {} new LIMS endpoints'.format(len(endpoints))
+          body_lines = ['New LIMS endpoints found:\n']
+          for i, ep in enumerate(endpoints, 1):
+              body_lines.append('{}. **{}** \`{}\`'.format(i, ep['method'], ep['path']))
+              body_lines.append('   - File: {} :{}'.format(ep['file'], ep['line']))
+          body = chr(10).join(body_lines)
+          subprocess.run(['gh', 'issue', 'create', '--title', title, '--body', body])
+          "

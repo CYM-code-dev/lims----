@@ -3,14 +3,14 @@ sequence_data:
   weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物 -025/称量记录.xlsx
   method_file: D:/Agent/lims数据登记/methods/PD-苯系物.mtd
   spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物 -025
-  temperature: '22'
-  humidity: '52'
+  temperature: '23'
+  humidity: '54'
 - id: 2
-  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物 -025/称量记录.xlsx
-  method_file: D:/Agent/lims数据登记/methods/苯系物18583.mtd
-  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物 -025
-  temperature: '22'
-  humidity: '52'
+  weighing_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物-172/称量记录.xlsx
+  method_file: D:/Agent/lims数据登记/methods/PD-苯系物.mtd
+  spectrum_path: //files.cirs-testing.com/轻工实验室-内部/轻工公盘/有机/测试数据/苯系物-172
+  temperature: '24'
+  humidity: '56'
 column_widths:
 - 50
 - 260
