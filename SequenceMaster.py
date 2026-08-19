@@ -2033,7 +2033,7 @@ class SequenceMaster:
     def __init__(self, root):
         self.root = root
         self.root.title("序列编辑器")
-        w, h = paths.scaled_size(self.root, 1600, 850)
+        w, h = paths.scaled_size(self.root, 1600, 850, max_frac=(0.78, 0.72))
         self.root.geometry(f"{w}x{h}")
 
         # 存储序列数据
@@ -6551,6 +6551,17 @@ def _selfcheck():
     assert _DAPI._load_std_no_name_cache(_api3) == {"老名字": 123}
     import os as _os
     _os.unlink(_cache_f.name)
+
+    # scaled_size(max_frac)：主窗口屏占比封顶——1080p 上 1600×850(83%×79%)、
+    # 小笔电 1366×768 几乎满屏 → 封顶 78%×72%；小对话框不传 max_frac 不受影响
+    class _FakeScr:
+        def __init__(self, w, h): self._s = (w, h)
+        def winfo_screenwidth(self): return self._s[0]
+        def winfo_screenheight(self): return self._s[1]
+    _fs1080 = _FakeScr(1920, 1080)
+    assert paths.scaled_size(_fs1080, 1600, 850, max_frac=(0.78, 0.72)) == (1497, 777)
+    assert paths.scaled_size(_FakeScr(1366, 768), 1600, 850, max_frac=(0.78, 0.72)) == (1065, 552)
+    assert paths.scaled_size(_fs1080, 360, 240) == (360, 240)                 # 小窗口原样
 
     # _code_belongs_sample：按小号匹配，不把同报验号其它小号吃进
     assert _code_belongs_sample("TS26072277087", "TS26072277087", "TS26072277")       # 精确

@@ -40,16 +40,20 @@ def dpi_factor():
 _COMFORT = 0.75
 
 
-def scaled_size(widget, w, h):
+def scaled_size(widget, w, h, max_frac=None):
     """窗口尺寸缩放：普通屏（≤1920×1080、100% 缩放）→ 原样不变；
     高 DPI/高分屏 → 按 min(DPI, 屏幕相对 1920×1080 比例)×折扣 放大，但不低于 1.0
     （基准尺寸按内容设计，再小会裁切），最终仍夹在屏内。
-    """
+    max_frac=(宽占比, 高占比)：主窗口用——再按屏占比封顶(基准可被压小，主窗口内容
+    可滚动不裁切)，避免 1080p/小笔电上窗口几乎满屏。"""
     f = min(dpi_factor(),
             widget.winfo_screenwidth() / 1920.0,
             widget.winfo_screenheight() / 1080.0)
     f = max(1.0, f * _COMFORT)
     w, h = min(w, 1880), min(h, 1010)
+    if max_frac:
+        w = min(w, int(widget.winfo_screenwidth() * max_frac[0]))
+        h = min(h, int(widget.winfo_screenheight() * max_frac[1]))
     return min(int(w * f), widget.winfo_screenwidth() - 40), \
            min(int(h * f), widget.winfo_screenheight() - 100)
 

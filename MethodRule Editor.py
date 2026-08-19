@@ -181,8 +181,8 @@ class QueryTab:
                                              values=["方法", "样品"], state="readonly", width=8)
         self.query_mode_combo.grid(row=0, column=5, padx=(0, 10), pady=1, sticky='w')
 
-        # 是否总和：勾选才走「总和录入」(读各组分值求和)，否则按报告解析
-        ttk.Label(row1, text="是否总和:").grid(row=0, column=6, padx=(0, 5), pady=1, sticky='w')
+        # 总和：勾选才走「总和录入」(读各组分值求和)，否则按报告解析
+        ttk.Label(row1, text="总和:").grid(row=0, column=6, padx=(0, 5), pady=1, sticky='w')
         self.query_sum_entry_var = tk.BooleanVar()
         self.query_sum_entry_check = ttk.Checkbutton(
             row1, variable=self.query_sum_entry_var, style=self.app.large_cb_style)
@@ -196,7 +196,7 @@ class QueryTab:
         display_frame.pack(fill='both', expand=True, pady=5)
 
         # 创建规则表格 - 列顺序与输入框一致：项目/检测方法/Retest/最大选中数量；Mode 为非输入项置末
-        columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode", "是否总和")
+        columns = ("No", "项目", "检测方法", "Retest", "Max", "Mode", "总和")
         self.query_rules_tree = ttk.Treeview(display_frame, columns=columns, show="headings", height=10)
 
         # 设置列标题和宽度
@@ -208,7 +208,7 @@ class QueryTab:
             "Retest": {"width": 90, "anchor": "center", "stretch": False},  # 注销复测列居中对齐
             "Max": {"width": 80, "anchor": "center", "stretch": False},  # 最大选中数量列居中对齐
             "Mode": {"width": 90, "anchor": "center", "stretch": False},  # 录入方式列居中对齐
-            "是否总和": {"width": 90, "anchor": "center", "stretch": False}  # 是否总和录入列居中对齐
+            "总和": {"width": 90, "anchor": "center", "stretch": False}  # 总和录入列居中对齐
         }
 
         for col in columns:
@@ -572,7 +572,7 @@ class QueryTab:
                         rule["cancel_test"] = (new_value == "是")
                     elif column_name == "Max":
                         rule["max_select"] = new_value
-                    elif column_name == "是否总和":
+                    elif column_name == "总和":
                         rule["sum_entry"] = (new_value == "是")
 
                 # 标记已修改
@@ -2454,7 +2454,7 @@ class QueryAppFixed:
     def __init__(self, root):
         self.root = root
         self.root.title("录入方法编辑器_未加载配置文件")
-        w, h = paths.scaled_size(self.root, 1200, 880)
+        w, h = paths.scaled_size(self.root, 1200, 880, max_frac=(0.78, 0.72))
         self.root.geometry(f"{w}x{h}")  # 增大窗口以完整显示各标签页内容
 
         # 统一控件风格（与 SequenceMaster 保持一致）

@@ -86,7 +86,7 @@ class DetectionEntrySystem:
     def __init__(self, root, result_checkin_ids=None, sample_id=None, sample_project_ids=None, url_params=None):
         self.root = root
         self.root.title("检测数据录入系统")
-        w, h = paths.scaled_size(self.root, 1500, 1200)
+        w, h = paths.scaled_size(self.root, 1500, 1200, max_frac=(0.78, 0.72))
         self.root.geometry(f"{w}x{h}")
         self.solution_type_var = None
         self.solution_status_var = None
