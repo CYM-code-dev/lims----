@@ -34,7 +34,8 @@ def build_release_layout(dist, ver):
     os.makedirs(rel)
     shutil.copy2(os.path.join(dist, "launcher.exe"), rel)
     shutil.copytree(os.path.join(dist, "app"), os.path.join(rel, "app"))
-    shutil.copytree(os.path.join(ROOT, "methods"), os.path.join(rel, "app", "methods"))
+    shutil.copytree(os.path.join(ROOT, "methods"), os.path.join(rel, "app", "methods"),
+                    ignore=shutil.ignore_patterns("运行日志_*"))  # 运行日志不进发行包
     shutil.copy2(os.path.join(ROOT, "switch_rules.mtd"),
                  os.path.join(rel, "app", "switch_rules.mtd"))
     with open(os.path.join(rel, "app", "VERSION"), "w", encoding="utf-8") as f:

@@ -2249,21 +2249,33 @@ class DetectionAPI:
 
     def _load_std_no_name_cache(self):
         import os, json
+        today = datetime.now().strftime("%Y-%m-%d")
         try:
             p = self._std_no_name_cache_path()
             if os.path.isfile(p):
                 with open(p, encoding="utf-8") as f:
-                    return json.load(f)
+                    raw = json.load(f)
+                out = {}
+                for k, v in raw.items():
+                    if isinstance(v, dict) and "_neg" in v:   # 当日负缓存：跨天作废
+                        if v.get("_neg") == today:
+                            out[k] = None
+                        continue
+                    out[k] = v
+                return out
         except Exception:
             pass
         return {}
 
     def _save_std_no_name_cache(self):
         import json
+        today = datetime.now().strftime("%Y-%m-%d")
         try:
             with open(self._std_no_name_cache_path(), "w", encoding="utf-8") as f:
-                # 只持久化正命中；None 负缓存(当日窗口查无)留在进程内，避免跨天变陈旧
-                json.dump({k: v for k, v in self._std_no_name_to_id.items() if v}, f, ensure_ascii=False)
+                # 正命中存 id；负缓存带日期持久化(次日自动作废)——否则每次启动都重付
+                # 预取大查询+逐名兜底(如 'GB 18583-2008 附录B' 永远查无，≈22s)
+                payload = {k: (v if v else {"_neg": today}) for k, v in self._std_no_name_to_id.items()}
+                json.dump(payload, f, ensure_ascii=False)
         except Exception:
             pass
 
@@ -2316,6 +2328,7 @@ class DetectionAPI:
                             self._save_std_no_name_cache()
                             return mid
             self._std_no_name_to_id[key] = None  # 负缓存：窗口内查无此子方法，本进程不再逐样品重查
+            self._save_std_no_name_cache()       # 当日持久化，免去下次启动重付预取+兜底
             return None
         except Exception as e:
             if log_func:
@@ -2324,7 +2337,7 @@ class DetectionAPI:
 
     def _prefetch_std_no_name_ids(self, names, log_func=None):
         """批量预取子方法ID：一次查30天内全部 decideMethod 记录，按 standardNoName 填缓存。
-        替代逐方法名串行查(N方法名=N×RTT)；未命中的名字仍由 get_method_id_by_standard_no_name 单查兜底。"""
+        替代逐方法名串行查(N方法名=N×RTT)；预取未命中的名字直接负缓存(单名兜底是子集查询，查不到预取没有的)。"""
         names = {n for n in names if n and n not in self._std_no_name_to_id}
         if not names:
             return
@@ -2353,6 +2366,11 @@ class DetectionAPI:
                         sn = (m.get('standardNoName') or "").strip()
                         if sn in names:
                             self._std_no_name_to_id[sn] = m.get('id')
+                    # 预取是全集(无名字过滤)、单名兜底是子集查询——预取没有的名字兜底也查不到，
+                    # 直接负缓存，省掉逐名 N×RTT 兜底
+                    for sn in names:
+                        self._std_no_name_to_id.setdefault(sn, None)
+                    self._save_std_no_name_cache()  # 正命中+本次负缓存一起落盘
         except Exception as e:
             if log_func:
                 log_func(f"预取子方法ID异常: {e}")

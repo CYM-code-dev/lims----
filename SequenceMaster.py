@@ -2060,7 +2060,8 @@ class SequenceMaster:
         self.login_system = MultiUserLoginSystem()
         self.api = DetectionAPI(self.login_system)
         self.logged_in = False
-        self._env_eq_cfg_cache = {}  # sample_code -> 完整 equipment_config(设备选择器用，跨行去重)
+        self._det_eq_raw_cache = {}  # 子方法ID -> 设备raw_data(设备选择器用，会话级缓存)
+        self._eq_row_codes_cache = {}  # (称样路径,谱图路径,方法文件) -> (样品编号列表, 原因)——设备选择器展开缓存
         self._method_projects_cache = {}  # 方法查询键->该方法待登记项目列表(运行期跨行复用)
 
         # 序列运行器状态（阶段1）：1 worker 线程 + queue + 4 Event，UI 更新全部 marshal 回主线程
@@ -2829,28 +2830,42 @@ class SequenceMaster:
             return []
 
     def _apply_standard_config(self, row, st, prep, standard_rules=None):
-        """标液配置应用到行"""
+        """标液配置应用到行。_auto_prep 记录方法带出的配制序号：
+        换方法(fresh/未配置)时旧方法带出的序号清掉，用户手填的保留。"""
         row["standard_type"] = st
         if st == "fixed" and prep:
             row["configure_order"] = prep      # 带出固定编号，可覆盖
+            row["_auto_prep"] = prep
         elif st == "conditional":
             row["configure_order"] = ""        # 条件匹配时清空（运行时按样品匹配）
+            row["_auto_prep"] = ""
             row["_standard_rules"] = standard_rules  # 保存规则供 _submit_batch 使用
         elif st == "none":
             row["configure_order"] = ""        # 无需标液，清空
-        # fresh / 未知：保留用户已填或空
+            row["_auto_prep"] = ""
+        else:  # fresh / 未配置：方法带出的旧序号清掉(用户手填的保留)
+            if (row.get("configure_order") or "").strip() == (row.get("_auto_prep") or ""):
+                row["configure_order"] = ""
+            row["_auto_prep"] = ""
 
     def _apply_equipment_config(self, row, setting, device, equipment_rules=None):
-        """设备配置应用到行（仪器设置→显示模式；指定设备带出编号可覆盖）"""
+        """设备配置应用到行（仪器设置→显示模式；指定设备带出编号可覆盖）。
+        _auto_equipment 记录方法带出的编号：换方法(未配置/指定无编号)时旧编号清掉，用户手填的保留。"""
         row["instrument_setting"] = setting
         if setting == "specified" and device:
             row["equipment"] = device          # 带出设备编号，可覆盖
+            row["_auto_equipment"] = device
         elif setting == "conditional":
             row["equipment"] = ""              # 条件匹配时清空（运行时按样品匹配）
+            row["_auto_equipment"] = ""
             row["_equipment_rules"] = equipment_rules  # 保存规则供 _run_one_row 使用
         elif setting == "default":
             row["equipment"] = ""              # 默认设备，清空（显示占位）
-        # 未配置：保留用户已填或空
+            row["_auto_equipment"] = ""
+        else:  # 未配置 / 指定但无编号：方法带出的旧编号清掉(用户手填的保留)
+            if (row.get("equipment") or "").strip() == (row.get("_auto_equipment") or ""):
+                row["equipment"] = ""
+            row["_auto_equipment"] = ""
 
     def _apply_method_params(self, row, method_file):
         """选方法 / 编辑器保存后：一次读取并回填标液+设备+称样量模式配置（共用）"""
@@ -2904,17 +2919,24 @@ class SequenceMaster:
 
     def _resolve_equipment_choices(self, row, log):
         """本行【子方法】主检设备可选 (编号, 名称) 对(设备选择器显示用)。
+        项目来源=方法池(_query_projects_by_methods，1次/方法名+_method_projects_cache 会话缓存)。
+        设备是方法级：直接全池交方法过滤，不展开本行样品(免逐PDF内容解析数十秒)；样品编号仅在
+        switch desc 路由 / 无方法名回退 / 全池空诊断时惰性展开(按行缓存)。
         - switch_rules 方法：复刻提交的 project_name+desc→to_id 路由(_match_switch_rule)，逐个
           get_detection_equipment(子方法id) 取检测设备。getOcExperiment/ocMultipleChoicePage 只给切换前
           主方法设备(如 PAE 给 1168 而非 4480/4596)，故 switch 方法必须走这条。
-        - 无 switch_rules：_resolve_equipment_config(提交同源，方法级设备)。
+        - 无 switch_rules：按 decideProjectMethodId 逐子方法取设备(方法级设备)。
         返回去重保序 [(编号, 名称), ...]；失败返回 None。"""
-        sample_codes, _ = self._row_sample_codes(row, log)
-        if not sample_codes:
-            log("设备查询：未取到子方法设备——本行无可登记样品")
-            return None
         method_file = row.get("method_file") or ""
         switch_rules = self._read_switch_rules(method_file)
+        _codes_key = ((row.get("weighing_path") or "").strip(),
+                      (row.get("spectrum_path") or "").strip(), method_file)
+
+        def _row_codes():
+            # 惰性+按行缓存(路径+方法文件为键)。ponytail: 称样Excel原地改动后需重开程序才刷新
+            if _codes_key not in self._eq_row_codes_cache:
+                self._eq_row_codes_cache[_codes_key] = self._row_sample_codes(row, log)
+            return self._eq_row_codes_cache[_codes_key]
 
         def _pairs_from_raw(raw_data, pairs):
             for eq in raw_data or []:
@@ -2933,102 +2955,78 @@ class SequenceMaster:
                     pairs.append((code, name))
             return pairs
 
-        if not switch_rules:
-            eq_cfg = self._resolve_equipment_config(row, log, sample_codes)
-            if not eq_cfg:
-                log("设备查询：未取到方法设备(样品不可查或方法未配置检测设备)，回退手动输入")
+        # 项目来源：方法池优先(与运行阶段A同源，窗口同用 date_window_days 避免污染池缓存)；
+        # 无文本方法名(纯数字ID/未配置)回退并行逐样品精确查(此时才需要展开样品编号)
+        days = self._read_date_window_days(method_file)
+        names = self._method_query_names(method_file)
+        if names:
+            projects = self._query_projects_by_methods(names, log, days=days)
+        else:
+            sample_codes, _ = _row_codes()
+            if not sample_codes:
+                log("设备查询：未取到子方法设备——本行无可登记样品")
                 return None
-            return _pairs_from_raw(eq_cfg.get("raw_data"), []) or None
-
-        # switch_rules：按目标子方法取设备。desc(switch_rules.desc 匹配用)取自称样记录首个样品描述。
-        desc = ""
-        rec_path = (row.get("weighing_path") or "").strip()
-        if rec_path and os.path.isfile(rec_path):
-            _wm, _ = _read_weighing_records(rec_path)
-            if _wm:
-                _wp = self._read_weighing_params(method_file)
-                _wm = _merge_parallel_groups(_wm, (_wp or {}).get("non_parallel_suffixes"))
-                desc = ((_wm.get(sample_codes[0]) or {}).get("desc") or "")
-        # 首个可查样品的项目即可解析本行全部子方法(设备是方法级)
-        projects = None
-        _reason = "未登记样品中未查到(可能受理超30天/编号不符/已登记)"
-        for sc in sample_codes:
-            try:
-                _ps = self.api.query_samples_by_conditions(sample_code=sc, exact_match=True, log_func=log)
-                if not _ps:
-                    # 未登记查不到 → 试已登记，区分"样品已登记"
-                    _done = self.api.query_samples_by_conditions(
-                        sample_code=sc, exact_match=True, log_func=log,
-                        check_in_status="CHECK_IN_STATUS_ALREADY")
-                    if _done and self._filter_projects_by_method(_done, row, lambda *a, **k: None)[0]:
-                        _reason = "样品已登记(设备查询仅查未登记样品)"
-                    continue
-                _ps, ferr = self._filter_projects_by_method(_ps, row, log)
-                if ferr:
-                    _reason = f"方法未匹配项目：{ferr}"
-                    continue
-                if _ps:
-                    projects = _ps
-                    break
-            except Exception as e:
-                log(f"设备查询：查询样品异常({sc}): {e}")
+            fetched = self._query_samples_parallel(sample_codes, log, days=days)
+            projects, _seen = [], set()
+            for sc in sample_codes:
+                for p in fetched.get(sc) or []:
+                    if p.get("projectId") not in _seen:
+                        _seen.add(p.get("projectId"))
+                        projects.append(p)
         if not projects:
-            log(f"设备查询：{_reason}，回退手动输入")
+            # 方法池/逐样品查询全空：一次并行"已登记"复核，只为日志区分原因(不再逐样品补查)
+            sample_codes, _ = _row_codes()
+            if sample_codes:
+                _done = self._query_samples_parallel(sample_codes, log, days=days,
+                                                     check_in_status="CHECK_IN_STATUS_ALREADY")
+                if _done:
+                    log(f"设备查询：本行 {len(_done)}/{len(sample_codes)} 个样品已登记(设备查询仅查未登记样品)，无待登记项目")
+                    return None
+            log("设备查询：未查到本行样品的待登记项目(可能受理超窗口/编号不符)，回退手动输入")
             return None
+        projects, ferr = self._filter_projects_by_method(projects, row, log)
+        if ferr or not projects:
+            log(f"设备查询：{ferr or '方法过滤后无项目'}，回退手动输入")
+            return None
+
+        # 子方法ID：switch 方法按 project_name+desc 路由；否则直接取项目 decideProjectMethodId
         method_ids = []
-        for p in projects:
-            mid = _match_switch_rule(switch_rules, p.get("projectName", ""), [], desc)
-            if mid and mid not in method_ids:
-                method_ids.append(mid)
-        if not method_ids:
-            log("设备查询：switch_rules 未命中目标子方法(project_name/desc 不符)，回退手动输入")
-            return None
+        if switch_rules:
+            sample_codes, _ = _row_codes()
+            if not sample_codes:
+                log("设备查询：未取到子方法设备——本行无可登记样品")
+                return None
+            # desc(switch_rules.desc 匹配用)取自称样记录首个样品描述
+            desc = ""
+            rec_path = (row.get("weighing_path") or "").strip()
+            if rec_path and os.path.isfile(rec_path):
+                _wm, _ = _read_weighing_records(rec_path)
+                if _wm:
+                    _wp = self._read_weighing_params(method_file)
+                    _wm = _merge_parallel_groups(_wm, (_wp or {}).get("non_parallel_suffixes"))
+                    desc = ((_wm.get(sample_codes[0]) or {}).get("desc") or "")
+            for p in projects:
+                mid = _match_switch_rule(switch_rules, p.get("projectName", ""), [], desc)
+                if mid and mid not in method_ids:
+                    method_ids.append(mid)
+            if not method_ids:
+                log("设备查询：switch_rules 未命中目标子方法(project_name/desc 不符)，回退手动输入")
+                return None
+        else:
+            for p in projects:
+                mid = p.get("decideProjectMethodId")
+                if mid and str(mid) not in {str(m) for m in method_ids}:
+                    method_ids.append(mid)
+            if not method_ids:
+                log("设备查询：项目无 decideProjectMethodId，回退手动输入")
+                return None
         pairs = []
         for mid in method_ids:
-            pairs = _pairs_from_raw((self.api.get_detection_equipment(mid, log) or {}).get("raw_data"), pairs)
+            # ponytail: 会话级缓存，设备有效期跨天翻转由运行时提交路径重新拉取兜底
+            if mid not in self._det_eq_raw_cache:
+                self._det_eq_raw_cache[mid] = (self.api.get_detection_equipment(mid, log) or {}).get("raw_data") or []
+            pairs = _pairs_from_raw(self._det_eq_raw_cache[mid], pairs)
         return pairs or None
-
-    def _resolve_equipment_config(self, row, log, sample_codes=None):
-        """查询 LIMS 取本行方法(任一可查样品)的检测设备配置(含 raw_data)。
-        同行样品可能分属不同标准(混标批，如 GB 36246 与 GB 18583)，逐样品尝试至命中；
-        命中后按子方法ID(decideProjectMethodId)逐个取设备并合并——getOcExperiment 混子方法
-        报"方法不同"，设备查询绕开它只走 selectByDetectionMethodId(与 switch 分支同源)。
-        按 sample_code 缓存(_env_eq_cfg_cache)。失败/无样品返回 None。"""
-        if sample_codes is None:
-            sample_codes, _ = self._row_sample_codes(row, log)
-        cache = self._env_eq_cfg_cache
-        eq_cfg = None
-        probed = []
-        for sample_code in sample_codes:
-            if sample_code in cache:
-                if cache[sample_code]:
-                    return cache[sample_code]
-                continue   # 缓存的负结果：跳过，继续找下一个样品(混标批后段可能命中)
-            probed.append(sample_code)
-            try:
-                projects = self.api.query_samples_by_conditions(
-                    sample_code=sample_code, exact_match=True, log_func=log)
-                if not projects:
-                    continue
-                projects, ferr = self._filter_projects_by_method(projects, row, log)
-                if ferr:
-                    log(f"设备查询({sample_code})：{ferr}")
-                    continue
-                raw, seen = [], set()   # ponytail: 同批子方法设备高度重合，靠消费端 _codes_from_raw 去重
-                for p in projects or []:
-                    mid = p.get("decideProjectMethodId")
-                    if not mid or str(mid) in seen:
-                        continue
-                    seen.add(str(mid))
-                    raw.extend((self.api.get_detection_equipment(mid, log) or {}).get("raw_data") or [])
-                if raw:
-                    eq_cfg = {"raw_data": raw}
-                    break
-            except Exception as e:
-                log(f"查询方法设备列表异常({sample_code}): {e}")
-        for c in probed:
-            cache[c] = eq_cfg
-        return eq_cfg
 
     def _override_equipment(self, equipment_config, device_field):
         """表格/设备规则指定的设备编号覆盖默认主检设备与称样设备（设备以序列表格为准；支持 ';' 分隔多个）。
@@ -5105,24 +5103,37 @@ class SequenceMaster:
         先用完整方法名(含子方法后缀)精确查——结果少、快；若 0(服务端 standardNo 末尾空格拼接出双空格、如六价铬 7-2:2017，
         或子方法名与样品侧不完全一致)，回退到标准号主体(_method_query_key 剥后缀)宽查——必命中但是超集，
         _filter_projects_by_method 再按 standardNo+子方法ID 精准过滤。
+        两波并行：先全部 full 名，miss 的名字按 core 去重后再宽查(附录B/C 同回退 'GB 18583-2008' 只查一次)。
         days: 方法池受理日期窗口(按方法文件可配)，默认30；仅本方法池查询用。"""
+        from concurrent.futures import ThreadPoolExecutor
         cache = self._method_projects_cache
+
+        def _cached_query(key):
+            projects = cache.get(key)
+            if projects is None:
+                projects = self.api.query_samples_by_conditions(
+                    method_name=key, log_func=log, days=days) or []
+                cache[key] = projects
+                log(f"按方法查询 {key}：{len(projects)} 个项目")
+            return projects
+
+        names = list(dict.fromkeys(names))
+        with ThreadPoolExecutor(max_workers=min(6, len(names))) as ex:
+            full_hits = dict(zip(names, ex.map(_cached_query, names)))
+        # full 未命中的名字 → core 去重宽查(同 core 名字共享一份结果)
+        cores = []
+        for n in names:
+            if not full_hits.get(n):
+                core = self._method_query_key(n)
+                if core not in cores:
+                    cores.append(core)
+        core_hits = {}
+        if cores:
+            with ThreadPoolExecutor(max_workers=min(6, len(cores))) as ex:
+                core_hits = dict(zip(cores, ex.map(_cached_query, cores)))
         pooled, seen = [], set()
-        for name in names:
-            core = self._method_query_key(name)
-            keys = [name, core] if name != core else [core]  # 先精确(full)，0 再宽查(core)
-            chosen = None
-            for key in keys:
-                projects = cache.get(key)
-                if projects is None:
-                    projects = self.api.query_samples_by_conditions(
-                        method_name=key, log_func=log, days=days) or []
-                    cache[key] = projects
-                    log(f"按方法查询 {key}：{len(projects)} 个项目")
-                if projects:
-                    chosen = projects
-                    break
-            for p in (chosen or []):
+        for n in names:
+            for p in (full_hits.get(n) or core_hits.get(self._method_query_key(n)) or []):
                 pid = p.get("projectId")
                 if pid not in seen:
                     seen.add(pid)
@@ -5648,7 +5659,9 @@ class SequenceMaster:
                 proj_hint = f"，项目名过滤={project_vals!r}" if project_vals else ""
                 sub_hint = f"，子方法ID={_sub_ids}" if _sub_ids else ""
                 _pstds = sorted({str(p.get("standardNo") or "") for p in filtered})
-                _pnames = [str(p.get("projectName") or "") for p in filtered]
+                _pnames = [str(p.get("projectName") or "") for p in filtered[:8]]
+                if len(filtered) > 8:   # 全池过滤后项目可达百余个，列表全打会把日志刷满
+                    _pnames.append(f"…等 {len(filtered)} 个")
                 _skipped_hint = f"，复测维度(cancel_test)排除 {len(_retest_skipped)} 个" if _retest_skipped else ""
                 log(f"按方法过滤出 {len(filtered)} 个项目(共 {len(rule_stds)} 条方法规则：{', '.join(distinct)}{proj_hint}{sub_hint})；"
                     f"标准号集合: {_pstds}；项目名: {_pnames}{_skipped_hint}")
@@ -6480,6 +6493,65 @@ def _selfcheck():
     _out2 = SequenceMaster._enrich_weighing_bill(_sm2, _cfg, "sp1,sp2", lambda *a: None)
     assert _out2["weighingEquipmentRaw"] is _raw_hit, _out2         # 回归：首个即命中
 
+    # _resolve_equipment_choices：方法池取项目后全池交方法过滤——非 switch 不展开本行样品
+    # (免 35+ PDF 内容解析)，mid 级缓存(重复调用 0 次新请求)、mid 去重后 pairs 与样品无关。
+    _sm3 = SequenceMaster.__new__(SequenceMaster)
+    _sm3._det_eq_raw_cache = {}
+    _sm3._eq_row_codes_cache = {}
+    _eq_calls = []
+    class _PoolAPI:
+        def get_detection_equipment(self, mid, log):
+            _eq_calls.append(mid)
+            return {"raw_data": [
+                {"usedCategory": "检测设备", "name": "气相", "equipmentBillId": mid,
+                 "mainEquipmentNames": f"CK-SB0{mid}-CG,气相,2026-12-08"},
+                {"usedCategory": "称样设备", "name": "天平", "mainEquipmentNames": "CK-WB001,天平,"},
+            ]}
+    _sm3.api = _PoolAPI()
+    _sm3._row_sample_codes = lambda row, log: (_ for _ in ()).throw(
+        AssertionError("有方法名且非 switch 不应展开样品(逐PDF解析数十秒)"))
+    _sm3._read_switch_rules = lambda mf: []
+    _sm3._read_date_window_days = lambda mf: 30
+    _sm3._method_query_names = lambda mf: ["GB 31604.52-2021"]
+    _sm3._query_projects_by_methods = lambda names, log, days=30: [dict(p) for p in [
+        {"sampleCode": "TS26080731001", "projectId": 1, "projectName": "BIT",
+         "standardNo": "GB 31604.52-2021", "decideProjectMethodId": 4480},
+        {"sampleCode": "TS26080731002", "projectId": 2, "projectName": "他样",
+         "standardNo": "GB 31604.52-2021", "decideProjectMethodId": 4480}]]
+    _sm3._query_samples_parallel = lambda codes, log, **kw: (_ for _ in ()).throw(
+        AssertionError("有方法名不应走逐样品回退"))
+    _sm3._filter_projects_by_method = lambda projects, row, log: (projects, None)
+    _row3 = {"method_file": "mf.json"}
+    _p1 = SequenceMaster._resolve_equipment_choices(_sm3, _row3, lambda *a: None)
+    assert _p1 == [("CK-SB04480-CG", "气相")], _p1        # 检测设备按"编号,名称"解析，称样设备不进列表
+    assert _eq_calls == [4480], _eq_calls                  # 1 次 selectByDetectionMethodId(池内同 mid 去重)
+    _p2 = SequenceMaster._resolve_equipment_choices(_sm3, _row3, lambda *a: None)
+    assert _p2 == _p1 and _eq_calls == [4480], _eq_calls   # mid 缓存命中：重复调用 0 次新请求
+
+    # 子方法ID负缓存当日持久化(次日作废)：正命中存 id、负缓存存 {"_neg": 当天}，旧格式 {名: id} 兼容。
+    # 否则每次启动对 'GB 18583-2008 附录B' 这类永远查无的名字重付 预取大查询+逐名兜底 ≈22s。
+    import tempfile as _tf
+    from detection_entry_api import DetectionAPI as _DAPI
+    _api = _DAPI.__new__(_DAPI)
+    _cache_f = _tf.NamedTemporaryFile(suffix=".json", delete=False)
+    _cache_f.close()
+    _api._std_no_name_cache_path = lambda: _cache_f.name
+    _api._std_no_name_to_id = {"GB 36246-2018 6.15.2": 1949, "GB 18583-2008 附录B": None}
+    _DAPI._save_std_no_name_cache(_api)
+    _api2 = _DAPI.__new__(_DAPI)
+    _api2._std_no_name_cache_path = lambda: _cache_f.name
+    _loaded = _DAPI._load_std_no_name_cache(_api2)
+    assert _loaded == {"GB 36246-2018 6.15.2": 1949, "GB 18583-2008 附录B": None}, _loaded
+    # 旧格式(纯 {名: id})仍按正命中加载
+    import json as _json
+    with open(_cache_f.name, "w", encoding="utf-8") as _f:
+        _json.dump({"老名字": 123}, _f)
+    _api3 = _DAPI.__new__(_DAPI)
+    _api3._std_no_name_cache_path = lambda: _cache_f.name
+    assert _DAPI._load_std_no_name_cache(_api3) == {"老名字": 123}
+    import os as _os
+    _os.unlink(_cache_f.name)
+
     # _code_belongs_sample：按小号匹配，不把同报验号其它小号吃进
     assert _code_belongs_sample("TS26072277087", "TS26072277087", "TS26072277")       # 精确
     assert not _code_belongs_sample("TS26072277055", "TS26072277087", "TS26072277")   # 同报验号不同小号不归属
@@ -6547,6 +6619,27 @@ def _selfcheck():
     _r5 = _random_masses([], 4, None, {**_wp_r, **_ovr}, 4)                     # 覆盖后走全局 dp
     assert len(_r5) == 4 and all(1.2 <= float(v) <= 1.5 for v in _r5)
     assert _match_conditional_rule(_rr_rules, "项目", [], "气体", "") is None   # 未命中→全局范围
+
+    # _apply_*_config：换方法残留。方法带出的编号在换到未配置方法时清掉，用户手填的保留。
+    _sm = SequenceMaster.__new__(SequenceMaster)  # 两函数不碰 self，裸实例即可
+    _er = {"equipment": ""}
+    _sm._apply_equipment_config(_er, "specified", "CK-1")            # 方法A带出编号
+    assert _er["equipment"] == "CK-1"
+    _sm._apply_equipment_config(_er, "", "")                         # 换未配置方法
+    assert _er["equipment"] == ""                                    # 旧编号不再残留
+    _sm._apply_equipment_config(_er, "specified", "CK-1")
+    _er["equipment"] = "CK-9"                                        # 用户手改
+    _sm._apply_equipment_config(_er, "", "")                         # 再换未配置方法
+    assert _er["equipment"] == "CK-9"                                # 手填保留
+    _sr = {"configure_order": ""}
+    _sm._apply_standard_config(_sr, "fixed", "D-9540")               # 方法A带出标液序号
+    assert _sr["configure_order"] == "D-9540"
+    _sm._apply_standard_config(_sr, "fresh", "")                     # 换现配现用方法
+    assert _sr["configure_order"] == ""                              # 旧序号不再残留
+    _sm._apply_standard_config(_sr, "fixed", "D-9540")
+    _sr["configure_order"] = "D-0001"                                # 用户手改
+    _sm._apply_standard_config(_sr, "fresh", "")
+    assert _sr["configure_order"] == "D-0001"                        # 手填保留
 
     # _split_mass_vol：称样量单元格 "0.39/10.00" 斜杠前=称样量、后=定容体积(原样串保留末尾0)。
     # 回归：天平/定容体积末尾0不被 float 吞掉，无斜杠单元格行为不变。
