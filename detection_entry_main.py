@@ -86,7 +86,8 @@ class DetectionEntrySystem:
     def __init__(self, root, result_checkin_ids=None, sample_id=None, sample_project_ids=None, url_params=None):
         self.root = root
         self.root.title("检测数据录入系统")
-        self.root.geometry("1500x1200")
+        w, h = paths.scaled_size(self.root, 1500, 1200)
+        self.root.geometry(f"{w}x{h}")
         self.solution_type_var = None
         self.solution_status_var = None
         # 使用登录系统和API模块
@@ -2190,14 +2191,20 @@ def main():
 
     args = parser.parse_args()
 
+    paths.set_dpi_awareness()
     root = ttkb.Window(themename="sandstone-light")
+    root.withdraw()  # 构建期间隐藏，配置完再显示，避免可见的从小变大
+    try:
+        root.iconbitmap(paths.resource("detection.ico"))
+    except Exception:
+        pass
     app = DetectionEntrySystem(
         root,
         result_checkin_ids=args.result_checkin_ids,
         sample_id=args.sample_id,
         sample_project_ids=args.sample_project_ids
     )
-
+    root.deiconify()
     root.mainloop()
 
 

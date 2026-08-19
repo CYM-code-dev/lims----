@@ -247,7 +247,8 @@ class QueryTab:
         """显示排除项目设置对话框"""
         dialog = ttkb.Toplevel(self.parent)
         dialog.title("排除项目设置")
-        dialog.geometry("880x760")  # 增加宽度以容纳更多内容
+        w, h = paths.scaled_size(dialog, 880, 760)  # 增加宽度以容纳更多内容
+        dialog.geometry(f"{w}x{h}")
         dialog.transient(self.parent)
         dialog.grab_set()
 
@@ -1249,7 +1250,7 @@ class WeighingTab:
     def create_all_weighing_modes(self, parent):
         """创建所有称样量模式的内容区域"""
         # 随机数生成模式（可折叠）：范围按条件随机范围规则，小数位/回写为全局设置
-        self.random_frame, rb = self._make_collapsible(parent, "随机数生成模式", expanded=True)
+        self.random_frame, rb = self._make_collapsible(parent, "随机数生成模式", expanded=False)
         settings = ttk.Frame(rb)
         settings.pack(fill='x', pady=2)
         # 小数位数：record/pdf 模式称量格式化共用；random 模式为规则未覆盖时的兜底
@@ -1265,7 +1266,7 @@ class WeighingTab:
         self.create_random_rules_section(rb)
 
         # 称量记录处理模式（标题可点击折叠/展开）
-        self.process_frame, process_body = self._make_collapsible(parent, "称量记录处理模式", expanded=True)
+        self.process_frame, process_body = self._make_collapsible(parent, "称量记录处理模式", expanded=False)
 
         # 处理规则配置区域 - 使用grid布局
         config_frame = ttk.Frame(process_body)
@@ -2453,7 +2454,8 @@ class QueryAppFixed:
     def __init__(self, root):
         self.root = root
         self.root.title("录入方法编辑器_未加载配置文件")
-        self.root.geometry("1400x1100")  # 增大窗口以完整显示各标签页内容
+        w, h = paths.scaled_size(self.root, 1200, 880)
+        self.root.geometry(f"{w}x{h}")  # 增大窗口以完整显示各标签页内容
 
         # 统一控件风格（与 SequenceMaster 保持一致）
         style = ttk.Style()
@@ -3898,6 +3900,13 @@ class OtherParamsTab:
 
 
 if __name__ == "__main__":
+    paths.set_dpi_awareness()
     root = ttkb.Window(themename="sandstone-light")
+    root.withdraw()  # 构建期间隐藏，配置完再显示，避免可见的从小变大
+    try:
+        root.iconbitmap(paths.resource("method.ico"))
+    except Exception:
+        pass
     app = QueryAppFixed(root)
+    root.deiconify()
     root.mainloop()

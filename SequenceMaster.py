@@ -18,6 +18,7 @@ import yaml
 import openpyxl
 from datetime import datetime, date, timedelta
 from PIL import Image, ImageTk
+import paths
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from login import MultiUserLoginSystem
@@ -418,17 +419,19 @@ def _gen_random_mass(wp):
 def _random_masses(recorded, n_par, prule, wp, mdp, single=False):
     """random 称样量：记录值不少于本样品平行数(n_par)则用记录(按 prule 换算或按 mdp 格式化)，
     否则随机生成。平行数取本样品的，混批下不因他样多平行而丢弃本样记录值。
+    记录不足时按槽位补：recorded[i] 有值则沿用(Excel 已回写的 A 行不重随机，保持与 LIMS 一致)，
+    缺失槽才随机生成(如 A 已回写 0.2868、B 空格 → 只生成 B)。
     single=单称样多次进样(如 TDI 称1次进样2次)：记录不足平行数时复用末值，不丢弃真实称样量去随机生成。"""
+    def _fmt(v):
+        return _apply_processing(v, prule, wp) if prule else f"{float(v):.{mdp}f}"
     def _clamp(i):
         return recorded[i] if i < len(recorded) else recorded[-1]
     if recorded and len(recorded) >= n_par:
-        if prule:
-            return [_apply_processing(recorded[i], prule, wp) for i in range(n_par)]
-        return [f"{float(recorded[i]):.{mdp}f}" for i in range(n_par)]
+        return [_fmt(recorded[i]) for i in range(n_par)]
     if single and recorded:  # 单称样：复用唯一称样量补齐各平行槽
-        if prule:
-            return [_apply_processing(_clamp(i), prule, wp) for i in range(n_par)]
-        return [f"{float(_clamp(i)):.{mdp}f}" for i in range(n_par)]
+        return [_fmt(_clamp(i)) for i in range(n_par)]
+    if recorded:
+        return [_fmt(recorded[i]) if i < len(recorded) else _gen_random_mass(wp) for i in range(n_par)]
     return [_gen_random_mass(wp) for _ in range(n_par)]
 
 
@@ -514,14 +517,6 @@ def _project_match(project_name, project_val):
     if "*" in pv:
         return fnmatch.fnmatchcase(pname, pv)
     return pname == pv
-
-
-def _is_sum_project(project_name):
-    """是否"总和"项目：项目名含「总和」或「之和」(覆盖 甲苯..总和/四项之和/AfPS PAK 4项之和/18种多环芳烃总和 等)。"""
-    pn = (project_name or "")
-    return "总和" in pn or "之和" in pn
-
-
 
 
 def _std_loose_match(std, target):
@@ -1410,6 +1405,36 @@ class UniversalCell:
         # 绑定值变化事件
         self.value_var.trace("w", self.on_value_change)
 
+        self._bind_value_tip()
+
+    def _bind_value_tip(self):
+        """称样记录路径/录入方法/标准物质/设备/谱图文件路径列：悬停显示完整内容
+        （路径列 label 只显示文件名，悬停看全路径）"""
+        if self.col_index not in (1, 2, 3, 4, 5):
+            return
+        tip = {"win": None}
+
+        def show(_e):
+            if tip["win"]:
+                return
+            full = self.value_var.get()
+            if not full:
+                return
+            tw = tk.Toplevel(self.label)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{self.label.winfo_rootx()+18}+{self.label.winfo_rooty()+self.label.winfo_height()+4}")
+            ttk.Label(tw, text=full, background="#ffffe0", relief='solid', borderwidth=1,
+                      font=("微软雅黑", 9), wraplength=400).pack(ipadx=4, ipady=2)
+            tip["win"] = tw
+
+        def hide(_e):
+            if tip["win"]:
+                tip["win"].destroy()
+                tip["win"] = None
+
+        self.label.bind("<Enter>", show)
+        self.label.bind("<Leave>", hide)
+
     def on_entry_click(self, event):
         """输入框点击事件 - 阻止事件传播到单元格"""
         return "break"
@@ -2008,7 +2033,8 @@ class SequenceMaster:
     def __init__(self, root):
         self.root = root
         self.root.title("序列编辑器")
-        self.root.geometry("1600x850")
+        w, h = paths.scaled_size(self.root, 1600, 850)
+        self.root.geometry(f"{w}x{h}")
 
         # 存储序列数据
         self.sequence_data = []
@@ -3163,6 +3189,10 @@ class SequenceMaster:
         items: [(编号, 名称), ...]"""
         win = ttkb.Toplevel(self.root)  # 主题 Toplevel，与主界面风格一致
         win.title(f"选择设备 - 第 {row_index + 1} 行")
+        try:
+            win.iconbitmap(paths.resource("device.ico"))
+        except Exception:
+            pass
         win.transient(self.root)
         win.grab_set()
         _font = ("Microsoft YaHei", 10)
@@ -3209,8 +3239,9 @@ class SequenceMaster:
                             variable=v, style=cb_style).pack(fill="x", padx=8, pady=5)
             cvars.append((code, v))
         win.update_idletasks()
-        win.geometry(f"600x{min(980, 160 + len(items) * 54)}")
-        win.minsize(500, 360)
+        w, h = paths.scaled_size(win, 600, min(980, 160 + len(items) * 54))
+        win.geometry(f"{w}x{h}")
+        win.minsize(*paths.scaled_size(win, 500, 360))
         win.update_idletasks()  # 确保 winfo 反映实际尺寸后再算居中
         rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
         x = rx + (self.root.winfo_width() - win.winfo_width()) // 2
@@ -3533,11 +3564,17 @@ class SequenceMaster:
         mre = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mre)
         top = ttkb.Toplevel(self.root)
+        top.withdraw()  # 构建期间隐藏，配置完再显示，避免可见的从小变大
         top.title("录入方法编辑器")
+        try:
+            top.iconbitmap(paths.resource("method.ico"))
+        except Exception:
+            pass
         top.transient(self.root)  # 置于序列编辑器之上(owned)：加载方法时序列窗口不再抢占到最前端
         app = mre.QueryAppFixed(top)
         if file_path:
             app.load_config_file(file_path)
+        top.deiconify()
         self._method_editor_top = top
         top.protocol("WM_DELETE_WINDOW", lambda: self._on_method_editor_closed(top, file_path))
 
@@ -4359,9 +4396,14 @@ class SequenceMaster:
         _pdfs_by_sc = {}
         for _it in batch_items:
             _pdfs_by_sc.setdefault(_it["sample_code"], []).extend(_it.get("pdf_paths") or [])
-        for _sc in dict.fromkeys(it["sample_code"] for it in batch_items
-                                 if not _is_sum_project((it["project"] or {}).get("projectName", ""))):
-            # 总和项目不随称样平行扩展：报告值只报一个，扩成多条平行会多录(如 AB 报告 4项/15项之和)
+        # 总和项目(方法编辑器"是否总和"复选框=query rule sum_entry)不随称样平行扩展：
+        # 报告值只报一个，扩成多条平行会多录(如 AB 报告 4项/15项之和)。
+        # 不按项目名含"总和"判断：名带"总和"但未勾选的项目(跑道PAE)是普通项目，A/B 照常扩展。
+        _qr_ls = self._read_query_rules(ctx.get("method_file") or "")
+        def _is_sum_item(it):
+            _i = it.get("_qr_idx")
+            return isinstance(_i, int) and 0 <= _i < len(_qr_ls) and bool(_qr_ls[_i].get("sum_entry"))
+        for _sc in dict.fromkeys(it["sample_code"] for it in batch_items if not _is_sum_item(it)):
             _mm = ((ctx["wmap"] or {}).get(_sc) or {}).get("masses") or []
             _n = len(_mm)
             if _n <= 1 and _known_suf:  # 称量记录未编码平行数 → 由文件名 A/B 推断
@@ -6007,7 +6049,12 @@ class SequenceMaster:
             self._confirm_win.destroy()
         win = tk.Toplevel(self.root)
         win.title(f"确认提交 - 第 {prompt['idx'] + 1} 行")
-        win.geometry("640x560")
+        try:
+            win.iconbitmap(paths.resource("device.ico"))
+        except Exception:
+            pass
+        w, h = paths.scaled_size(win, 640, 560)
+        win.geometry(f"{w}x{h}")
         win.transient(self.root)
 
         info = tk.Frame(win, padx=10, pady=8)
@@ -6098,7 +6145,12 @@ class SequenceMaster:
 
         win = ttkb.Toplevel(self.root)
         win.title("登录 LIMS")
-        win.geometry("400x360")
+        try:
+            win.iconbitmap(paths.resource("login.ico"))
+        except Exception:
+            pass
+        w, h = paths.scaled_size(win, 400, 360)
+        win.geometry(f"{w}x{h}")
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
@@ -6472,8 +6524,8 @@ def _selfcheck():
     _wp_r = {"min_value": 1.9, "max_value": 2.2, "decimal_places": 4}
     assert _random_masses(["0.2751"], 1, None, _wp_r, 4) == ["0.2751"]            # 单值不被随机覆盖
     assert _random_masses(["0.5000", "0.6000"], 2, None, _wp_r, 4) == ["0.5000", "0.6000"]  # 2平行2值
-    _r2 = _random_masses(["0.2751"], 2, None, _wp_r, 4)                          # 需2平行仅录1值→随机补
-    assert len(_r2) == 2 and all(1.9 <= float(v) <= 2.2 for v in _r2)
+    _r2 = _random_masses(["0.2751"], 2, None, _wp_r, 4)                          # 需2平行仅录1值→槽0沿用、槽1随机补
+    assert len(_r2) == 2 and _r2[0] == "0.2751" and 1.9 <= float(_r2[1]) <= 2.2  # 回归754: A已回写不重随机
     _r3 = _random_masses([], 1, None, _wp_r, 4)                                  # 无记录→随机
     assert len(_r3) == 1 and 1.9 <= float(_r3[0]) <= 2.2
     _pr_x4 = {"type": "换算处理", "factor": 4, "decimal_places": 4}              # prule 换算路径
@@ -6515,8 +6567,15 @@ def _selfcheck():
 
 
 def main():
+    paths.set_dpi_awareness()
     root = ttkb.Window(themename="sandstone-light")
+    root.withdraw()  # 构建期间隐藏，配置完再显示，避免可见的从小变大
+    try:
+        root.iconbitmap(paths.resource("app.ico"))
+    except Exception:
+        pass
     app = SequenceMaster(root)
+    root.deiconify()
     root.mainloop()
 
 

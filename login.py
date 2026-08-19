@@ -682,8 +682,7 @@ class CompactLoginApp:
         self.set_window_icon()
 
         # 设置窗口大小
-        window_width = 360
-        window_height = 240
+        window_width, window_height = paths.scaled_size(root, 360, 240)
 
         # 获取屏幕尺寸
         screen_width = root.winfo_screenwidth()
@@ -795,37 +794,35 @@ class CompactLoginApp:
                 self.status_label.configure(text="未登录", foreground="red")
 
     def find_icon_file(self, icon_file):
-        """查找图标文件"""
-        # 首先在当前目录查找
-        if os.path.exists(icon_file):
-            return icon_file
+        """查找图标文件（各基准目录下先找原名，再找 icons/ 子目录）"""
+        candidates = [icon_file, os.path.join("icons", icon_file)]
 
-        # 在打包环境中，尝试在 _internal 目录查找
+        def find(base):
+            for c in candidates:
+                p = os.path.join(base, c) if base else c
+                if os.path.exists(p):
+                    return p
+            return None
+
+        # 当前目录
+        p = find("")
+        if p:
+            return p
+
+        # 打包环境：exe 同级目录、_internal 目录
         if getattr(sys, 'frozen', False):
-            # 尝试在 exe 同级目录查找
-            exe_dir = os.path.dirname(sys.executable)
-            icon_path = os.path.join(exe_dir, icon_file)
-            if os.path.exists(icon_path):
-                return icon_path
+            for base in (os.path.dirname(sys.executable),
+                         os.path.join(os.path.dirname(sys.executable), '_internal')):
+                p = find(base)
+                if p:
+                    return p
 
-            # 尝试在 _internal 目录查找
-            internal_dir = os.path.join(exe_dir, '_internal')
-            if os.path.exists(internal_dir):
-                icon_path = os.path.join(internal_dir, icon_file)
-                if os.path.exists(icon_path):
-                    return icon_path
-
-        # 尝试在脚本所在目录查找
+        # 脚本所在目录及其父目录
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, icon_file)
-        if os.path.exists(icon_path):
-            return icon_path
-
-        # 尝试在父目录查找
-        parent_dir = os.path.dirname(script_dir)
-        icon_path = os.path.join(parent_dir, icon_file)
-        if os.path.exists(icon_path):
-            return icon_path
+        for base in (script_dir, os.path.dirname(script_dir)):
+            p = find(base)
+            if p:
+                return p
 
         return None
 
@@ -1236,13 +1233,14 @@ class CompactLoginApp:
         """显示新用户配置对话框"""
         dialog = ttkb.Toplevel(self.root)
         dialog.title("新用户配置")
-        dialog.geometry("500x270")
+        w, h = paths.scaled_size(dialog, 500, 270)
+        dialog.geometry(f"{w}x{h}")
         dialog.resizable(False, False)
         dialog.transient(self.root)
 
         # 设置对话框图标
         try:
-            icon_path = self.find_icon_file("login.ico")
+            icon_path = self.find_icon_file("user-add.ico")
             if icon_path:
                 dialog.iconbitmap(icon_path)
         except:
@@ -1327,12 +1325,13 @@ class CompactLoginApp:
             """显示已有用户信息"""
             users_window = ttkb.Toplevel(dialog)
             users_window.title("已有用户信息")
-            users_window.geometry("460x500")
+            w, h = paths.scaled_size(users_window, 620, 500)
+            users_window.geometry(f"{w}x{h}")
             users_window.transient(dialog)
 
             # 设置用户信息窗口图标
             try:
-                icon_path = self.find_icon_file("login.ico")
+                icon_path = self.find_icon_file("users.ico")
                 if icon_path:
                     users_window.iconbitmap(icon_path)
             except:
@@ -1460,8 +1459,11 @@ def run_login():
 
 def main():
     """主函数"""
+    paths.set_dpi_awareness()
     root = ttkb.Window(themename="sandstone-light")
+    root.withdraw()  # 构建期间隐藏，配置完再显示，避免可见的从小变大
     app = CompactLoginApp(root)
+    root.deiconify()
     root.mainloop()
 
 

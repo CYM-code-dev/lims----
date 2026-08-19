@@ -4,6 +4,7 @@ import sys
 
 import update_check
 from version import APP_VERSION
+import paths
 
 
 def _gate():
@@ -21,6 +22,7 @@ def _gate():
 
 
 def main():
+    paths.set_dpi_awareness()
     if "--selfcheck" in sys.argv:
         import SequenceMaster
         SequenceMaster._selfcheck()

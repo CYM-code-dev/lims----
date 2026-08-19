@@ -1,6 +1,7 @@
 # app.spec — onedir，入口 entry.py → app.exe
-# datas：login.ico 与 MethodRule Editor.py 落在 _internal 根，
-# 分别供 login._get_resource_path 与 SequenceMaster 的 __file__ 同级查找命中；
+# datas：icons/ 整目录 → _internal/icons（各处 iconbitmap 经 paths.resource /
+# login.find_icon_file 的 icons/ 兜底命中）；MethodRule Editor.py 落 _internal 根，
+# 供 SequenceMaster 的 __file__ 同级查找命中；
 # ttkbootstrap 的主题字体/图标等非 .py 资源需显式收集（缺则启动即 FileNotFoundError）。
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -8,7 +9,7 @@ a = Analysis(
     ["entry.py"],
     pathex=[],
     binaries=[],
-    datas=[("login.ico", "."), ("MethodRule Editor.py", ".")]
+    datas=[("icons", "icons"), ("MethodRule Editor.py", ".")]
           + collect_data_files("ttkbootstrap"),
     hiddenimports=[],
     hookspath=[],
@@ -30,7 +31,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon="login.ico",
+    icon="icons/app.ico",
 )
 coll = COLLECT(
     exe,

@@ -14,6 +14,56 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def set_dpi_awareness():
+    """进程级 DPI 声明（任何 Tk 创建前调用一次，之后各机渲染行为一致）。
+    重复调用/已声明/旧系统 → 静默。"""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)  # Per-Monitor V2
+        except Exception:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # System Aware
+    except Exception:
+        pass
+
+
+def dpi_factor():
+    """当前 DPI / 96（进程已声明感知后即真实值；失败回退 1.0）。"""
+    try:
+        import ctypes
+        return ctypes.windll.user32.GetDpiForSystem() / 96.0
+    except Exception:
+        return 1.0
+
+
+# 高 DPI/大屏机器上窗口放大倍数的折扣（1.0=完全等比；调小=高 DPI 机器窗口更紧凑）
+_COMFORT = 0.75
+
+
+def scaled_size(widget, w, h):
+    """窗口尺寸缩放：普通屏（≤1920×1080、100% 缩放）→ 原样不变；
+    高 DPI/高分屏 → 按 min(DPI, 屏幕相对 1920×1080 比例)×折扣 放大，但不低于 1.0
+    （基准尺寸按内容设计，再小会裁切），最终仍夹在屏内。
+    """
+    f = min(dpi_factor(),
+            widget.winfo_screenwidth() / 1920.0,
+            widget.winfo_screenheight() / 1080.0)
+    f = max(1.0, f * _COMFORT)
+    w, h = min(w, 1880), min(h, 1010)
+    return min(int(w * f), widget.winfo_screenwidth() - 40), \
+           min(int(h * f), widget.winfo_screenheight() - 100)
+
+
+def resource(name):
+    """随包资源文件绝对路径（frozen → _internal；dev → 脚本根目录；
+    图标已整合到 icons/ 子目录，自动兜底查找）。"""
+    base = getattr(sys, "_MEIPASS", None) or app_dir()
+    for p in (os.path.join(base, name), os.path.join(base, "icons", name)):
+        if os.path.exists(p):
+            return p
+    return os.path.join(base, name)
+
+
 def data_dir():
     """用户数据目录（更新时绝不覆盖）。
 
