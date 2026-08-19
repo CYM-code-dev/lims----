@@ -2654,7 +2654,7 @@ class QueryAppFixed:
                 return
 
             # 如果没有上次打开的配置文件，尝试加载默认配置文件
-            default_config = "switch_rules.mtd"
+            default_config = os.path.join(paths.app_dir(), "switch_rules.mtd")
             if os.path.exists(default_config):
                 self.current_config_file = default_config
                 self.config_file_name = os.path.basename(default_config)
@@ -2816,7 +2816,7 @@ class QueryAppFixed:
 
         if not self.current_config_file:
             # 如果没有当前配置文件，使用默认名称
-            self.current_config_file = "switch_rules.mtd"
+            self.current_config_file = os.path.join(paths.app_dir(), "switch_rules.mtd")
             self.config_file_name = "switch_rules.mtd"
 
         # 获取各标签页的规则

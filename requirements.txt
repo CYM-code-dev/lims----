@@ -1,0 +1,6 @@
+ttkbootstrap
+requests
+PyYAML
+openpyxl
+Pillow
+pyinstaller

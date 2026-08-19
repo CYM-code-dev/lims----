@@ -6514,10 +6514,14 @@ def _selfcheck():
     print("selfcheck OK")
 
 
+def main():
+    root = ttkb.Window(themename="sandstone-light")
+    app = SequenceMaster(root)
+    root.mainloop()
+
+
 if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         _selfcheck()
         sys.exit(0)
-    root = ttkb.Window(themename="sandstone-light")
-    app = SequenceMaster(root)
-    root.mainloop()
+    main()

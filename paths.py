@@ -5,6 +5,15 @@ import sys
 _DATA_FILES = ["users_config.json", "session_info.json", "last_config.txt", "原始记录登记.xlsx"]
 
 
+def app_dir():
+    """程序内容目录（随版本更新整体替换）：methods/、switch_rules.mtd 所在处。
+    frozen（onedir）→ app.exe 所在的 app/；dev → 脚本根目录。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def data_dir():
     """用户数据目录（更新时绝不覆盖）。
 
@@ -16,9 +25,9 @@ def data_dir():
     if env:
         d = env
     elif getattr(sys, "frozen", False):
-        # launcher+app 布局：app.exe 在 app/ 内，数据放上一级安装根，
-        # 否则更新覆盖 app/ 时会连带丢数据。
-        d = os.path.dirname(os.path.dirname(sys.executable))
+        # launcher+app 布局：app.exe 在 <安装根>\app\ 内，数据放安装根的 data\，
+        # 否则更新覆盖 app\ 时会连带丢数据。
+        d = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "data")
     else:
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     os.makedirs(d, exist_ok=True)
