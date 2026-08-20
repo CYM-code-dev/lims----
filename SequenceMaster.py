@@ -1703,7 +1703,7 @@ class SelectableRow:
     def __init__(self, parent, index, data, column_widths, selection_manager,
                  on_path_select, on_method_select, on_spectrum_select, on_cell_select,
                  on_drag_start, on_drag_update, on_drag_end, on_data_update,
-                 on_equipment_select=None):
+                 on_equipment_select=None, on_action=None):
         self.parent = parent
         self.index = index
         self.data = data
@@ -1713,6 +1713,7 @@ class SelectableRow:
         self.on_method_select = on_method_select
         self.on_spectrum_select = on_spectrum_select
         self.on_equipment_select = on_equipment_select
+        self.on_action = on_action
         self.on_cell_select = on_cell_select
         self.on_drag_start = on_drag_start
         self.on_drag_update = on_drag_update
@@ -1869,6 +1870,43 @@ class SelectableRow:
         self.status_label.bind('<Enter>', _show_status_tip)
         self.status_label.bind('<Leave>', _hide_status_tip)
 
+        # 操作列 - 签名/取消/清空
+        self.action_cell = tk.Frame(self.row_frame, width=self.column_widths[9], bg="white")
+        self.action_cell.pack(side='left', fill='y')
+        self.action_cell.pack_propagate(False)
+        tk.Frame(self.action_cell, width=1, bg="#c0c0c0").pack(side='right', fill='y')
+        tk.Frame(self.action_cell, height=1, bg="#c0c0c0").pack(side='bottom', fill='x')
+        _bcfg = dict(font=("Segoe UI", 8), relief='flat', padx=4, pady=1, cursor="arrow")
+        self.btn_sign = tk.Label(self.action_cell, text="签名", bg="#f5f5f5", fg="#cccccc", **_bcfg)
+        self.btn_cancel = tk.Label(self.action_cell, text="取消", bg="#f5f5f5", fg="#cccccc", **_bcfg)
+        self.btn_clear = tk.Label(self.action_cell, text="清空", bg="#f5f5f5", fg="#cccccc", **_bcfg)
+        for b in (self.btn_sign, self.btn_cancel, self.btn_clear):
+            b.pack(side='left', expand=True, fill='both', padx=1)
+        self.btn_sign.bind('<Button-1>', lambda e: self._do_action("sign"))
+        self.btn_cancel.bind('<Button-1>', lambda e: self._do_action("cancel"))
+        self.btn_clear.bind('<Button-1>', lambda e: self._do_action("clear"))
+        self._update_action_buttons()
+
+    @staticmethod
+    def _set_btn(btn, enabled, bg, fg):
+        btn.configure(bg=bg if enabled else "#f5f5f5",
+                      fg=fg if enabled else "#cccccc",
+                      cursor="hand2" if enabled else "arrow")
+
+    def _update_action_buttons(self):
+        st = self.data.get("status", "待运行")
+        has_meta = bool(self.data.get("_sign_meta"))
+        _s = has_meta and st in ("成功", "暂存成功", "签名失败")
+        _c = has_meta and st in ("完成",)
+        _d = has_meta and st in ("成功", "暂存成功", "签名失败", "完成")
+        self._set_btn(self.btn_sign, _s, "#dbeafe", "#1d4ed8")
+        self._set_btn(self.btn_cancel, _c, "#fef3c7", "#92400e")
+        self._set_btn(self.btn_clear, _d, "#fee2e2", "#991b1b")
+
+    def _do_action(self, action):
+        if self.on_action and not self.destroyed:
+            self.on_action(self.index, action)
+
     # 状态显示样式（阶段1）
     STATUS_STYLE = {
         "待运行": ("white", "#888888"),
@@ -1896,6 +1934,7 @@ class SelectableRow:
             text = f"失败:{short}"
         if self.status_label.winfo_exists():
             self.status_label.configure(text=text, bg=bg, fg=fg)
+        self._update_action_buttons()
 
     def on_weighing_button_click(self):
         """称样记录路径按钮：打开文件选择器(双击单元格可手动编辑/清空)"""
@@ -1986,6 +2025,8 @@ class SelectableRow:
             cell.cell_frame.configure(width=widths[i])
         if self.status_cell.winfo_exists():
             self.status_cell.configure(width=widths[8])
+        if hasattr(self, 'action_cell') and self.action_cell.winfo_exists():
+            self.action_cell.configure(width=widths[9])
 
     def destroy(self):
         """销毁行"""
@@ -2051,7 +2092,7 @@ class SequenceMaster:
         self.shift_pressed = False
 
         # 列宽配置
-        self.column_widths = [50, 260, 220, 140, 180, 260, 90, 90, 140]
+        self.column_widths = [50, 260, 220, 140, 180, 260, 90, 90, 140, 160]
 
         # 存储分隔线引用
         self.draggable_headers = []
@@ -2293,7 +2334,8 @@ class SequenceMaster:
             {"text": "谱图文件路径", "anchor": "w"},
             {"text": "T", "anchor": "w"},
             {"text": "RH", "anchor": "w"},
-            {"text": "运行状态", "anchor": "center"}
+            {"text": "运行状态", "anchor": "center"},
+            {"text": "操作", "anchor": "center"}
         ]
 
         self.header_cells = []
@@ -2439,7 +2481,8 @@ class SequenceMaster:
             self.handle_drag_update,
             self.handle_drag_end,
             self.on_data_update,
-            self.select_equipment
+            self.select_equipment,
+            self._post_run_action
         )
         self.row_widgets.append(row_widget)
         self.status_var.set(f"已添加第 {row_id} 行")
@@ -2472,7 +2515,8 @@ class SequenceMaster:
                 self.handle_drag_update,
                 self.handle_drag_end,
                 self.on_data_update,
-                self.select_equipment
+                self.select_equipment,
+                self._post_run_action
             )
             self.row_widgets.append(row_widget)
 
@@ -3875,6 +3919,110 @@ class SequenceMaster:
                         "" if _ok else "签名失败(已暂存)，见日志可手动签名或重跑")))
         self._sign_results.sort(key=lambda s: s["idx"])
 
+    def _post_run_action(self, idx, action):
+        """操作列按钮分发（主线程），在后台线程执行具体操作。"""
+        if self._running:
+            return
+        row = self.sequence_data[idx]
+        meta_list = row.get("_sign_meta", [])
+        if not meta_list:
+            return
+        dispatch = {"sign": self._action_sign, "cancel": self._action_cancel, "clear": self._action_clear}
+        fn = dispatch.get(action)
+        if fn:
+            threading.Thread(target=fn, args=(idx, meta_list), daemon=True).start()
+
+    def _action_sign(self, idx, meta_list):
+        """操作列-签名：对已暂存批补调 submitOcExperiment。"""
+        log = lambda m: self._log(f"[行{idx + 1}] {m}")
+        self._ui_q.put(("status", (idx, "签名中", "")))
+        for i, batch in enumerate(meta_list):
+            if i > 0:
+                time.sleep(1.15)  # 服务端同秒撞号节流
+            sign_data = dict(batch["experiment_data"])
+            eid = batch.get("experiment_id")
+            rc = batch["real_code"]
+            if eid:
+                sign_data["id"] = eid
+            sign_data["experimentCode"] = rc
+            # 暂存时已带谱图的行，签名不再带（避免重复绑定）
+            if batch.get("had_spectrum_in_save"):
+                sign_data.pop("fileIds", None)
+                sign_data.pop("spectrumJsonList", None)
+            log(f"提交签名 实验编号 {rc} ...")
+            ok, resp_data = self.api.submit_experiment_data(
+                sign_data, batch["method_name"], log, require_signature=True)
+            if not ok:
+                self._ui_q.put(("status", (idx, "签名失败", resp_data or "签名失败")))
+                log(f"签名失败: {resp_data}")
+                return
+            # 签名后回读：确认编号 + 提取 resultCheckInId（供取消签名用）
+            fpid = batch.get("first_pid") or ""
+            checkin_ids = []
+            if fpid:
+                try:
+                    cfg = self.api.get_experiment_config(fpid, "", "", "", log)
+                    if isinstance(cfg, dict):
+                        final = self.api.extract_experiment_code(cfg, rc)
+                        if final and final != rc:
+                            log(f"签名后编号变更: {rc} → {final}")
+                        # 递归提取 resultCheckInId
+                        def _walk(v):
+                            if isinstance(v, dict):
+                                for k, val in v.items():
+                                    if k == "resultCheckInId" and val:
+                                        checkin_ids.append(str(val))
+                                    else:
+                                        _walk(val)
+                            elif isinstance(v, list):
+                                for item in v:
+                                    _walk(item)
+                        _walk(cfg)
+                except Exception:
+                    pass
+            if checkin_ids:
+                batch["checkin_ids"] = ",".join(checkin_ids)
+                log(f"获取 resultCheckInId: {batch['checkin_ids']}")
+            else:
+                log("警告: 未从回读中找到 resultCheckInId，取消签名可能不可用")
+        self._ui_q.put(("status", (idx, "完成", "")))
+        log("签名完成")
+
+    def _action_cancel(self, idx, meta_list):
+        """操作列-取消签名：cancelObjs 回退到暂存状态。"""
+        log = lambda m: self._log(f"[行{idx + 1}] {m}")
+        ok_all = True
+        for batch in meta_list:
+            checkin_ids = batch.get("checkin_ids")
+            if not checkin_ids:
+                log("取消签名跳过: 无 resultCheckInId（可能未通过操作列签名）")
+                ok_all = False
+                continue
+            log(f"取消签名 (resultCheckInIds={checkin_ids}) ...")
+            ok = self.api.cancel_signature(checkin_ids, log)
+            if not ok:
+                ok_all = False
+        if ok_all:
+            self._ui_q.put(("status", (idx, "暂存成功", "")))
+            log("已取消签名")
+        else:
+            log("取消签名部分失败，见上方日志")
+
+    def _action_clear(self, idx, meta_list):
+        """操作列-清空数据：cancleOcExperiment + deleteSpectrumByProjectIds。"""
+        log = lambda m: self._log(f"[行{idx + 1}] {m}")
+        for batch in meta_list:
+            pids = batch.get("project_ids", [])
+            if not pids:
+                continue
+            pid_str = ",".join(pids)
+            log(f"清空实验+谱图 (项目{pid_str}) ...")
+            self.api.clear_experiment_cache(pid_str, log)
+            self.api.delete_spectrum_by_project_ids(pid_str, log)
+        self.sequence_data[idx].pop("_sign_meta", None)
+        self._ui_q.put(("status", (idx, "待运行", "")))
+        log("已清空")
+
     def _run_one_row(self, idx, weighing_caches=None):
         """单行流水线（worker 线程内）。返回 'ok'/'skip'/'abort'/'fail'，失败自行 put status。
         谱图为目录+多PDF+未填样品编号时，按「称样记录excel ∩ 谱图目录」展开为多个样品；
@@ -4931,6 +5079,16 @@ class SequenceMaster:
                 "experiment_data": experiment_data, "method_name": actual_method_name,
                 "idx": idx, "real_code": real_code, "first_pid": first_pid,
             })
+        # 操作列签名元数据（无论是否 require_sign 都存，供运行后补签名/取消/清空）
+        self._ui_q.put(("rowdata_append", (idx, "_sign_meta", {
+            "experiment_data": dict(experiment_data),
+            "method_name": actual_method_name,
+            "real_code": real_code,
+            "experiment_id": experiment_id,
+            "first_pid": first_pid,
+            "project_ids": project_ids,
+            "had_spectrum_in_save": bool(spec_list and not _require_sign),
+        })))
         log(f"本批完成，实验编号 {real_code}")
         return True, real_code
 
@@ -5931,6 +6089,10 @@ class SequenceMaster:
                     idx, extras = payload
                     if idx < len(self.sequence_data):
                         self.sequence_data[idx].update(extras)
+                elif kind == "rowdata_append":
+                    idx, key, value = payload
+                    if idx < len(self.sequence_data):
+                        self.sequence_data[idx].setdefault(key, []).append(value)
                 elif kind == "prompt":
                     self._build_confirm_dialog(payload)
                 elif kind == "askyesno":

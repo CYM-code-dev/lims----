@@ -920,6 +920,60 @@ class DetectionAPI:
                 log_func(f"清空旧谱图异常: {str(e)}, 项目ID: {project_ids}")
             return False
 
+    def cancel_signature(self, result_checkin_ids, log_func=None):
+        """取消签名(提交审核)：POST resultCheckIn/cancelObj, _method=PUT。
+        result_checkin_ids: 逗号分隔的 resultCheckInId 字符串或列表（即 projectIds）。"""
+        try:
+            if isinstance(result_checkin_ids, list):
+                ids_str = ",".join(str(i) for i in result_checkin_ids if i)
+            else:
+                ids_str = str(result_checkin_ids or "").strip(",")
+            if not ids_str:
+                return False
+
+            request_data = {
+                "ids": ids_str,
+                "pid": self.get_user_pid(),
+                "pname": self.get_user_pname(),
+                "loginId": self.get_user_login_id(),
+                "_method": "PUT",
+            }
+
+            headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Referer': f'{self.login_system.base_url}/web/detectionResultCheckInCalc.html?ids=&decideProjectOrgIds=23&type=0&recordNumber=null&checkInStatus=CHECK_IN_STATUS_ALREADY&verifyStatus=&auditStatus=&resultCheckInIds={ids_str}&souce=checkIn&pid={self.get_user_pid()}&pname={self.get_user_pname()}&loginId={self.get_user_login_id()}',
+                'X-Requested-With': 'XMLHttpRequest',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36'
+            }
+
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/resultCheckIn/cancelObjs",
+                data=request_data,
+                headers=headers,
+                verify=False,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    if log_func:
+                        log_func(f"已取消签名(ids={ids_str})")
+                    return True
+                error_msg = result.get('errorCtx', {}).get('errorMsg', '未知错误')
+                if log_func:
+                    log_func(f"取消签名失败: {error_msg}, ids: {ids_str}")
+                return False
+            if log_func:
+                log_func(f"取消签名失败: HTTP {response.status_code}, ids: {ids_str}")
+            return False
+
+        except Exception as e:
+            if log_func:
+                log_func(f"取消签名异常: {str(e)}, ids: {result_checkin_ids}")
+            return False
+
     def get_units_config(self, log_func=None):
         """获取单位配置 - 使用正确的API地址"""
         try:
