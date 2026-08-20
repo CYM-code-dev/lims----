@@ -56,11 +56,14 @@ def build_publish(dist, rel, ver):
             for fn in files:
                 full = os.path.join(base, fn)
                 z.write(full, os.path.relpath(full, rel).replace(os.sep, "/"))
+    launcher_exe = os.path.join(dist, "launcher.exe")
     manifest = {
         "version": ver,
         "zip": os.path.basename(zpath),
         "sha256": sha256_of(zpath),
         "size": os.path.getsize(zpath),
+        "launcher": "launcher.exe",
+        "launcher_sha256": sha256_of(launcher_exe),
     }
     with open(os.path.join(pub, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)

@@ -600,9 +600,9 @@ def _plan_submission_batches(query_rules, items, max_items=_MAX_BATCH_ITEMS):
         if not rule_items:
             continue
         remaining = [it for it in remaining if id(it) not in {id(x) for x in rule_items}]
-        groups = {}  # switch_mid -> [items]（保序）
+        groups = {}  # effective_mid -> [items]（保序）
         for it in rule_items:
-            groups.setdefault(it.get("switch_mid", ""), []).append(it)
+            groups.setdefault(it.get("effective_mid", ""), []).append(it)
         for mid, g_items in groups.items():
             # 条件设备二次分组：不同设备需拆独立批（分批录入）
             by_eq = {}  # equipment -> [items]（保序）
@@ -641,6 +641,7 @@ def _plan_submission_batches(query_rules, items, max_items=_MAX_BATCH_ITEMS):
                             for ch in chunks:
                                 plan.append({
                                     "switch_mid": mid,
+                                    "effective_mid": mid,
                                     "_equipment": eq_key,
                                     "_lab_proc": lp_key,
                                     "wdate": d,
@@ -672,28 +673,30 @@ def _split_device_codes(field):
     return [c.strip() for c in _EQUIP_SEP_RE.split(field or "") if c.strip()]
 
 
-def _match_switch_rule(switch_rules, project_name, pdf_paths, desc=""):
+def _match_switch_rule(switch_rules, project_name, pdf_paths, desc="", cur_method_id=""):
     """统一规则匹配（纯函数，可单测）。
-    规则各非空条件均需满足(AND): project_name 关键字包含于项目名(空=任意项目)、
-    filename 关键字出现在某谱图PDF文件名(空=任意文件)、desc 关键字(逗号OR/分号AND)
-    出现在样品"试样描述"(空=任意描述)。多规则命中取 project_name 关键字最长者
-    (防短关键字遮蔽：如「苯」会抢先命中「甲苯、二甲苯及乙苯总和」，须让长关键字赢)，
-    同长取首条；均不命中返回 ''。三项匹配均大小写不敏感。"""
+    规则各非空条件均需满足(AND): from_id(原ID/基方法)须等于项目当前方法ID(空=不限)、
+    project_name 逗号/分号分隔多关键字任一命中(空=任意项目；单个关键字精确相等，
+    含 * 用 fnmatch 通配)、filename 关键字出现在某谱图PDF文件名(空=任意文件)、
+    desc 关键字(逗号OR/分号AND)出现在样品"试样描述"(空=任意描述)。
+    多规则命中取首条，均不命中返回 ''。三项匹配均大小写不敏感。"""
     bases = [os.path.basename(p).lower() for p in (pdf_paths or []) if p]
     pn = (project_name or "").strip()
-    best = None  # (关键字长度, 规则)
+    cur = str(cur_method_id or "").strip()
     for r in switch_rules or []:
-        rp = str(r.get("project_name") or "").strip()
-        if rp and rp.lower() not in pn.lower():
+        rf = str(r.get("from_id") or "").strip()
+        if rf and rf != cur:
+            continue
+        kws = [k for k in re.split(r"[，,；;]", str(r.get("project_name") or "")) if k.strip()]
+        if kws and not any(_project_match(pn, k.strip()) for k in kws):
             continue
         fk = str(r.get("filename") or "").strip().lower()
         if fk and not any(fk in b for b in bases):
             continue
         if not _kw_match(r.get("desc"), desc):
             continue
-        if best is None or len(rp) > best[0]:
-            best = (len(rp), r)
-    return str(best[1].get("to_id") or "").strip() if best else ""
+        return str(r.get("to_id") or "").strip()
+    return ""
 
 
 def _match_conditional_rule(rules, project_name, pdf_paths, desc="", method_name=""):
@@ -3006,7 +3009,10 @@ class SequenceMaster:
                     _wm = _merge_parallel_groups(_wm, (_wp or {}).get("non_parallel_suffixes"))
                     desc = ((_wm.get(sample_codes[0]) or {}).get("desc") or "")
             for p in projects:
-                mid = _match_switch_rule(switch_rules, p.get("projectName", ""), [], desc)
+                mid = _match_switch_rule(switch_rules, p.get("projectName", ""), [], desc,
+                                         str(p.get("decideProjectMethodId") or ""))
+                # 未命中(含 from_id 不符)时设备按项目当前方法查——提交也将用该方法
+                mid = mid or str(p.get("decideProjectMethodId") or "")
                 if mid and mid not in method_ids:
                     method_ids.append(mid)
             if not method_ids:
@@ -4141,13 +4147,15 @@ class SequenceMaster:
             wrec = (ctx.get("wmap") or {}).get(it["sample_code"]) or {}
             desc = wrec.get("desc") or ""
             it["wdate"] = _date_str(wrec.get("time"))   # 称样日期分组键；无时间→""(并入合并组)
-            mid = _match_switch_rule(switch_rules, pname, it.get("pdf_paths") or [], desc)
+            mid = _match_switch_rule(switch_rules, pname, it.get("pdf_paths") or [], desc,
+                                     str(it["project"].get("decideProjectMethodId") or ""))
             if switch_rules:
                 if mid:
                     log(f"[{it['sample_code']}] 命中切换规则 → 方法ID {mid}（项目:{pname}）")
                 else:
                     log(f"[{it['sample_code']}] 未命中切换规则（项目:{pname}），用默认方法")
             it["switch_mid"] = mid or fallback_mid
+            it["effective_mid"] = mid or str(it["project"].get("decideProjectMethodId") or "") or fallback_mid
             # 条件设备匹配：按 equipment_rules 为每个样品匹配设备（用于拆批）
             if equipment_rules:
                 eq_dev = _match_equipment_rule(equipment_rules, pname, it.get("pdf_paths") or [], desc)
@@ -4208,8 +4216,10 @@ class SequenceMaster:
             if b["switch_mid"]:
                 log(f"切换到方法ID {b['switch_mid']} {eq_info}{lp_info}（{len(sb)} 个样品: {', '.join(sb)}）{dw}")
             else:
-                log(f"未匹配切换规则（{len(sb)} 个样品）{dw} {eq_info}{lp_info}，用默认方法")
-            ok, code = self._submit_batch(idx, row, b["items"], ctx, log, b["force_new"], b["switch_mid"], b.get("_lab_proc") or "")
+                _emid = b.get("effective_mid", "")
+                _mid_info = f"〔方法ID:{_emid}〕" if _emid else ""
+                log(f"未匹配切换规则（{len(sb)} 个样品）{_mid_info}{dw} {eq_info}{lp_info}，用默认方法")
+            ok, code = self._submit_batch(idx, row, b["items"], ctx, log, b["force_new"], b["switch_mid"], b.get("_lab_proc") or "", b.get("effective_mid") or "")
             if not ok:
                 # 部分成功：本行多批，前面批已提交(有实验编号)，本批失败。记已成功编号 + 未成功批信息，
                 # 供运行报告给出"哪些成功、哪批没成功、为何失败"，避免重跑重复录入已成功批。
@@ -4323,7 +4333,7 @@ class SequenceMaster:
                   "sample_id": sample_id, "pdf_paths": pdf_paths} for p in projects]
         return items, None
 
-    def _submit_batch(self, idx, row, batch_items, ctx, log, force_new, switch_mid="", lab_proc=""):
+    def _submit_batch(self, idx, row, batch_items, ctx, log, force_new, switch_mid="", lab_proc="", effective_mid=""):
         """提交一批 projects（worker 线程内，跨样品合并）。返回 (ok, real_code)，失败自行 put status。
         batch_items: [{project, sample_code, sample_id, spectrum_uploaded}, ...]，含多个样品的
         同方法项目；同一目标方法(to_id)的不同样品项目合并到一个实验编号。
@@ -4358,6 +4368,9 @@ class SequenceMaster:
                     _rm = str(_qr[_qi].get("method") or "").strip()
                     if _rm and not _rm.isdigit():
                         sub_method_id = self.api.get_method_id_by_standard_no_name(_rm, log) or ""
+            # 已切换项目(effective_mid 非空且 ≠ from_id)规则解析可能为空/错，用项目实际方法兜底
+            if not sub_method_id and effective_mid:
+                sub_method_id = effective_mid
             log("取实验配置 ...")
             log(f"取实验配置: sp_ids={sp_ids_str} method={method_name!r} sample_id={sample_id!r}"
                 + (f" subMethodId={sub_method_id}" if sub_method_id else ""))
@@ -6348,28 +6361,36 @@ def _selfcheck():
     assert _pdf_parallel_count("TN26070729001",
         ["TN26070729001.pdf", "TN26070729001T.pdf", "TN26070729001TS.pdf"], _suf) == 1
 
-    # _match_switch_rule：统一规则 project_name + filename + desc 匹配(desc 默认空=不限)
-    # project_name 为包含匹配(纯关键字，无通配符)
-    fr = [{"to_id": "4481", "filename": "K", "project_name": "DEHP"},
-          {"to_id": "4482", "filename": "K", "project_name": "DNOP"}]
+    # _match_switch_rule：统一规则 from_id + project_name + filename + desc 匹配
+    # project_name 逗号/分号多关键字 OR；单个关键字精确相等，含 * 用 fnmatch 通配
+    fr = [{"to_id": "4481", "filename": "K", "project_name": "*DEHP*"},
+          {"to_id": "4482", "filename": "K", "project_name": "*DNOP*"}]
     # 命中：DNOP + 文件名含 K -> 4482（大小写不敏感）
     assert _match_switch_rule(fr, "DNOP", ["D:/sp/K-001.pdf"]) == "4482"
     # 不命中：DBP 无名称规则 -> ''
     assert _match_switch_rule(fr, "DBP", ["D:/sp/K-001.pdf"]) == ""
     # 不命中：DNOP 但文件名不含 K -> ''
     assert _match_switch_rule(fr, "DNOP", ["D:/sp/001.pdf"]) == ""
-    # project_name 关键字包含于 LIMS 长项目名 -> 路由到各自 to_id
+    # project_name 通配符包含于 LIMS 长项目名 -> 路由到各自 to_id
     assert _match_switch_rule(fr, "3种邻苯二甲酸酯类化合物（DBP、BBP、DEHP）总和", ["K-001.pdf"]) == "4481"
     assert _match_switch_rule(fr, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["K-001.pdf"]) == "4482"
-    # 关键字包含即可命中（长项目名亦路由）
+    # 精确语义：裸关键字不命中长项目名（要通配须写 *关键字*）
     fr_exact = [{"to_id": "9901", "filename": "X", "project_name": "DNOP"}]
     assert _match_switch_rule(fr_exact, "DNOP", ["X-001.pdf"]) == "9901"
-    assert _match_switch_rule(fr_exact, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["X-001.pdf"]) == "9901"
-    # 短关键字不遮蔽长关键字：苯 vs 甲苯、二甲苯及乙苯总和，各自路由到自己的 to_id
-    fr_shadow = [{"to_id": "4678", "project_name": "苯"},
-                 {"to_id": "4679", "project_name": "甲苯、二甲苯及乙苯总和"}]
-    assert _match_switch_rule(fr_shadow, "苯", []) == "4678"
-    assert _match_switch_rule(fr_shadow, "甲苯、二甲苯及乙苯总和", []) == "4679"
+    assert _match_switch_rule(fr_exact, "3种邻苯二甲酸酯类化合物（DNOP、DINP、DIDP）总和", ["X-001.pdf"]) == ""
+    # 逗号/分号多关键字 OR：各自完整项目名命中，stray 末尾分号容忍
+    fr_list = [{"to_id": "5130", "project_name": "镉（Cd），汞（Hg），铅（Pb）；"}]
+    assert _match_switch_rule(fr_list, "铅（Pb）", []) == "5130"
+    assert _match_switch_rule(fr_list, "镉（Cd）", []) == "5130"
+    assert _match_switch_rule(fr_list, "四项之和", []) == ""
+    # from_id(原ID)门：非空时须等于项目当前方法ID才命中；空=不限
+    fr_from = [{"to_id": "5183", "project_name": "六价铬（CrVI）", "from_id": "1303"}]
+    assert _match_switch_rule(fr_from, "六价铬（CrVI）", [], "", "1303") == "5183"
+    assert _match_switch_rule(fr_from, "六价铬（CrVI）", [], "", "5119") == ""   # 当前挂 IEC 7-2 不切
+    assert _match_switch_rule(fr_from, "六价铬（CrVI）", [], "", "") == ""        # 拿不到当前方法不切(安全)
+    assert _match_switch_rule(fr_from, "六价铬（CrVI）", [], "", 1303) == "5183"  # int 型容忍
+    fr_nofrom = [{"to_id": "7", "project_name": "苯"}]
+    assert _match_switch_rule(fr_nofrom, "苯", [], "", "123") == "7"              # 无 from_id=不限
 
     # 统一规则 + 试样描述(desc)：文件名与描述均非空时需同时命中(AND)；任一为空=不限
     mr = [{"to_id": "5501", "filename": "K", "desc": "苯,甲苯"}]

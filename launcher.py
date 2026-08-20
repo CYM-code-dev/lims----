@@ -74,6 +74,21 @@ def _do_update(manifest, root, app_dir, app_exe):
         shutil.rmtree(backup, ignore_errors=True)
         os.rename(app_dir, backup)
         _apply_release(zip_path, root)
+        # 更新 launcher.exe 本体（onefile 运行的是临时副本，原文件无锁）
+        launcher_field = manifest.get("launcher")
+        launcher_sha = manifest.get("launcher_sha256")
+        if launcher_field and launcher_sha:
+            new_launcher = os.path.join(tempfile.gettempdir(), "lims_launcher_%s.exe" % manifest["version"])
+            if update_check.download_and_verify(launcher_field, launcher_sha, new_launcher):
+                try:
+                    shutil.copy2(new_launcher, target_exe)
+                except OSError:
+                    pass
+                try:
+                    os.remove(new_launcher)
+                except OSError:
+                    pass
+        _desktop_shortcut(root)
     except Exception as e:
         # 换新失败：清掉残缺 app\，从备份还原
         shutil.rmtree(app_dir, ignore_errors=True)

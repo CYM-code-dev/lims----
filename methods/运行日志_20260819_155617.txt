@@ -1,0 +1,113 @@
+[15:47:14] 已从方法同步标液+设备配置到 1 行
+[15:47:26] 已从方法同步标液+设备配置到 1 行
+[15:47:37] ==== 开始运行序列，全部 1 行（共 1 行）====
+[15:47:37] 预检: 1 个样品检查收样/制样状态 ...
+[15:47:41] 预检: 完成，1 个样品收样/制样状态正常
+[15:47:41] --- 第 1/1 行 ---
+[15:47:41] [行1] 谱图检查通过
+[15:47:41] [行1] 样品数 1 ≤ 阈值 200，按样品并行精确查询（跳过方法池，窗口40天）
+[15:47:41] [行1] 逐样品精确查询 1 个样品(去重后 1 个报验编号, 并行, 窗口40天) ...
+[15:47:45] [行1] 逐样品精确查询完成：1/1 命中，用时 4.0s
+[15:47:52] [行1] 按方法过滤出 5 个项目(共 10 条方法规则：/, CPSC-CH-E1002-08.3, EPA 3052:1996; EPA 6010D:2018, EPA 3060A:1996; EPA 7196A:1992, IEC 62321-3-1:2013+IEC 62321-4:2013+AMD1:2017 IEC62321XRF, IEC 62321-3-1:2013+IEC 62321-5:2013 IEC62321XRF, IEC 62321-3-1:2013+IEC 62321-6:2015, IEC 62321-3-1:2013+IEC 62321-7-2:2017 XRF, 参考碱消解，紫外分光光度法分析, 酸消解，ICP-OES分析，项目名过滤=['四项之和']，子方法ID=['1131', '1303', '1544', '1958', '4318', '4319', '5119', '7672', '830', '859'])；标准号集合: ['/', 'IEC 62321-3-1:2013+IEC 62321-4:2013+AMD1:2017', 'IEC 62321-3-1:2013+IEC 62321-5:2013', 'IEC 62321-3-1:2013+IEC 62321-7-2:2017']；项目名: ['铅（Pb）', '镉（Cd）', '汞（Hg）', '六价铬（CrVI）', '四项之和']
+[15:47:52] [行1] 清空旧实验暂存与谱图 ...
+[15:47:52] [行1] 按方法配置删除已绑定谱图 ...
+[15:47:52] [行1] 已清空旧谱图(ids=4110710,4110709,4110708,4110707,4110706)
+[15:47:52] [行1] uploadFile fileName=TS26082291001.pdf, size=204931, name=王君燕, resultCheckInIds=''
+[15:47:52] [行1] 谱图上传 1 个(去重): TS26082291001.pdf
+[15:47:52] [行1] [TS26082291001] 未命中切换规则（项目:铅（Pb）），用默认方法
+[15:47:52] [行1] [TS26082291001] 未命中切换规则（项目:镉（Cd）），用默认方法
+[15:47:52] [行1] [TS26082291001] 未命中切换规则（项目:汞（Hg）），用默认方法
+[15:47:52] [行1] [TS26082291001] 命中切换规则 → 方法ID 5183（项目:六价铬（CrVI））
+[15:47:52] [行1] [TS26082291001] 未命中切换规则（项目:四项之和），用默认方法
+[15:47:52] [行1] 未匹配切换规则（2 个样品） 〔默认设备〕，用默认方法
+[15:47:52] [行1] 取实验配置 ...
+[15:47:52] [行1] 取实验配置: sp_ids=4110710,4110709 method='IEC 62321-3-1:2013+IEC 62321-5:2013' sample_id=231758 subMethodId=4319
+[15:47:53] [行1] 取全量配置 ...
+[15:47:53] [行1] [设备] 方法返回 2 台: 能量色散X荧光光谱仪(检测设备/isDefault=None); 能量色散型X射线荧光分析仪(检测设备/isDefault=1)
+[15:47:53] [行1] 生成实验编号 ...
+[15:47:53] [行1] 温湿度: 温度=22℃ 湿度=56%RH
+[15:47:53] [行1] 称样量模式=无需称样量，跳过称样列
+[15:47:53] [行1] 试样描述(试样描述) 已按样品填充 0/2 条
+[15:47:53] [行1] 构建并提交 ...
+[15:47:53] [行] [固定参数] 项目='铅（Pb）' 命中触发条件，待填: ['计算值', '报告值', '试样描述']
+[15:47:53] [行] [固定参数] 找不到同名列(参数名↔列名不符)，未填: ['计算值', '报告值']
+[15:47:53] [行] [固定参数] 实际动态列名: ['试样描述']
+[15:47:53] [行] [固定参数] 项目='镉（Cd）' 命中触发条件，待填: ['计算值', '报告值', '试样描述']
+[15:47:53] [行] [固定参数] 找不到同名列(参数名↔列名不符)，未填: ['计算值', '报告值']
+[15:47:53] [行] [固定参数] 实际动态列名: ['试样描述']
+[15:47:53] [行] 结果值由固定参数写死，跳过 calcTheValue
+[15:47:53] [行1] [设备] 提交称样设备对象: 
+[15:47:53] [行1] 无称样时间(默认模式)，开始时间(startTime) <- max(上一工作日,批内最晚受理日): 2026-08-18 00:00:00 〔上一工作日(未取到受理时间)〕
+[15:47:53] [行1] 警告: 未取到受理时间字段，raw keys=['sampleRemarkContent', 'symbol', 'isOriginalNumber', 'seqNo', 'wordResultTemplateId', 'modifyDatetime', 'criteria', 'mixedOriginalNo', 'submissionIdentifying', 'referencedStandardId', 'decideProjectMethodId', 'detectionLimit', 'isLogout', 'limsId', 'taskChecklistNo', 'id', 'detectionUserName', 'experimentCode', 'samplingPosition', 'detectionId', 'recordNumber', 'microplateStatus', 'unitName', 'isLstd', 'acceptUserName', 'decideProjectId', 'sampleId', 'acceptTime', 'decideProjectOrgId', 'evaluateResult', 'wordResultAllowUpload', 'reportTemplateId', 'standardNo', 'mixedSmallNo', 'wordResultCheckInAllowUpload', 'detectionNo', 'analyzeStartDateBy', 'recordIdentifier', 'subMethodName', 'evaluate', 'returnProcess', 'wordResultCheckIn', 'wordResultCheckInTemplateId', 'originalNo', 'statusColor', 'oldSampleProjectId', 'creatorName', 'creatorId', 'idNumber', 'reportStatusColor', 'requireTime', 'sampleName', 'detectionRemark', 'subMethodId', 'warningVal', 'noticeName', 'detectionLimitValue', 'isProjectName', 'urgent', 'electronicsExperiment', 'smallNo', 'detectionLimitType', 'unitNameId', 'swatchRemark', 'decideProjectName', 'resultCheckIn', 'diseaseType', 'userId', 'decideProjectOrgName', 'createDatetime', 'wordResult', 'entrustCompanyName', 'repetitionNum', 'checkInStatus', 'analyzeEndDateBy', 'report', 'isSmallNo', 'detectionMethodId', 'decideProjectMethodName', 'modifierName']
+[15:47:53] [行1] 暂存实验数据 (saveOcExperiment) ...
+[15:47:53] [行1] [设备] 主检设备随实验载荷提交: ids=1509
+[15:47:53] [行1] 本批完成，实验编号 wjy20260819154746
+[15:47:53] [行1] 未匹配切换规则（1 个样品） 〔默认设备〕，用默认方法
+[15:47:53] [行1] 取实验配置 ...
+[15:47:53] [行1] 取实验配置: sp_ids=4110708 method='IEC 62321-3-1:2013+IEC 62321-4:2013+AMD1:2017' sample_id=231758 subMethodId=4318
+[15:47:53] [行1] 取全量配置 ...
+[15:47:54] [行1] [设备] 方法返回 2 台: 能量色散型X射线荧光分析仪(检测设备/isDefault=1); 能量色散X荧光光谱仪(检测设备/isDefault=None)
+[15:47:54] [行1] 生成实验编号 ...
+[15:47:54] [行1] 温湿度: 温度=22℃ 湿度=56%RH
+[15:47:54] [行1] 称样量模式=无需称样量，跳过称样列
+[15:47:54] [行1] 试样描述(试样描述) 已按样品填充 0/1 条
+[15:47:54] [行1] 复用首项目(组分)试样描述/称样量: 1/1 样品
+[15:47:54] [行1] 构建并提交 ...
+[15:47:54] [行] [固定参数] 项目='汞（Hg）' 命中触发条件，待填: ['计算值', '报告值', '试样描述']
+[15:47:54] [行] [固定参数] 找不到同名列(参数名↔列名不符)，未填: ['计算值', '报告值']
+[15:47:54] [行] [固定参数] 实际动态列名: ['试样描述']
+[15:47:54] [行] 结果值由固定参数写死，跳过 calcTheValue
+[15:47:54] [行1] [设备] 提交称样设备对象: 
+[15:47:54] [行1] 无称样时间(默认模式)，开始时间(startTime) <- max(上一工作日,批内最晚受理日): 2026-08-18 00:00:00 〔上一工作日(未取到受理时间)〕
+[15:47:54] [行1] 警告: 未取到受理时间字段，raw keys=['sampleRemarkContent', 'symbol', 'isOriginalNumber', 'seqNo', 'wordResultTemplateId', 'modifyDatetime', 'criteria', 'mixedOriginalNo', 'submissionIdentifying', 'referencedStandardId', 'decideProjectMethodId', 'detectionLimit', 'isLogout', 'limsId', 'taskChecklistNo', 'id', 'detectionUserName', 'experimentCode', 'samplingPosition', 'detectionId', 'recordNumber', 'microplateStatus', 'unitName', 'isLstd', 'acceptUserName', 'decideProjectId', 'sampleId', 'acceptTime', 'decideProjectOrgId', 'evaluateResult', 'wordResultAllowUpload', 'reportTemplateId', 'standardNo', 'mixedSmallNo', 'wordResultCheckInAllowUpload', 'detectionNo', 'analyzeStartDateBy', 'recordIdentifier', 'subMethodName', 'evaluate', 'returnProcess', 'wordResultCheckIn', 'wordResultCheckInTemplateId', 'originalNo', 'statusColor', 'oldSampleProjectId', 'creatorName', 'creatorId', 'idNumber', 'reportStatusColor', 'requireTime', 'sampleName', 'detectionRemark', 'subMethodId', 'warningVal', 'noticeName', 'detectionLimitValue', 'isProjectName', 'urgent', 'electronicsExperiment', 'smallNo', 'detectionLimitType', 'unitNameId', 'swatchRemark', 'decideProjectName', 'resultCheckIn', 'diseaseType', 'userId', 'decideProjectOrgName', 'createDatetime', 'wordResult', 'entrustCompanyName', 'repetitionNum', 'checkInStatus', 'analyzeEndDateBy', 'report', 'isSmallNo', 'detectionMethodId', 'decideProjectMethodName', 'modifierName']
+[15:47:54] [行1] 暂存实验数据 (saveOcExperiment) ...
+[15:47:55] [行1] [设备] 主检设备随实验载荷提交: ids=1509
+[15:47:55] [行1] 本批完成，实验编号 wjy20260819154747
+[15:47:55] [行1] 切换到方法ID 5183 〔默认设备〕（1 个样品: TS26082291001）
+[15:47:55] [行1] 切换检测方法 -> 方法ID 5183
+[15:47:55] [行1] 取全量配置 ...
+[15:47:55] [行1] [设备] 方法返回 2 台: 能量色散X荧光光谱仪(检测设备/isDefault=None); 能量色散型X射线荧光分析仪(检测设备/isDefault=1)
+[15:47:55] [行1] 生成实验编号 ...
+[15:47:55] [行1] 温湿度: 温度=22℃ 湿度=56%RH
+[15:47:55] [行1] 称样量模式=无需称样量，跳过称样列
+[15:47:55] [行1] 试样描述(试样描述) 已按样品填充 0/1 条
+[15:47:55] [行1] 复用首项目(组分)试样描述/称样量: 1/1 样品
+[15:47:55] [行1] 构建并提交 ...
+[15:47:55] [行] [固定参数] 项目='六价铬（CrVI）' 命中触发条件，待填: ['计算值', '报告值', '试样描述']
+[15:47:55] [行] [固定参数] 找不到同名列(参数名↔列名不符)，未填: ['计算值', '报告值']
+[15:47:55] [行] [固定参数] 实际动态列名: ['试样描述']
+[15:47:55] [行] 结果值由固定参数写死，跳过 calcTheValue
+[15:47:55] [行1] [设备] 提交称样设备对象: 
+[15:47:55] [行1] 无称样时间(默认模式)，开始时间(startTime) <- max(上一工作日,批内最晚受理日): 2026-08-18 00:00:00 〔上一工作日(未取到受理时间)〕
+[15:47:55] [行1] 警告: 未取到受理时间字段，raw keys=['sampleRemarkContent', 'symbol', 'isOriginalNumber', 'seqNo', 'wordResultTemplateId', 'modifyDatetime', 'criteria', 'mixedOriginalNo', 'submissionIdentifying', 'referencedStandardId', 'decideProjectMethodId', 'detectionLimit', 'isLogout', 'limsId', 'taskChecklistNo', 'id', 'detectionUserName', 'experimentCode', 'samplingPosition', 'detectionId', 'recordNumber', 'microplateStatus', 'unitName', 'isLstd', 'acceptUserName', 'decideProjectId', 'sampleId', 'acceptTime', 'decideProjectOrgId', 'evaluateResult', 'wordResultAllowUpload', 'reportTemplateId', 'standardNo', 'mixedSmallNo', 'wordResultCheckInAllowUpload', 'detectionNo', 'analyzeStartDateBy', 'recordIdentifier', 'subMethodName', 'evaluate', 'returnProcess', 'wordResultCheckIn', 'wordResultCheckInTemplateId', 'originalNo', 'statusColor', 'oldSampleProjectId', 'creatorName', 'creatorId', 'idNumber', 'reportStatusColor', 'requireTime', 'sampleName', 'detectionRemark', 'subMethodId', 'warningVal', 'noticeName', 'detectionLimitValue', 'isProjectName', 'urgent', 'electronicsExperiment', 'smallNo', 'detectionLimitType', 'unitNameId', 'swatchRemark', 'decideProjectName', 'resultCheckIn', 'diseaseType', 'userId', 'decideProjectOrgName', 'createDatetime', 'wordResult', 'entrustCompanyName', 'repetitionNum', 'checkInStatus', 'analyzeEndDateBy', 'report', 'isSmallNo', 'detectionMethodId', 'decideProjectMethodName', 'modifierName']
+[15:47:55] [行1] 暂存实验数据 (saveOcExperiment) ...
+[15:47:56] [行1] [设备] 主检设备随实验载荷提交: ids=1509
+[15:47:56] [行1] 本批完成，实验编号 wjy20260819154749
+[15:47:56] [行1] 未匹配切换规则（1 个样品） 〔默认设备〕，用默认方法
+[15:47:56] [行1] 取实验配置 ...
+[15:47:56] [行1] 取实验配置: sp_ids=4110706 method='/' sample_id=231758 subMethodId=1131
+[15:47:56] [行1] 取全量配置 ...
+[15:47:56] [行1] [设备] 方法返回 4 台: 能量色散型X射线荧光分析仪(检测设备/isDefault=1); 气相色谱质谱联用仪(检测设备/isDefault=None); 电子天平(称样设备/isDefault=None); 能量色散X荧光光谱仪(检测设备/isDefault=None)
+[15:47:56] [行1] 生成实验编号 ...
+[15:47:56] [行1] 温湿度: 温度=22℃ 湿度=56%RH
+[15:47:56] [行1] 称样量模式=无需称样量，跳过称样列
+[15:47:56] [行1] 试样描述(试样描述) 已按样品填充 0/1 条
+[15:47:56] [行1] 复用首项目(组分)试样描述/称样量: 1/1 样品
+[15:47:56] [行1] 构建并提交 ...
+[15:47:56] [行] [固定参数] 项目='四项之和' 命中触发条件，待填: ['计算值', '报告值', '试样描述']
+[15:47:56] [行] [固定参数] 找不到同名列(参数名↔列名不符)，未填: ['计算值', '报告值']
+[15:47:56] [行] [固定参数] 实际动态列名: ['试样描述', '铅Pb', '汞Hg', '镉Cd', '铬Cr']
+[15:47:56] [行] 结果值由固定参数写死，跳过 calcTheValue
+[15:47:56] [行1] [设备] 提交称样设备对象: 
+[15:47:56] [行1] 无称样时间(默认模式)，开始时间(startTime) <- max(上一工作日,批内最晚受理日): 2026-08-18 00:00:00 〔上一工作日(未取到受理时间)〕
+[15:47:56] [行1] 警告: 未取到受理时间字段，raw keys=['sampleRemarkContent', 'symbol', 'isOriginalNumber', 'seqNo', 'wordResultTemplateId', 'modifyDatetime', 'criteria', 'mixedOriginalNo', 'submissionIdentifying', 'referencedStandardId', 'decideProjectMethodId', 'detectionLimit', 'isLogout', 'limsId', 'taskChecklistNo', 'id', 'detectionUserName', 'experimentCode', 'samplingPosition', 'detectionId', 'recordNumber', 'microplateStatus', 'unitName', 'isLstd', 'acceptUserName', 'decideProjectId', 'sampleId', 'acceptTime', 'decideProjectOrgId', 'evaluateResult', 'wordResultAllowUpload', 'reportTemplateId', 'standardNo', 'mixedSmallNo', 'wordResultCheckInAllowUpload', 'detectionNo', 'analyzeStartDateBy', 'recordIdentifier', 'subMethodName', 'evaluate', 'returnProcess', 'wordResultCheckIn', 'wordResultCheckInTemplateId', 'originalNo', 'statusColor', 'oldSampleProjectId', 'creatorName', 'creatorId', 'idNumber', 'reportStatusColor', 'requireTime', 'sampleName', 'detectionRemark', 'subMethodId', 'warningVal', 'noticeName', 'detectionLimitValue', 'isProjectName', 'urgent', 'electronicsExperiment', 'smallNo', 'detectionLimitType', 'unitNameId', 'swatchRemark', 'decideProjectName', 'resultCheckIn', 'diseaseType', 'userId', 'decideProjectOrgName', 'createDatetime', 'wordResult', 'entrustCompanyName', 'repetitionNum', 'checkInStatus', 'analyzeEndDateBy', 'report', 'isSmallNo', 'detectionMethodId', 'decideProjectMethodName', 'modifierName']
+[15:47:56] [行1] 暂存实验数据 (saveOcExperiment) ...
+[15:47:57] [行1] [设备] 主检设备随实验载荷提交: ids=1509
+[15:47:57] [行1] 本批完成，实验编号 wjy20260819154750
+[15:47:57] [行1] 成功，1/1 个样品参与合并，实验编号 wjy20260819154746 / wjy20260819154747 / wjy20260819154749 / wjy20260819154750
+==== 序列运行结束 ====
+运行报告：共 1 行 — 成功 1 / 失败 0 / 中止 0
+汇总：1/1 个样品参与合并，实验编号 wjy20260819154746 / wjy20260819154747 / wjy20260819154749 / wjy20260819154750
+[15:49:49] 已从方法同步标液+设备配置到 1 行
+[15:53:38] 已从方法同步标液+设备配置到 1 行
+[15:54:27] 已从方法同步标液+设备配置到 1 行
