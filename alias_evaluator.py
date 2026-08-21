@@ -14,6 +14,7 @@
   - |   多组分分隔
 """
 import re
+import unicodedata
 
 # ponytail: 线性范围 /[lo-hi]，可选前置斜杠；ICP 用分号分隔(';[lo-hi]')，故前导符 [/;] 均吃掉避免尾分号
 _RANGE_RE = re.compile(r'[;/]?\[([0-9]+(?:\.[0-9]+)?)-([0-9]+(?:\.[0-9]+)?)\]')
@@ -21,6 +22,18 @@ _RANGE_RE = re.compile(r'[;/]?\[([0-9]+(?:\.[0-9]+)?)-([0-9]+(?:\.[0-9]+)?)\]')
 # 全角标点(U+FF01..FF5E)→半角；LIMS 中文前端常录成 ；＝｜／＃，规范化后才按分隔符切。
 # ponytail: 一次性映射整个全角 ASCII 区，比逐个替换分隔符更省且覆盖所有分隔符。
 _FW_MAP = {c: chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)}
+
+# 括号类统一为圆括号：别名常录 「苯并（a,h）蒽」，LIMS 组分名却用 「苯并[a,h]蒽」
+_BR_MAP = {'[': '(', ']': ')', '{': '(', '}': ')', '（': '(', '）': ')', '【': '(', '】': ')'}
+
+
+def norm_component(s):
+    """LIMS 组分名/别名段名匹配归一：NFKC(全角→半角) + 去空白与逗号 + 括号统一为圆括号 + 小写。
+    覆盖 「苯并（a,h）蒽」(别名) vs 「苯并[a,h]蒽」(LIMS) 这类录入风格差异；
+    谐音错字(茚苯/茚并)不归一——归不出来，靠未匹配告警暴露。"""
+    s = unicodedata.normalize('NFKC', str(s or ''))
+    return ''.join(_BR_MAP.get(ch, ch) for ch in s
+                   if not ch.isspace() and ch not in (',', '，', '、')).lower()
 
 
 def parse_alias(alias_str):
@@ -179,6 +192,12 @@ if __name__ == '__main__':
     # 检出限取自别名 <X：检出值高于限->数值；低于限->报 <限（修复 0.05 硬编码误判）
     r = evaluate_alias('Phenanthrene;<0.005', {'Phenanthrene': {'value': 0.026, 'status': '检出'}})
     assert r[0]['value'] == '0.026', r
+
+    # 组分名匹配归一：全角/半角括号、方括号、空白/逗号差异应相等；不同化合物不等
+    assert norm_component('苯并（a,h）蒽') == norm_component('苯并[a,h]蒽')
+    assert norm_component('茚苯（123-cd）芘') == norm_component('茚苯[1,2,3-cd]芘')
+    assert norm_component('苯并（a）蒽') != norm_component('苯并（a）芘')
+    print('alias_evaluator self-check OK')
     r = evaluate_alias('Anthracene;<0.005', {'Anthracene': {'value': 0.003, 'status': '检出'}})
     assert r[0]['value'] == '<0.005', r
     # 超线性(>范围上限) → 改用稀释报告读数(原值不乘)，并标记 diluted

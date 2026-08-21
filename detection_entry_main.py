@@ -18,7 +18,7 @@ from detection_entry_api import DetectionAPI, build_grouped_experiment_data
 import threading
 import paths
 from report_parser import parse_pdf_report, parse_pdf_report_multi, _dilution_factor, filter_samples_by_code
-from alias_evaluator import evaluate_alias
+from alias_evaluator import evaluate_alias, norm_component
 
 # ponytail: 与 SequenceMaster._strip_parallel_suffix 同逻辑；两模块刻意解耦不互导，故复制。
 _PARALLEL_SUFFIX_RE = re.compile(r'^([A-Za-z]+\d{8})\d{3}([A-Za-z]*)$')
@@ -922,9 +922,13 @@ class DetectionEntrySystem:
                 b = None
                 if comp_name and isinstance(comp_vars, list):
                     for idx, v in enumerate(comp_vars):
-                        if v.get() == comp_name:
+                        if norm_component(v.get()) == norm_component(comp_name):
                             b = idx // N
                             break
+                if b is None and comp_name and isinstance(comp_vars, list):
+                    # 组分名未匹配：跳过留空+告警，不落到首项目行(错值比空值更糟)
+                    self.log(f"数据采集: 组分名「{comp_name}」未在组分列找到匹配行，已跳过")
+                    continue
                 if b is None:  # 无组分列：按 projectId 落到对应项目行
                     b = pid_to_block.get(item.get('projectId'), 0)
                 pos = b * N + slot

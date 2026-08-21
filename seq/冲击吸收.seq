@@ -1,0 +1,18 @@
+sequence_data:
+- id: 1
+  weighing_path: D:/Agent/lims数据登记/谱图/冲击吸收数据导出.csv
+  method_file: D:/Agent/lims数据登记/methods/跑道冲击吸收.mtd
+  spectrum_path: ''
+  temperature: '22'
+  humidity: '55'
+column_widths:
+- 50
+- 260
+- 220
+- 140
+- 180
+- 224
+- 126
+- 90
+- 140
+- 160

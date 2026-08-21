@@ -1276,6 +1276,8 @@ class DetectionAPI:
                     'calculatedValue': cv.get('calculatedValue'),
                     'reportValue': cv.get('reportValue'),
                     'other': cv.get('other'),
+                    # 完整 columnValues：公式动态列(如 平均力值(N))由服务端算好带回，供回填
+                    'columnValues': cv,
                 }
             if log_func and not out:
                 log_func(f"calcTheValue: 响应 0 行 (rd 类型={type(rd).__name__})")
@@ -1284,6 +1286,46 @@ class DetectionAPI:
             if log_func:
                 log_func(f"calcTheValue 异常: {str(e)}")
             return {}
+
+    def conversion_batch(self, unit_rows, log_func=None):
+        """unitConversion/conversionBatch——前端「获取报告值」按钮的前置单位换算调用。
+        unit_rows: 每记录一条 {objMeteringUnitName:计算值单位, targetMeteringUnitName:报告单位}；
+        固定 reportUnit=1/isCalculatedValue=1(与抓包一致)。返回是否成功(响应值未被前端用于后续请求)。"""
+        try:
+            pid = self.get_user_pid()
+            try:
+                pid = int(pid)
+            except (ValueError, TypeError):
+                pid = 377
+            body = {
+                "unitConversion": [{"objMeteringUnitName": (u or {}).get("objMeteringUnitName") or "",
+                                    "targetMeteringUnitName": (u or {}).get("targetMeteringUnitName") or "",
+                                    "reportUnit": 1, "isCalculatedValue": 1}
+                                   for u in (unit_rows or [])],
+                "pid": pid,
+                "pname": self.get_user_pname(),
+                "loginId": pid,
+            }
+            response = self.login_system.session.post(
+                f"{self.login_system.base_url}/detectionManager/manager/unitConversion/conversionBatch",
+                json=body,
+                headers={
+                    'Content-Type': 'application/json;charset=UTF-8',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Origin': self.login_system.base_url,
+                    'Referer': f"{self.login_system.base_url}/web/detectionResultCheckInCalc.html",
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36',
+                },
+                verify=False, timeout=30,
+            )
+            ok = response.status_code == 200 and (response.json() or {}).get('success')
+            if log_func and not ok:
+                log_func(f"conversionBatch 失败: HTTP {response.status_code}; 响应={response.text[:200]}")
+            return bool(ok)
+        except Exception as e:
+            if log_func:
+                log_func(f"conversionBatch 异常: {str(e)}")
+            return False
 
     def get_experiment_config(self, sample_project_ids, method_standard_no, result_checkin_ids=None, sample_id=None,
                               log_func=None, method_id=None):
@@ -3294,6 +3336,27 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
         }
         calc_result = self.api.calc_report_values(calc_rows, calc_meta, self.log)
         if calc_result:
+            # 两段式方法(如冲击吸收 CALC_METHOD_ENUM_AVG)：一段只回计算值、报告值为空。
+            # 复刻前端「获取报告值」按钮：conversionBatch 前置 + 带计算值重发 calcTheValue 取报告值
+            _half = [cv for cv in calc_result.values()
+                     if cv.get('calculatedValue') and not cv.get('reportValue')]
+            if _half:
+                for row in calc_rows:
+                    cv = calc_result.get(row['id']) or {}
+                    if cv.get('calculatedValue'):
+                        row['columnValues']['calculatedValue'] = cv['calculatedValue']
+                self.api.conversion_batch(
+                    [{"objMeteringUnitName": r.get('calcUnit'), "targetMeteringUnitName": r.get('reportUnit')}
+                     for r in calc_rows], self.log)
+                calc2 = self.api.calc_report_values(calc_rows, calc_meta, self.log)
+                if calc2:
+                    calc_result = calc2
+                if self.log:
+                    self.log(f"报告值二段计算(获取报告值): {len(_half)} 条补报告值")
+            # 公式动态列(如 冲击吸收 平均力值(N))：响应 columnValues 里服务端算好的列值，
+            # 回填记录里为空/默认的动态列(已有真实值不覆盖)
+            _dyn_codes = {c.get('columeCode') for c in (self.dynamic_columns or []) if c.get('columeCode')}
+            _bf = 0
             for rec in oc_analysis_record_save_list:
                 cv = calc_result.get(rec.get('id'))
                 if cv:
@@ -3304,8 +3367,13 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
                         rec['reportValue'] = cv.get('reportValue')
                     if cv.get('other'):
                         rec['other'] = cv['other']
+                    for k, v in (cv.get('columnValues') or {}).items():
+                        if k in _dyn_codes and v not in (None, "") and not rec.get(k):
+                            rec[k] = str(v)
+                            _bf += 1
             if self.log:
-                self.log(f"已计算报告值: {len(calc_result)} 条")
+                self.log(f"已计算报告值: {len(calc_result)} 条" +
+                         (f"，公式动态列回填 {_bf} 格" if _bf else ""))
     elif self.log:
         self.log("结果值由固定参数写死，跳过 calcTheValue")
 

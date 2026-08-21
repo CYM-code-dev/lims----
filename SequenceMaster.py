@@ -508,6 +508,53 @@ def _vol_field_by_project(records, pid_to_sample, pvol_by_sample, vol_code):
     return out
 
 
+def _variant_project_match(csv_val, pname):
+    """称量记录「检测项目」值(如 '冲击吸收|0℃')是否对应 LIMS 检测项目名 pname(如 '冲击吸收0℃')。
+    '|'(含全角｜)拆 基名|条件，_norm_cn 归一后 pname 须同时包含基名与条件；无 '|' 按包含；空值=全中。
+    包含匹配带数字边界：命中段两侧不得是数字(0℃ 不得命中 50℃)。"""
+    v = str(csv_val or "").strip().replace("｜", "|")
+    if not v:
+        return True
+    n = _norm_cn(pname)
+    if not n:
+        return False
+
+    def _in(sub):  # 带数字边界的包含(0℃ ≠ 50℃)
+        i = n.find(sub)
+        while i != -1:
+            if (i == 0 or not n[i - 1].isdigit()) and \
+                    (i + len(sub) >= len(n) or not n[i + len(sub)].isdigit()):
+                return True
+            i = n.find(sub, i + 1)
+        return False
+
+    if "|" in v:
+        base, _, cond = v.partition("|")
+        nb, nc = _norm_cn(base), _norm_cn(cond)
+        # 数字边界仅限条件段(0℃≠50℃)；基名后常直接跟温度数字(冲击吸收0℃)，用普通包含
+        return (not nb or nb in n) and (not nc or _in(nc))
+    return _norm_cn(v) in n
+
+
+def _extra_field_by_variant(records, pid_to_sample, pid_to_pname, rows_by_sample, header, code):
+    """变体通道字段列表(对齐 ocAnalysisRecordList)：记录按其 LIMS 项目名匹配称量记录行的
+    「检测项目」值(同变体多行按行序=平行序取值，不足取末值)；无匹配行保留记录原值 r[code]。"""
+    parallel_of, _ = _parallel_indices(records)
+    out = []
+    for g, r in enumerate(records or []):
+        pid = str(r.get("projectId"))
+        sc = pid_to_sample.get(pid, "")
+        rows = [rd for rd in (rows_by_sample.get(sc) or [])
+                if _variant_project_match(rd.get("proj"), (pid_to_pname or {}).get(pid, ""))]
+        vals = [rd["vals"][header] for rd in rows if header in rd.get("vals", {})]
+        if vals:
+            par = parallel_of.get(g, 0)
+            out.append(_Box(vals[par] if par < len(vals) else vals[-1]))
+        else:
+            out.append(_Box(r.get(code) if code else ""))
+    return out
+
+
 def _project_match(project_name, project_val):
     """单条 query rule 的 project 匹配：rule.project 空=全中；含 * 用 fnmatch；否则精确相等。"""
     pname = (project_name or "").strip()
@@ -876,16 +923,17 @@ def _merge_parallel_groups(wmap, non_parallel_suffixes=()):
         if not g["marker"] and len(par_codes) == 1:
             out[par_codes[0]] = wmap[par_codes[0]]  # 普通样品原样
             continue
-        masses, cells, remarks, extra = [], [], [], {}
+        masses, cells, remarks, extra, rows = [], [], [], {}, []
         for c in par_codes:
             src = wmap[c] or {}
             masses.extend(src.get("masses") or [])
             cells.extend(src.get("cells") or [])
             remarks.extend(src.get("remarks") or [])
+            rows.extend(src.get("rows") or [])
             for h, vs in (src.get("extra") or {}).items():
                 extra.setdefault(h, []).extend(vs)
         entry = {"masses": masses, "cells": cells, "remarks": remarks, "extra": extra,
-                 "time": g["time"], "desc": g["desc"]}
+                 "rows": rows, "time": g["time"], "desc": g["desc"]}
         if any((wmap[c] or {}).get("force_parse") for c in par_codes):
             entry["force_parse"] = True  # E列「解析」标记随平行合并保留(任一平行行标即生效)
         if g["marker"]:
@@ -1022,7 +1070,9 @@ def _read_weighing_records(path):
     行序即平行序；time/desc 取该样品首行(称样时间/试样描述)。表头按列名定位，缺失按 A/B/C/D 兜底。
     称样量单元格形如 "0.39/10.00" 时，斜杠前=称样量、后=定容体积(原样串)。
     remarks=备注列(非空按行序)；extra=保留列之外的所有列(如 浸泡面积/浸泡体积，按表头分组、
-    非空按行序；空格不收=沿用上行值)。"""
+    非空按行序；空格不收=沿用上行值)。
+    含「检测项目」列时(如冲击吸收导出 检测项目=冲击吸收|0℃)改走变体通道 rows：
+    每行一条 {proj: 检测项目值, vals: {表头: 非空格}}，提交时按 LIMS 项目名路由(行序=同变体平行序)。"""
     try:
         if str(path).lower().endswith(".csv"):
             rows = None
@@ -1056,12 +1106,18 @@ def _read_weighing_records(path):
     time_col, desc_col = find("称样时间", 0), find("试样描述", 3)
     parse_col = find("解析", 4)  # E列：强制解析标记
     remark_col = find("备注", -1)
+    # 变体列(精确匹配，避免含该子串的动态列名误切变体通道)：值为 项目名|条件(如 冲击吸收|0℃)
+    proj_col = header.index("检测项目") if "检测项目" in header else -1
     # 称样量兜底守卫：无「称样量」表头时兜底列(D)若是有名同名列(如 浸泡面积s (cm2))，
     # 其数值会被误当称样量读，弃用兜底(老式全空表头文件不受影响)
     if not any("称样量" in h for h in header) and mass_col < len(header) and header[mass_col]:
         mass_col = None
+    # 解析列同款守卫：兜底列(E)被其它有名同名录用(如 第一次冲击结果(N))时弃用，
+    # 否则该列被 reserved 排除出同名列通道、数值还会误当强制解析标记
+    if 0 <= parse_col < len(header) and header[parse_col] and "解析" not in header[parse_col]:
+        parse_col = -1
     # 同名列通道：保留列之外的所有非空表头列(行序即平行序)
-    _reserved = {c for c in (code_col, mass_col, time_col, desc_col, parse_col, remark_col)
+    _reserved = {c for c in (code_col, mass_col, time_col, desc_col, parse_col, remark_col, proj_col)
                  if c is not None and c >= 0}
     extra_cols = [(i, h) for i, h in enumerate(header) if h and i not in _reserved]
     m = {}
@@ -1072,8 +1128,10 @@ def _read_weighing_records(path):
         code = r[code_col] if code_col < len(r) else None
         if code is None or str(code).strip() == "":
             continue
-        entry = m.setdefault(str(code).strip(), {"masses": [], "cells": [], "volumes": [],
-                                                 "time": None, "desc": "", "remarks": [], "extra": {}})
+        # 编号统一大写：设备导出常为小写报验编号(tn…)，LIMS 码全大写，容错查找区分大小写会 miss
+        _code = str(code).strip().upper()
+        entry = m.setdefault(_code, {"masses": [], "cells": [], "volumes": [],
+                                     "time": None, "desc": "", "remarks": [], "extra": {}, "rows": []})
         # 称样量可能为空(random 模式称样量随机生成，excel 仅记录编号/试样描述)；有值才追加
         mass = r[mass_col] if mass_col is not None and mass_col < len(r) else None
         added = False
@@ -1096,7 +1154,7 @@ def _read_weighing_records(path):
         if not entry["desc"]:
             d = r[desc_col] if desc_col < len(r) else None
             entry["desc"] = str(d).strip() if d is not None else ""
-        if parse_col < len(r):
+        if 0 <= parse_col < len(r):  # 0<=：解析列守卫可置 -1，负索引会误读末列
             pv = r[parse_col]
             if pv is not None and str(pv).strip():
                 entry["force_parse"] = True
@@ -1105,11 +1163,18 @@ def _read_weighing_records(path):
             rv = r[remark_col]
             if rv is not None and str(rv).strip():
                 entry["remarks"].append(str(rv).strip())
-        for ci, ch in extra_cols:
-            if ci < len(r):
-                ev = r[ci]
-                if ev is not None and str(ev).strip():
-                    entry["extra"].setdefault(ch, []).append(_cell_str(ev))
+        if proj_col >= 0:
+            # 变体通道：本行非空 extra 格收入该行 vals，提交时按「检测项目」值路由到对应 LIMS 项目
+            _pv = r[proj_col] if proj_col < len(r) else None
+            entry["rows"].append({"proj": str(_pv).strip() if _pv is not None else "",
+                                  "vals": {ch: _cell_str(r[ci]) for ci, ch in extra_cols
+                                           if ci < len(r) and r[ci] is not None and str(r[ci]).strip()}})
+        else:
+            for ci, ch in extra_cols:
+                if ci < len(r):
+                    ev = r[ci]
+                    if ev is not None and str(ev).strip():
+                        entry["extra"].setdefault(ch, []).append(_cell_str(ev))
     return m, None
 
 
@@ -1580,6 +1645,13 @@ class UniversalCell:
         """按方法称样量模式切换称样记录列（cells[1]）：模式作为占位提示显示"""
         self._set_placeholder(*self._WEIGHING_MODES.get((mode or "").strip(), ("称样记录", False)))
 
+    def set_spectrum_mode(self, no_spectrum):
+        """无需谱图方法切换谱图文件路径列（cells[5]）：值保持空，灰色占位「无需谱图」(同无需标液)"""
+        if no_spectrum:
+            self._set_placeholder("无需谱图", True)
+        else:
+            self._set_placeholder(None, False)
+
     def start_editing(self):
         """开始编辑"""
         if self.editing or self.destroyed or self.readonly:
@@ -1811,6 +1883,7 @@ class SelectableRow:
             has_button=True, on_button_click=lambda: self.on_spectrum_button_click(), display_transform=_format_path
         )
         spectrum_cell.cell_frame.pack(side='left', fill='y')
+        spectrum_cell.set_spectrum_mode(bool(self.data.get("_no_spectrum")))
         self.cells.append(spectrum_cell)
 
         # 温度 - 单击选择，双击编辑（按设备房间自动填充，可手填覆盖）
@@ -2067,6 +2140,7 @@ class SelectableRow:
         self.cells[4].set_value(self.data.get("equipment", ""))
         self.cells[4].set_equipment_mode(self.data.get("instrument_setting", ""))
         self.cells[5].set_value(self.data.get("spectrum_path", ""))
+        self.cells[5].set_spectrum_mode(bool(self.data.get("_no_spectrum")))
         self.cells[6].set_value(self.data.get("temperature", ""))
         self.cells[7].set_value(self.data.get("humidity", ""))
         self.set_status(self.data.get("status", "待运行"), self.data.get("error_msg", ""))
@@ -2923,6 +2997,11 @@ class SequenceMaster:
                                      ops.get("device_number", ""), ops.get("equipment_rules"))
         wp = self._read_weighing_params(method_file)
         row["weighing_mode"] = (wp.get("weighing_mode") or "").strip() if wp else ""
+        # 无需谱图方法：谱图文件路径列灰字占位「无需谱图」(placeholder 机制，值保持空不入库、
+        # 不再写字面值)；历史字面值清掉。真实路径不动(按钮选了就显示路径)
+        row["_no_spectrum"] = self._method_no_spectrum(method_file)
+        if (row.get("spectrum_path") or "").strip() == "无需谱图":
+            row["spectrum_path"] = ""
 
     def _ensure_session_silent(self):
         """确保有可用 LIMS 会话(已登录或可复用存档)；无会话返回 False，不弹登录框。"""
@@ -3359,6 +3438,7 @@ class SequenceMaster:
                 self.sequence_data[i]["equipment"] = source_data["equipment"]
                 self.sequence_data[i]["instrument_setting"] = source_data.get("instrument_setting", "")
                 self.sequence_data[i]["spectrum_path"] = source_data["spectrum_path"]
+                self.sequence_data[i]["_no_spectrum"] = source_data.get("_no_spectrum", False)
                 self.sequence_data[i]["temperature"] = source_data.get("temperature", "")
                 self.sequence_data[i]["humidity"] = source_data.get("humidity", "")
 
@@ -4838,10 +4918,26 @@ class SequenceMaster:
         # 称量记录同名列填充：Excel 表头(_norm_cn 归一)匹配 LIMS 动态列名 → 按样品×平行填入。
         # 一行=合并列语义(实验1/2共用)；两行=各行各值(空格沿用上行)；无值保留记录原值(_vol_field_by_project)。
         # 已有专用通道的列(称样量/试样信息·描述/定容体积)不参与。
+        # 变体通道(含「检测项目」列，如冲击吸收导出)：每行属一个检测项目(冲击吸收|0℃)，
+        # 值按 LIMS 项目名路由到对应记录(_extra_field_by_variant)，不再按行序=平行序。
         _extra_hdrs = {}  # 归一表头 -> 原表头
         for _e in (ctx.get("wmap") or {}).values():
             for _h in ((_e or {}).get("extra") or {}):
                 _extra_hdrs.setdefault(_norm_cn(_h), _h)
+        _rows_by_sample = {}  # 样品 -> rows(变体通道)
+        for sc in batch_samples:
+            _rows = ((ctx.get("wmap") or {}).get(sc) or {}).get("rows")
+            if _rows:
+                _rows_by_sample[sc] = _rows
+        _variant_mode = bool(_rows_by_sample)
+        _pid_to_pname = {}
+        if _variant_mode:
+            for _rows in _rows_by_sample.values():
+                for _rd in _rows:
+                    for _h in _rd.get("vals", {}):
+                        _extra_hdrs.setdefault(_norm_cn(_h), _h)
+            _pid_to_pname = {str(p.get("projectId")): p.get("projectName", "")
+                             for p in batch_projects if p.get("projectId")}
         if _extra_hdrs:
             _skip_codes = {mass_code} if mass_code else set()
             _ic = _find_column_by_name(dynamic_columns, "试样信息", "试样描述")
@@ -4857,19 +4953,37 @@ class SequenceMaster:
                 if not _cn or _code in _skip_codes or _cn not in _extra_hdrs:
                     continue
                 _hdr = _extra_hdrs[_cn]
-                _vals = {}  # 键=完整样品编号(供 _vol_field_by_project 精确查)；wmap.get 按编号容错(短报验编号)
-                for sc in batch_samples:
-                    _v = (((ctx.get("wmap") or {}).get(sc) or {}).get("extra") or {}).get(_hdr)
-                    if _v:
-                        _vals[sc] = _v
-                if not _vals:
-                    continue
-                host.data_fields[_code] = _vol_field_by_project(records, pid_to_sample, _vals, _code)
+                _vals = {}  # 键=完整样品编号(供精确查)；wmap.get 按编号容错(短报验编号)
+                if _variant_mode:
+                    for sc, _rows in _rows_by_sample.items():
+                        if any(_hdr in _rd.get("vals", {}) for _rd in _rows):
+                            _vals[sc] = _rows
+                    if not _vals:
+                        continue
+                    host.data_fields[_code] = _extra_field_by_variant(
+                        records, pid_to_sample, _pid_to_pname, _rows_by_sample, _hdr, _code)
+                else:
+                    for sc in batch_samples:
+                        _v = (((ctx.get("wmap") or {}).get(sc) or {}).get("extra") or {}).get(_hdr)
+                        if _v:
+                            _vals[sc] = _v
+                    if not _vals:
+                        continue
+                    host.data_fields[_code] = _vol_field_by_project(records, pid_to_sample, _vals, _code)
                 _matched.add(_cn)
                 log(f"称量记录同名列「{col.get('columeName', '')}」<- Excel「{_hdr}」已填 {len(_vals)} 样品")
             for _cn, _h in _extra_hdrs.items():
                 if _cn not in _matched:
                     log(f"称量记录列「{_h}」未匹配到动态列(列名↔参数名不符)，未填")
+            if _variant_mode:  # 行级路由告警：检测项目值对不上任何 LIMS 项目名 → 该行值整体未填
+                for sc, _rows in _rows_by_sample.items():
+                    for _rd in _rows:
+                        if not _rd.get("vals"):
+                            continue
+                        if not any(_variant_project_match(_rd.get("proj"), _pn)
+                                   for _pn in set(_pid_to_pname.values())):
+                            log(f"称量记录检测项目「{_rd.get('proj')}」(样品 {sc})"
+                                "未匹配到 LIMS 检测项目，该行值未填")
         first_sc = batch_items[0]["sample_code"] if batch_items else ""
         analysis_start = ((ctx["wmap"] or {}).get(first_sc) or {}).get("time")
 
@@ -5582,7 +5696,7 @@ class SequenceMaster:
             return
 
         # 3) 逐记录求值：记录→projectId→样品→报告→别名→evaluate_alias→选段值
-        from alias_evaluator import evaluate_alias
+        from alias_evaluator import evaluate_alias, norm_component
         records = (experiment_config or {}).get("ocAnalysisRecordList") or []
         pid_to_item = {str(it["project"].get("projectId")): it for it in batch_items
                        if it.get("project", {}).get("projectId") is not None}
@@ -5622,6 +5736,8 @@ class SequenceMaster:
                 log(f"报告解析警告: 样品 {_sc} 报告含 {len(_smp)} 个样品段，但称样量仅扩出 {_slots} 个平行槽——"
                     f"多余 {len(_smp) - _slots} 个(如 B)将被丢弃，请在称样记录补全平行称样量")
 
+        _unmatched_comps = set()   # {(组分名, 别名段名列表)}：未匹配→留空告警，不回落首段
+
         def _value_for_record(rec, slot):
             item = pid_to_item.get(str(rec.get("projectId")))
             if not item:
@@ -5657,12 +5773,24 @@ class SequenceMaster:
             if comp_col_code:  # 多组分：按记录组分名匹配段(组分名取自记录该列值)
                 comp_name = str(rec.get(comp_col_code) or "").strip()
                 if comp_name:
-                    seg = next((r for r in results if r.get("lims_component") == comp_name), None)
+                    seg = next((r for r in results
+                                if norm_component(r.get("lims_component")) == norm_component(comp_name)), None)
                     if seg is not None:
                         return seg.get("value", ""), bool(seg.get('raw', {}).get('diluted')), ""
+                    # 组分名与别名段名对不上：留空+告警。绝不回落首段——首段是别的化合物的值，
+                    # 错值比空值更糟(2026-08-21 TN26081017001 全角括号vs方括号未匹配，9行萘值0.009串行)。
+                    _unmatched_comps.add((comp_name,
+                                          "、".join(sorted(str(r.get("lims_component"))
+                                                           for r in results if r.get("lims_component")))))
+                    return "", False, ""
             seg0 = results[0]
-            # 无组分列(PAHs)：单段即该化合物浓度；组分列未命中也回落首段
+            # 无组分列(PAHs)：单段即该化合物浓度
             return seg0.get("value", ""), bool(seg0.get('raw', {}).get('diluted')), ""
+
+        rec_values = [_value_for_record(r, parallel_of.get(g, 0)) for g, r in enumerate(records)]
+        for _cn, _offers in sorted(_unmatched_comps):
+            log(f"报告解析警告: 组分名「{_cn}」未匹配别名段，浓度留空（别名段名: {_offers}，"
+                f"请核对 LIMS 项目别名的中文名）")
 
         rec_values = [_value_for_record(r, parallel_of.get(g, 0)) for g, r in enumerate(records)]
         values = [v for v, _d, _r in rec_values]
