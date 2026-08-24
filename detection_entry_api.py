@@ -3029,8 +3029,10 @@ def build_grouped_experiment_data(host, projects, experiment_code, method_name, 
     skip_calc = _default_names >= {"计算值", "报告值"}
 
     # 检查关键配置是否存在（固定结果值的方法可缺计算公式/修约/计算方法）
+    # 平均值公式方法(如垂直变形 GB 36246 附录E)在 LIMS 本就无计算公式：服务端对列值取平均，公式可空
+    _avg_only = (calc_method.get('key') if isinstance(calc_method, dict) else calc_method) == 'CALC_METHOD_ENUM_AVG'
     if not skip_calc:
-        if not computing_formula:
+        if not computing_formula and not _avg_only:
             raise Exception("实验配置中缺少计算公式")
         if not round_method:
             raise Exception("实验配置中缺少修约方法")

@@ -19,11 +19,15 @@ import openpyxl
 from datetime import datetime, date, timedelta
 from PIL import Image, ImageTk
 import paths
+from version import APP_VERSION
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from login import MultiUserLoginSystem
 from method_file import load_method
 from detection_entry_api import DetectionAPI, build_grouped_experiment_data, _Box, _norm_cn, _detection_no_of
+
+# 表格行高/表头高按 DPI 缩放：高 DPI 机器(125%/150%)字体放大，固定 40px 会裁字；普通屏不变
+_ROW_H = max(40, round(40 * paths.dpi_factor()))
 
 
 # ==================== 节假日/工作日（法定假日+调休，数据源：标准品服务器 10.1.93.25:5000）====================
@@ -1419,7 +1423,7 @@ class UniversalCell:
 
     def create_widgets(self, initial_value):
         # 创建单元格框架
-        self.cell_frame = tk.Frame(self.parent, width=self.width, height=40, bg="white")
+        self.cell_frame = tk.Frame(self.parent, width=self.width, height=_ROW_H, bg="white")
         self.cell_frame.pack_propagate(False)
 
         # 添加右边框
@@ -2150,9 +2154,12 @@ class SelectableRow:
 class SequenceMaster:
     def __init__(self, root):
         self.root = root
-        self.root.title("序列编辑器")
+        self.root.title(f"序列编辑器  v{APP_VERSION}")
         w, h = paths.scaled_size(self.root, 1600, 850, max_frac=(0.78, 0.72))
         self.root.geometry(f"{w}x{h}")
+        self._win_w = w  # 初始窗口宽(_fit_column_widths 在窗口未映射时用)
+        self._last_fit_w = w  # 上次铺满时的窗口宽(窗口拉宽/最大化后重算列宽)
+        self._fitted_once = False  # 首次映射(Configure)时按真实窗口宽强制重铺一次
 
         # 存储序列数据
         self.sequence_data = []
@@ -2165,8 +2172,10 @@ class SequenceMaster:
         self.ctrl_pressed = False
         self.shift_pressed = False
 
-        # 列宽配置
-        self.column_widths = [50, 260, 220, 140, 180, 260, 90, 90, 140, 160]
+        # 列宽配置：基准合计1600按 DPI 等比放大(与字体同步)，再压回窗口内(总宽超窗会被截断)
+        self.column_widths = self._fit_column_widths(
+            [int(round(cw * max(1.0, paths.dpi_factor())))
+             for cw in (25, 260, 220, 140, 180, 260, 35, 35, 140, 160)])
 
         # 存储分隔线引用
         self.draggable_headers = []
@@ -2219,6 +2228,9 @@ class SequenceMaster:
 
         # 绑定全局点击事件，用于退出编辑模式
         self.root.bind('<Button-1>', self.on_global_click)
+
+        # 窗口拉宽/最大化后列宽重新铺满(手动拖过的比例保留，只整体缩放)
+        self.root.bind('<Configure>', self._on_window_resize)
 
         # 初始添加一行
         self.add_row()
@@ -2380,6 +2392,45 @@ class SequenceMaster:
 
         self.root.config(menu=menubar)
 
+    def _on_window_resize(self, event):
+        """窗口宽度变化(拉宽/最大化/还原)时，列宽按现有比例重新铺满新宽度。
+        首次映射事件强制重铺：__init__ 期 winfo_width() 不可靠，以真实窗口宽为准。"""
+        if event.widget is not self.root:
+            return
+        if not self._fitted_once:
+            self._fitted_once = True
+            self._last_fit_w = event.width
+            self.column_widths = self._fit_column_widths(self.column_widths)
+            self.update_header_layout()
+            self.refresh_table()
+            return
+        if abs(event.width - self._last_fit_w) < 20:  # 忽略高度变化与小抖动
+            return
+        self._last_fit_w = event.width
+        self.column_widths = self._fit_column_widths(self.column_widths)
+        self.update_header_layout()
+        self.refresh_table()
+
+    def _fit_column_widths(self, widths):
+        """列宽等比缩放至恰好铺满窗口(留滚动条/边距30px)：过宽压回、过窄放大。
+        No/T/RH(序号/温度/湿度)列固定原宽不参与缩放——短内容窄列即可，省下宽度分给其余列。"""
+        try:
+            win_w = self.root.winfo_width()
+            if win_w <= 1:  # 窗口未映射(启动期)，用初始几何宽
+                win_w = getattr(self, "_win_w", 0)
+        except Exception:
+            return widths
+        _fixed_idx = (0, 6, 7)  # No / T / RH
+        fixed = sum(widths[i] for i in _fixed_idx)
+        rest = [w for i, w in enumerate(widths) if i not in _fixed_idx]
+        limit = win_w - 100 - fixed  # 100=滚动条+边距+右侧留白(不铺满)
+        total = sum(rest)
+        if limit <= 0 or total <= 0:
+            return list(widths)
+        _f = limit / total
+        return [w if i in _fixed_idx else max(40, int(round(w * _f)))
+                for i, w in enumerate(widths)]
+
     def create_table_container(self, parent):
         """创建表格容器，包含表头和表格"""
         table_frame = tk.Frame(parent, bg="white", relief="solid", bd=1,
@@ -2395,7 +2446,7 @@ class SequenceMaster:
 
     def create_table_header(self, parent):
         """创建表格表头"""
-        self.header_frame = tk.Frame(parent, height=40, bg="white")
+        self.header_frame = tk.Frame(parent, height=_ROW_H, bg="white")
         self.header_frame.pack(fill='x')
         self.header_frame.pack_propagate(False)
 
@@ -2417,13 +2468,13 @@ class SequenceMaster:
 
         # 创建表头标签
         for i, header in enumerate(headers):
-            cell_frame = tk.Frame(self.header_frame, height=40, bg="white")
+            cell_frame = tk.Frame(self.header_frame, height=_ROW_H, bg="white")
 
             if i == 0:
-                cell_frame.place(x=0, y=0, width=self.column_widths[i], height=40)
+                cell_frame.place(x=0, y=0, width=self.column_widths[i], height=_ROW_H)
             else:
                 prev_width = sum(self.column_widths[:i])
-                cell_frame.place(x=prev_width, y=0, width=self.column_widths[i], height=40)
+                cell_frame.place(x=prev_width, y=0, width=self.column_widths[i], height=_ROW_H)
 
             # 添加边框
             border_right = tk.Frame(cell_frame, width=1, bg="#c0c0c0")
@@ -2456,8 +2507,8 @@ class SequenceMaster:
         else:
             self.column_widths[column_index] += delta
 
-        # 确保最小宽度
-        min_width = 50
+        # 确保最小宽度(No列基准25)
+        min_width = 25
         for i in range(len(self.column_widths)):
             if self.column_widths[i] < min_width:
                 self.column_widths[i] = min_width
@@ -2823,7 +2874,7 @@ class SequenceMaster:
         file_path = filedialog.askopenfilename(
             title="选择称样记录文件",
             initialdir=os.path.dirname(cur) if cur and os.path.dirname(cur) else None,
-            filetypes=[("Excel files", "*.xlsx;*.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("Excel/CSV files", "*.xlsx;*.xls;*.csv"), ("All files", "*.*")]
         )
         if file_path and 0 <= row_index < len(self.sequence_data):
             self.sequence_data[row_index]["weighing_path"] = file_path
@@ -3537,16 +3588,18 @@ class SequenceMaster:
         """根据当前打开的序列文件更新窗口标题"""
         if self.current_file:
             name = os.path.splitext(os.path.basename(self.current_file))[0]
-            self.root.title(f"序列编辑器 · {name}")
+            self.root.title(f"序列编辑器 · {name}  v{APP_VERSION}")
         else:
-            self.root.title("序列编辑器")
+            self.root.title(f"序列编辑器  v{APP_VERSION}")
 
     def _write_sequence(self, file_path):
         """实际写序列到文件，并更新 current_file/标题。失败弹错。"""
         try:
             save_data = {
                 "sequence_data": [],
-                "column_widths": self.column_widths
+                "column_widths": self.column_widths,
+                # 保存时的 DPI 因子：跨机器加载时把列宽换算到当前机器分辨率
+                "column_widths_dpi": round(paths.dpi_factor(), 3)
             }
 
             for row in self.sequence_data:
@@ -3624,7 +3677,11 @@ class SequenceMaster:
             self.selection_manager.clear_all_selection()
 
             if "column_widths" in loaded_data:
-                self.column_widths = loaded_data["column_widths"]
+                # 旧文件无 dpi 字段=1.0(未缩放)；按 保存因子→当前因子 换算，跨分辨率机器列宽一致
+                _sf = float(loaded_data.get("column_widths_dpi") or 1.0)
+                _cf = max(1.0, paths.dpi_factor())
+                self.column_widths = self._fit_column_widths(
+                    [int(round(cw * _cf / _sf)) for cw in loaded_data["column_widths"]])
                 self.update_header_layout()
 
             sequence_data = loaded_data.get("sequence_data", loaded_data)
