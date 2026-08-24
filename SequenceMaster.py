@@ -6376,7 +6376,9 @@ class SequenceMaster:
         self.log_text.configure(state='disabled')
 
     def download_weighing_template(self):
-        """工具菜单：下载称量记录模板(列结构与 _read_weighing_records 解析一致，含示例行)"""
+        """工具菜单：下载称量记录模板(列结构与 _read_weighing_records 解析一致，含示例行)。
+        通用单表：固定列 + 可选「检测项目」列(项目名|条件 变体路由) + 任意同名列(列名与
+        LIMS 动态列同名即按行序自动填值，如仪器多次测量值)。"""
         path = filedialog.asksaveasfilename(
             parent=self.root, title="保存称量记录模板",
             initialfile="称量记录模板.xlsx", defaultextension=".xlsx",
@@ -6387,13 +6389,22 @@ class SequenceMaster:
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "称量记录"
-            ws.append(["称样时间", "样品编号", "试样描述", "称样量", "解析", "备注"])
+            ws.append(["称样时间", "样品编号", "检测项目", "试样描述", "称样量",
+                       "测量1", "测量2", "解析", "备注"])
             _d = date(2026, 8, 13)  # 称样时间只到日(与实际称量记录一致)
-            ws.append([_d, "TN26080726001M", "红色颗粒", 0.5448, "解析", "M=标记样；解析列填「解析」=强制解析"])
-            ws.append([_d, "TN26080726001A", "红色颗粒", 0.5274, None, "A/B=平行样，行序即平行序"])
-            ws.append([_d, "TN26080726001B", "红色颗粒", "0.39/10.00", None, "斜杠后=定容体积"])
-            ws.append([_d, "TN26080726002A", "胶水", None, None, "称样量留空=随机生成后回写"])
-            for col, w in zip("ABCDEF", (18, 16, 10, 11, 6, 34)):
+            ws.append([_d, "TN26080726001M", None, "红色颗粒", 0.5448, None, None,
+                       "解析", "M=标记样；解析列填「解析」=强制解析"])
+            ws.append([_d, "TN26080726001A", None, "红色颗粒", 0.5274, None, None,
+                       None, "A/B=平行样，行序即平行序"])
+            ws.append([_d, "TN26080726001B", None, "红色颗粒", "0.39/10.00", None, None,
+                       None, "斜杠后=定容体积"])
+            ws.append([_d, "TN26080726002A", None, "胶水", None, None, None,
+                       None, "称样量留空=随机生成后回写"])
+            ws.append([_d, "TN26080726003A", "检测项目名称", "面层", None, 1.87, 1.89,
+                       None, "检测项目填 LIMS 项目名按名称匹配路由；同条件多变体可写 项目名|条件"])
+            ws.append([_d, "TN26080726004A", None, "面层", None, 1.22, 1.14,
+                       None, "测量1/测量2=同名列示例：列名与 LIMS 动态列同名即按行序自动填值，可加任意列"])
+            for col, w in zip("ABCDEFGHI", (18, 16, 12, 10, 11, 8, 8, 6, 46)):
                 ws.column_dimensions[col].width = w
             wb.save(path)
         except Exception as e:
