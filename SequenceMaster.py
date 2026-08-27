@@ -5816,7 +5816,8 @@ class SequenceMaster:
             if not det_pid:
                 return "", False, "样品项目无detectionProjectId"
             if det_pid not in alias_cache:
-                alias, _detail = self.api.get_project_alias(det_pid, log, item["project"].get("projectName"))
+                alias, _detail = self.api.get_project_alias(det_pid, log, item["project"].get("projectName"),
+                                                            item.get("effective_mid"))
                 alias_cache[det_pid] = alias or ""
             alias = alias_cache.get(det_pid)
             if not alias:

@@ -37,7 +37,7 @@ class DetectionAPI:
         self.method_id_to_standard_no = {}
         self._std_no_name_to_id = self._load_std_no_name_cache()  # standardNoName -> methodId，持久化跨进程复用
         self.cached_solution_types = None
-        self._alias_by_name = {}  # projectName -> 项目别名；同名跨方法/批次复用，避免重复兄弟查询
+        self._alias_by_name = {}  # (methodId, projectName) -> 项目别名；同名跨批次复用，避免重复兄弟查询
 
         # 实验编号缓存
         self.experiment_code_cache = {}  # 缓存已生成的实验编号
@@ -2011,13 +2011,14 @@ class DetectionAPI:
             "ocChoicePage", "称样设备", sample_project_id, {}, log_func,
         )
 
-    def get_project_alias(self, detection_project_id, log_func=None, project_name=None):
+    def get_project_alias(self, detection_project_id, log_func=None, project_name=None, method_id=None):
         """取项目别名（谱图数据采集的解析规则串）。
 
         对应网页 检测标准管理→项目→属性 的 detectionProjectProperty/detailByProject，
         返回 (alias, detail)。alias=otherName（如 "Chrysene;<0.005/[0.005-2.00]"）；
         detail 为短状态串（'ok'/'空'/'success=false:...'/'HTTP nnn'/'异常:...'），便于定位。
         id 参数是【检测项目定义ID detectionProjectId】，非样品项目ID。
+        method_id：切换后的检测方法ID，同名借用时据此优先取「同方法」那条(避免借到别的标准)。
         """
         try:
             params = {
@@ -2043,12 +2044,13 @@ class DetectionAPI:
                     if alias:
                         return alias, 'ok'
                     # otherName 空：别名可能配在同名另一条检测项目定义上 → 按名找兄弟回退
-                    # (见记忆 lims-duplicate-detection-project-alias)。按名缓存，整运行只查一次。
+                    # (见记忆 lims-duplicate-detection-project-alias)。按「方法+名」缓存，整运行只查一次。
                     if project_name:
-                        alias = self._alias_by_name.get(project_name)
+                        _ck = (str(method_id or ''), project_name)
+                        alias = self._alias_by_name.get(_ck)
                         if alias is None:
-                            alias = self._lookup_alias_by_name(project_name, detection_project_id, log_func) or ''
-                            self._alias_by_name[project_name] = alias
+                            alias = self._lookup_alias_by_name(project_name, detection_project_id, log_func, method_id) or ''
+                            self._alias_by_name[_ck] = alias
                         if alias:
                             return alias, f"同名兄弟回退({project_name})"
                     return '', '空'
@@ -2066,11 +2068,13 @@ class DetectionAPI:
                 log_func(f"取项目别名 {detail}")
             return '', detail
 
-    def _lookup_alias_by_name(self, project_name, exclude_id=None, log_func=None):
+    def _lookup_alias_by_name(self, project_name, exclude_id=None, log_func=None, method_id=None):
         """按项目名找同名检测项目定义，逐条 detailByProject 取 otherName，返回首个非空别名。
         回退场景：detailByProject?id=X 返回 otherName 空，但别名配在同名另一条检测项目定义上
         (见记忆 lims-duplicate-detection-project-alias)。走 detectionProject/pageObj?keyword=<项目名> 取
         同名 id 列表(此前会话实测)，客户端再按名精确匹配后逐条 detailByProject。
+        同名项目横跨多个标准/方法，别名规则(尤其检出限 <X)各不相同：method_id 非空时优先取
+        「当前(切换后)方法」那条，否则借到别的标准(如 AS/NZS)的检出限。
         注意：同名两条的别名规则值可能不同，借用会按兄弟的规则算——日志留痕可追溯。"""
         if not project_name:
             return ''
@@ -2111,6 +2115,13 @@ class DetectionAPI:
                     log_func(f"同名兄弟查询返回 {len(items)} 条(疑似 keyword 过滤未生效)，跳过逐条取别名")
                 return ''
             target = project_name.strip()
+            _want_mid = str(method_id or '')
+
+            def _mid(it):
+                mi = it.get('detectionMethodInfo') or {}
+                return str(mi.get('id') or '')
+
+            cands = []
             for it in items:
                 iname = str(it.get('name') or it.get('detectionProjectName')
                             or it.get('decideProjectName') or '').strip()
@@ -2119,10 +2130,16 @@ class DetectionAPI:
                 sid = it.get('id') or it.get('detectionProjectId')
                 if not sid or str(sid) == str(exclude_id):
                     continue
+                cands.append(it)
+            # 同名项目横跨多标准/方法：优先取「当前(切换后)方法」那条，方法不符的仍兜底在后。
+            cands.sort(key=lambda it: 0 if (_want_mid and _mid(it) == _want_mid) else 1)
+            for it in cands:
+                sid = it.get('id') or it.get('detectionProjectId')
                 alias, _ = self.get_project_alias(sid, log_func)  # 不传 project_name → 不回环
                 if alias:
                     if log_func:
-                        log_func(f"项目别名借用: {project_name} <- 同名 detectionProjectId={sid}")
+                        _tag = "方法匹配" if (_want_mid and _mid(it) == _want_mid) else "方法不符"
+                        log_func(f"项目别名借用: {project_name} <- 同名 detectionProjectId={sid}（{_tag}）")
                     return alias
             return ''
         except Exception as e:
